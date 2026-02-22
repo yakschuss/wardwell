@@ -282,4 +282,4 @@ Strict lints: `deny(clippy::unwrap_used, expect_used, panic, todo, unimplemented
 
 ## License
 
-MIT
+Apache 2.0 — see [LICENSE](LICENSE).

@@ -2,7 +2,9 @@
 name = "wardwell"
 version = "0.3.0"
 edition = "2024"
-description = "Personal AI knowledge vault — MCP server for vault search, read, and proposals"
+description = "Persistent project memory for Claude Code — MCP server + CLI"
+license = "Apache-2.0"
+repository = "https://github.com/yakschuss/wardwell"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
