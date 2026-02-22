@@ -11,7 +11,7 @@ impl McpConfigPaths {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
             claude_desktop: home.join("Library/Application Support/Claude/claude_desktop_config.json"),
-            claude_code: home.join(".claude.json"),
+            claude_code: home.join(".claude/settings.json"),
         }
     }
 }
