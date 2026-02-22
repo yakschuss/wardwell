@@ -45,7 +45,9 @@ impl IndexStore {
              WHERE vault_search MATCH ?1"
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        params.push(Box::new(q.query.clone()));
+        // Quote the query to prevent FTS5 operator interpretation (e.g. hyphens as NOT)
+        let quoted_query = format!("\"{}\"", q.query.replace('"', "\"\""));
+        params.push(Box::new(quoted_query));
 
         let mut param_idx = 2;
 
@@ -198,12 +200,13 @@ fn parse_confidence(s: &str) -> Option<Confidence> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::index::builder::IndexBuilder;
 
     fn build_test_index() -> IndexStore {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
 
         let write = |name: &str, content: &str| {
             let path = dir.path().join(name);
@@ -230,7 +233,7 @@ mod tests {
             "---\ntype: insight\nconfidence: inferred\nsummary: Always check clippy warnings first\ntags: [rust, debugging]\n---\n## Pattern\nCheck clippy before declaring fixed.\n",
         );
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
         IndexBuilder::full_build(&store, dir.path()).ok();
         store
     }
@@ -244,8 +247,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         assert!(results.total > 0);
     }
 
@@ -259,8 +262,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         for r in &results.results {
             assert_eq!(r.frontmatter.domain.as_deref(), Some("myapp"));
         }
@@ -276,8 +279,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         for r in &results.results {
             assert_eq!(r.frontmatter.file_type, VaultType::Decision);
         }
@@ -292,8 +295,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         assert_eq!(results.total, 0);
         // suggestions may or may not be present depending on fuzzy match
     }
@@ -308,8 +311,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         for r in &results.results {
             assert_eq!(r.frontmatter.status, Some(Status::Resolved));
         }
@@ -326,8 +329,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         // All results should be from one of the allowed domains
         for r in &results.results {
             if let Some(ref d) = r.frontmatter.domain {
@@ -347,8 +350,8 @@ mod tests {
             ..Default::default()
         };
         let results = store.search(&q);
-        assert!(results.is_ok());
-        let results = results.unwrap_or_else(|_| std::process::exit(1));
+        assert!(results.is_ok(), "{results:?}");
+        let results = results.unwrap();
         for r in &results.results {
             assert_eq!(r.frontmatter.domain.as_deref(), Some("myapp"));
         }

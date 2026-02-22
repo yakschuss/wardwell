@@ -53,35 +53,35 @@ pub struct WriteParams {
     pub project: String,
 
     // -- sync fields --
-    #[schemars(description = "For sync: project status (active, blocked, completed)")]
+    #[schemars(description = "REQUIRED for sync: project status (active, blocked, completed)")]
     pub status: Option<String>,
-    #[schemars(description = "For sync: what you're working on right now")]
+    #[schemars(description = "REQUIRED for sync: what you're working on right now")]
     pub focus: Option<String>,
-    #[schemars(description = "For sync: why this project matters (optional)")]
+    #[schemars(description = "Optional for sync: why this project matters")]
     pub why_this_matters: Option<String>,
-    #[schemars(description = "For sync: single concrete next step")]
+    #[schemars(description = "REQUIRED for sync: single concrete next step")]
     pub next_action: Option<String>,
-    #[schemars(description = "For sync: open questions (optional)")]
+    #[schemars(description = "Optional for sync: open questions")]
     pub open_questions: Option<Vec<String>>,
-    #[schemars(description = "For sync: things blocking progress (optional)")]
+    #[schemars(description = "Optional for sync: things blocking progress")]
     pub blockers: Option<Vec<String>>,
-    #[schemars(description = "For sync: things waiting on others (optional)")]
+    #[schemars(description = "Optional for sync: things waiting on others")]
     pub waiting_on: Option<Vec<String>>,
-    #[schemars(description = "For sync: one-line commit message summarizing the session")]
+    #[schemars(description = "REQUIRED for sync: one-line commit message summarizing the session")]
     pub commit_message: Option<String>,
 
-    // -- shared fields (sync history, append_history, decide) --
-    #[schemars(description = "For sync/append_history/decide: title of the entry")]
+    // -- shared fields --
+    #[schemars(description = "REQUIRED for decide/append_history/lesson. Optional for sync (if provided, appends history entry).")]
     pub title: Option<String>,
-    #[schemars(description = "For sync/append_history/decide: body text")]
+    #[schemars(description = "REQUIRED for decide/append_history. Optional for sync.")]
     pub body: Option<String>,
 
     // -- lesson fields --
-    #[schemars(description = "For lesson: what went wrong")]
+    #[schemars(description = "REQUIRED for lesson: what went wrong")]
     pub what_happened: Option<String>,
-    #[schemars(description = "For lesson: why it went wrong")]
+    #[schemars(description = "REQUIRED for lesson: why it went wrong")]
     pub root_cause: Option<String>,
-    #[schemars(description = "For lesson: how to prevent it")]
+    #[schemars(description = "REQUIRED for lesson: how to prevent it")]
     pub prevention: Option<String>,
 }
 
@@ -291,12 +291,20 @@ impl WardwellServer {
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "active".to_string());
 
+                    let focus = extract_section(&vf.body, "Focus");
+                    let next_action = extract_section(&vf.body, "Next Action");
+
+                    // Skip empty seeds — no focus and no next action
+                    if focus.is_empty() && next_action.is_empty() {
+                        continue;
+                    }
+
                     let entry = serde_json::json!({
                         "domain": domain_name,
                         "project": project_name,
                         "status": status_str,
-                        "focus": extract_section(&vf.body, "Focus"),
-                        "next_action": extract_section(&vf.body, "Next Action"),
+                        "focus": focus,
+                        "next_action": next_action,
                     });
 
                     match status_str.as_str() {
@@ -1014,13 +1022,23 @@ fn list_subdirs(dir: &std::path::Path) -> Vec<PathBuf> {
 
 /// Extract a markdown section body by heading name (e.g. "Focus" → content under "## Focus").
 fn extract_section(body: &str, heading: &str) -> String {
-    let marker = format!("## {heading}");
-    let start = match body.find(&marker) {
-        Some(pos) => pos + marker.len(),
+    let marker = format!("\n## {heading}");
+    // Find marker at line start (check start-of-body case too)
+    let pos = if body.starts_with(&marker[1..]) {
+        Some(0)
+    } else {
+        body.find(&marker).map(|p| p + 1) // skip the leading \n
+    };
+    let start = match pos {
+        Some(p) => p + marker.len() - 1, // past "## Heading"
         None => return String::new(),
     };
-    let rest = body[start..].trim_start();
-    // Find next ## or end of string
+    // Skip to next line after heading
+    let after_heading = match body[start..].find('\n') {
+        Some(nl) => start + nl + 1,
+        None => return String::new(),
+    };
+    let rest = &body[after_heading..];
     let end = rest.find("\n## ").unwrap_or(rest.len());
     rest[..end].trim().to_string()
 }
@@ -1294,6 +1312,7 @@ fn clipboard_copy(content: &str) -> Result<usize, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -1335,7 +1354,7 @@ mod tests {
     #[test]
     fn extract_recent_history_entries() {
         let content = "# Project History\n\n## 2026-02-20 14:30 — First entry\n\nDid some work.\n\n---\n\n## 2026-02-19 10:00 — Second entry\n\nMore work.\n\n---\n\n## 2026-02-18 09:00 — Third entry\n\nEven more.\n\n---\n\n## 2026-02-17 08:00 — Fourth entry\n\nOld stuff.\n";
-        let entries = extract_recent_history_md(&content, 3);
+        let entries = extract_recent_history_md(content, 3);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0]["title"], "First entry");
         assert_eq!(entries[0]["date"], "2026-02-20");
@@ -1345,7 +1364,7 @@ mod tests {
     #[test]
     fn extract_recent_history_fewer_than_n() {
         let content = "# History\n\n## 2026-02-20 14:30 — Only entry\n\nContent.\n";
-        let entries = extract_recent_history_md(&content, 5);
+        let entries = extract_recent_history_md(content, 5);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["title"], "Only entry");
     }
@@ -1355,14 +1374,14 @@ mod tests {
         let tmp = std::env::temp_dir().join("wardwell_test_vault_match");
         let _ = std::fs::remove_dir_all(&tmp);
         let project_dir = tmp.join("personal").join("wardwell");
-        std::fs::create_dir_all(&project_dir).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&project_dir).unwrap();
 
         let result = resolve_vault_project(
             std::path::Path::new("/Users/jack/Code/wardwell"),
             &tmp,
         );
         assert!(result.is_some());
-        let (domain, project, _) = result.unwrap_or_else(|| std::process::exit(1));
+        let (domain, project, _) = result.unwrap();
         assert_eq!(domain, "personal");
         assert_eq!(project, "wardwell");
 
@@ -1374,7 +1393,7 @@ mod tests {
         let tmp = std::env::temp_dir().join("wardwell_test_vault_nomatch");
         let _ = std::fs::remove_dir_all(&tmp);
         let project_dir = tmp.join("personal").join("other-project");
-        std::fs::create_dir_all(&project_dir).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&project_dir).unwrap();
 
         let result = resolve_vault_project(
             std::path::Path::new("/Users/jack/Code/wardwell"),
@@ -1406,13 +1425,13 @@ mod tests {
     fn append_jsonl_creates_file_with_schema() {
         let tmp = std::env::temp_dir().join("wardwell_test_jsonl_create");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&tmp).unwrap();
 
         let path = tmp.join("history.jsonl");
         let entry = r#"{"date":"2026-02-22T14:30:00Z","title":"Test","status":"active","focus":"f","next_action":"n","commit":"c","body":"b"}"#;
-        append_jsonl(&path, "history", entry).unwrap_or_else(|_| std::process::exit(1));
+        append_jsonl(&path, "history", entry).unwrap();
 
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|_| std::process::exit(1));
+        let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"_schema\": \"history\""));
@@ -1425,15 +1444,15 @@ mod tests {
     fn append_jsonl_second_append_no_duplicate_schema() {
         let tmp = std::env::temp_dir().join("wardwell_test_jsonl_append");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&tmp).unwrap();
 
         let path = tmp.join("history.jsonl");
         let entry1 = r#"{"date":"2026-02-22T14:00:00Z","title":"First","status":"","focus":"","next_action":"","commit":"","body":""}"#;
         let entry2 = r#"{"date":"2026-02-22T15:00:00Z","title":"Second","status":"","focus":"","next_action":"","commit":"","body":""}"#;
-        append_jsonl(&path, "history", entry1).unwrap_or_else(|_| std::process::exit(1));
-        append_jsonl(&path, "history", entry2).unwrap_or_else(|_| std::process::exit(1));
+        append_jsonl(&path, "history", entry1).unwrap();
+        append_jsonl(&path, "history", entry2).unwrap();
 
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|_| std::process::exit(1));
+        let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 3); // schema + 2 entries
         assert!(lines[0].contains("\"_schema\""));
@@ -1447,7 +1466,7 @@ mod tests {
     fn append_jsonl_lesson() {
         let tmp = std::env::temp_dir().join("wardwell_test_jsonl_lesson");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&tmp).unwrap();
 
         let path = tmp.join("lessons.jsonl");
         let entry = LessonJsonlEntry {
@@ -1457,10 +1476,10 @@ mod tests {
             root_cause: "No existence check".to_string(),
             prevention: "Use upsert".to_string(),
         };
-        let json = serde_json::to_string(&entry).unwrap_or_else(|_| std::process::exit(1));
-        append_jsonl(&path, "lessons", &json).unwrap_or_else(|_| std::process::exit(1));
+        let json = serde_json::to_string(&entry).unwrap();
+        append_jsonl(&path, "lessons", &json).unwrap();
 
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|_| std::process::exit(1));
+        let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("\"_schema\": \"lessons\""));
@@ -1501,14 +1520,14 @@ mod tests {
     fn read_recent_history_from_dir_prefers_jsonl() {
         let tmp = std::env::temp_dir().join("wardwell_test_history_prefer_jsonl");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&tmp).unwrap();
 
         // Create both files — JSONL should win
         let jsonl = tmp.join("history.jsonl");
-        std::fs::write(&jsonl, "{\"_schema\": \"history\", \"_version\": \"1.0\"}\n{\"date\":\"2026-02-22T14:00:00Z\",\"title\":\"From JSONL\",\"status\":\"active\",\"focus\":\"f\",\"next_action\":\"n\",\"commit\":\"c\",\"body\":\"b\"}\n").unwrap_or_else(|_| std::process::exit(1));
+        std::fs::write(&jsonl, "{\"_schema\": \"history\", \"_version\": \"1.0\"}\n{\"date\":\"2026-02-22T14:00:00Z\",\"title\":\"From JSONL\",\"status\":\"active\",\"focus\":\"f\",\"next_action\":\"n\",\"commit\":\"c\",\"body\":\"b\"}\n").unwrap();
 
         let md = tmp.join("history.md");
-        std::fs::write(&md, "# History\n\n## 2026-02-22 14:00 — From MD\n\nBody.\n").unwrap_or_else(|_| std::process::exit(1));
+        std::fs::write(&md, "# History\n\n## 2026-02-22 14:00 — From MD\n\nBody.\n").unwrap();
 
         let entries = read_recent_history_from_dir(&tmp, 5);
         assert_eq!(entries.len(), 1);
@@ -1521,10 +1540,10 @@ mod tests {
     fn read_recent_history_from_dir_falls_back_to_md() {
         let tmp = std::env::temp_dir().join("wardwell_test_history_fallback_md");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&tmp).unwrap();
 
         let md = tmp.join("history.md");
-        std::fs::write(&md, "# History\n\n## 2026-02-22 14:00 — From MD\n\nBody.\n").unwrap_or_else(|_| std::process::exit(1));
+        std::fs::write(&md, "# History\n\n## 2026-02-22 14:00 — From MD\n\nBody.\n").unwrap();
 
         let entries = read_recent_history_from_dir(&tmp, 5);
         assert_eq!(entries.len(), 1);
