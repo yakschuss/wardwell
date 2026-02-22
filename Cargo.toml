@@ -1,0 +1,38 @@
+[package]
+name = "wardwell"
+version = "0.3.0"
+edition = "2024"
+description = "Personal AI knowledge vault — MCP server for vault search, read, and proposals"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+glob = "0.3"
+strsim = "0.11"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["full"] }
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+rusqlite = { version = "0.31", features = ["bundled-full"] }
+notify = "6"
+sha2 = "0.10"
+dirs = "6"
+schemars = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+overflow-checks = true
+lto = true
+strip = true
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"

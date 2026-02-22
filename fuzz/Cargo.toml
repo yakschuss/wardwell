@@ -1,0 +1,20 @@
+[package]
+name = "wardwell-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.wardwell]
+path = ".."
+
+[[bin]]
+name = "path_enforcement"
+path = "fuzz_targets/path_enforcement.rs"
+test = false
+doc = false
