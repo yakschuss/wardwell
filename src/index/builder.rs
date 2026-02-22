@@ -11,6 +11,7 @@ pub struct BuildStats {
     pub skipped: usize,
     pub removed: usize,
     pub errors: usize,
+    pub error_details: Vec<String>,
 }
 
 /// Build the full index from a vault directory.
@@ -28,6 +29,7 @@ impl IndexBuilder {
         let mut indexed = 0;
         let mut skipped = 0;
         let mut errors = 0;
+        let mut error_details = Vec::new();
         let mut seen_paths = HashSet::new();
 
         for result in results {
@@ -38,14 +40,18 @@ impl IndexBuilder {
                         .unwrap_or(&vf.path)
                         .to_string_lossy()
                         .to_string();
-                    seen_paths.insert(rel_path);
+                    seen_paths.insert(rel_path.clone());
                     match store.upsert(&vf, vault_root) {
                         Ok(true) => indexed += 1,
                         Ok(false) => skipped += 1,
-                        Err(_) => errors += 1,
+                        Err(e) => {
+                            error_details.push(format!("{rel_path}: {e}"));
+                            errors += 1;
+                        }
                     }
                 }
-                Err(_) => {
+                Err(e) => {
+                    error_details.push(format!("{e}"));
                     errors += 1;
                 }
             }
@@ -54,7 +60,7 @@ impl IndexBuilder {
         // Remove stale entries (files that no longer exist on disk)
         let removed = store.remove_stale(&seen_paths)?;
 
-        Ok(BuildStats { indexed, skipped, removed, errors })
+        Ok(BuildStats { indexed, skipped, removed, errors, error_details })
     }
 }
 

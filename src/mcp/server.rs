@@ -44,38 +44,6 @@ pub struct SearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WriteSnapshot {
-    pub status: String,
-    pub focus: String,
-    pub why_this_matters: Option<String>,
-    pub next_action: String,
-    pub open_questions: Option<Vec<String>>,
-    pub blockers: Option<Vec<String>>,
-    pub waiting_on: Option<Vec<String>>,
-    pub commit_message: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WriteHistoryEntry {
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WriteDecision {
-    pub title: String,
-    pub body: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct WriteLessonEntry {
-    pub title: String,
-    pub what_happened: String,
-    pub root_cause: String,
-    pub prevention: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteParams {
     #[schemars(description = "sync: replace current_state.md and optionally append history. decide: append to decisions.md. append_history: append to history.jsonl. lesson: append to lessons.jsonl.")]
     pub action: String,
@@ -83,14 +51,38 @@ pub struct WriteParams {
     pub domain: String,
     #[schemars(description = "Project folder within the domain (e.g., 'my-project')")]
     pub project: String,
-    #[schemars(description = "For sync: replaces current_state.md.")]
-    pub snapshot: Option<WriteSnapshot>,
-    #[schemars(description = "For sync (optional) or append_history: appended to history.jsonl")]
-    pub history_entry: Option<WriteHistoryEntry>,
-    #[schemars(description = "For decide: appended to decisions.md")]
-    pub decision: Option<WriteDecision>,
-    #[schemars(description = "For lesson: appended to lessons.jsonl")]
-    pub lesson: Option<WriteLessonEntry>,
+
+    // -- sync fields --
+    #[schemars(description = "For sync: project status (active, blocked, completed)")]
+    pub status: Option<String>,
+    #[schemars(description = "For sync: what you're working on right now")]
+    pub focus: Option<String>,
+    #[schemars(description = "For sync: why this project matters (optional)")]
+    pub why_this_matters: Option<String>,
+    #[schemars(description = "For sync: single concrete next step")]
+    pub next_action: Option<String>,
+    #[schemars(description = "For sync: open questions (optional)")]
+    pub open_questions: Option<Vec<String>>,
+    #[schemars(description = "For sync: things blocking progress (optional)")]
+    pub blockers: Option<Vec<String>>,
+    #[schemars(description = "For sync: things waiting on others (optional)")]
+    pub waiting_on: Option<Vec<String>>,
+    #[schemars(description = "For sync: one-line commit message summarizing the session")]
+    pub commit_message: Option<String>,
+
+    // -- shared fields (sync history, append_history, decide) --
+    #[schemars(description = "For sync/append_history/decide: title of the entry")]
+    pub title: Option<String>,
+    #[schemars(description = "For sync/append_history/decide: body text")]
+    pub body: Option<String>,
+
+    // -- lesson fields --
+    #[schemars(description = "For lesson: what went wrong")]
+    pub what_happened: Option<String>,
+    #[schemars(description = "For lesson: why it went wrong")]
+    pub root_cause: Option<String>,
+    #[schemars(description = "For lesson: how to prevent it")]
+    pub prevention: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -760,9 +752,21 @@ fn extract_search_terms(summary: &str, max_terms: usize) -> String {
 
 impl WardwellServer {
     fn action_sync(&self, p: &WriteParams) -> String {
-        let snapshot = match &p.snapshot {
-            Some(s) => s,
-            None => return json_error("'snapshot' is required for action 'sync'."),
+        let status = match &p.status {
+            Some(s) => s.clone(),
+            None => return json_error("'status' is required for action 'sync'."),
+        };
+        let focus = match &p.focus {
+            Some(f) => f.clone(),
+            None => return json_error("'focus' is required for action 'sync'."),
+        };
+        let next_action = match &p.next_action {
+            Some(n) => n.clone(),
+            None => return json_error("'next_action' is required for action 'sync'."),
+        };
+        let commit_message = match &p.commit_message {
+            Some(c) => c.clone(),
+            None => return json_error("'commit_message' is required for action 'sync'."),
         };
 
         let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
@@ -776,36 +780,34 @@ impl WardwellServer {
         let mut content = format!(
             "---\nchat_name: {project}\nupdated: {now}\nstatus: {status}\ntype: project\ncontext: {domain}\n---\n\n# {project}\n\n## Focus\n{focus}\n",
             project = p.project,
-            status = snapshot.status,
             domain = p.domain,
-            focus = snapshot.focus,
         );
 
-        if let Some(ref why) = snapshot.why_this_matters {
+        if let Some(ref why) = p.why_this_matters {
             content.push_str(&format!("\n## Why This Matters\n{why}\n"));
         }
 
-        content.push_str(&format!("\n## Next Action\n{}\n", snapshot.next_action));
+        content.push_str(&format!("\n## Next Action\n{next_action}\n"));
 
-        if let Some(ref qs) = snapshot.open_questions
+        if let Some(ref qs) = p.open_questions
             && !qs.is_empty() {
                 content.push_str("\n## Open Questions\n");
                 for q in qs { content.push_str(&format!("- {q}\n")); }
             }
 
-        if let Some(ref bs) = snapshot.blockers
+        if let Some(ref bs) = p.blockers
             && !bs.is_empty() {
                 content.push_str("\n## Blockers\n");
                 for b in bs { content.push_str(&format!("- {b}\n")); }
             }
 
-        if let Some(ref ws) = snapshot.waiting_on
+        if let Some(ref ws) = p.waiting_on
             && !ws.is_empty() {
                 content.push_str("\n## Waiting On\n");
                 for w in ws { content.push_str(&format!("- {w}\n")); }
             }
 
-        content.push_str(&format!("\n## Commit Message\n{}\n", snapshot.commit_message));
+        content.push_str(&format!("\n## Commit Message\n{commit_message}\n"));
 
         let state_path = project_dir.join("current_state.md");
         let mut files_written = vec![];
@@ -816,16 +818,16 @@ impl WardwellServer {
         files_written.push(format!("{}/{}/{}/current_state.md", self.vault_root.display(), p.domain, p.project));
 
         // Optionally append history entry to JSONL
-        if let Some(ref entry) = p.history_entry {
+        if let Some(ref title) = p.title {
             let history_path = project_dir.join("history.jsonl");
             let jsonl_entry = HistoryJsonlEntry {
                 date: chrono::Utc::now().to_rfc3339(),
-                title: entry.title.clone(),
-                status: snapshot.status.clone(),
-                focus: snapshot.focus.clone(),
-                next_action: snapshot.next_action.clone(),
-                commit: snapshot.commit_message.clone(),
-                body: entry.body.clone(),
+                title: title.clone(),
+                status: status.clone(),
+                focus: focus.clone(),
+                next_action: next_action.clone(),
+                commit: commit_message.clone(),
+                body: p.body.clone().unwrap_or_default(),
             };
             let json = match serde_json::to_string(&jsonl_entry) {
                 Ok(j) => j,
@@ -844,9 +846,13 @@ impl WardwellServer {
     }
 
     fn action_decide(&self, p: &WriteParams) -> String {
-        let decision = match &p.decision {
-            Some(d) => d,
-            None => return json_error("'decision' is required for action 'decide'."),
+        let title = match &p.title {
+            Some(t) => t.clone(),
+            None => return json_error("'title' is required for action 'decide'."),
+        };
+        let body = match &p.body {
+            Some(b) => b.clone(),
+            None => return json_error("'body' is required for action 'decide'."),
         };
 
         let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
@@ -857,7 +863,7 @@ impl WardwellServer {
         let decisions_path = project_dir.join("decisions.md");
         let now = chrono::Local::now().format("%Y-%m-%d").to_string();
 
-        let entry = format!("## {now} — {title}\n\n{body}\n\n---\n\n", title = decision.title, body = decision.body);
+        let entry = format!("## {now} — {title}\n\n{body}\n\n---\n\n");
 
         if let Err(e) = prepend_to_file(&decisions_path, &format!("# {} Decisions", p.project), &entry) {
             return json_error(&format!("Failed to write decisions.md: {e}"));
@@ -871,9 +877,9 @@ impl WardwellServer {
     }
 
     fn action_append_history(&self, p: &WriteParams) -> String {
-        let entry = match &p.history_entry {
-            Some(e) => e,
-            None => return json_error("'history_entry' is required for action 'append_history'."),
+        let title = match &p.title {
+            Some(t) => t.clone(),
+            None => return json_error("'title' is required for action 'append_history'."),
         };
 
         let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
@@ -884,12 +890,12 @@ impl WardwellServer {
         let history_path = project_dir.join("history.jsonl");
         let jsonl_entry = HistoryJsonlEntry {
             date: chrono::Utc::now().to_rfc3339(),
-            title: entry.title.clone(),
+            title,
             status: String::new(),
             focus: String::new(),
             next_action: String::new(),
             commit: String::new(),
-            body: entry.body.clone(),
+            body: p.body.clone().unwrap_or_default(),
         };
         let json = match serde_json::to_string(&jsonl_entry) {
             Ok(j) => j,
@@ -907,9 +913,21 @@ impl WardwellServer {
     }
 
     fn action_lesson(&self, p: &WriteParams) -> String {
-        let lesson = match &p.lesson {
-            Some(l) => l,
-            None => return json_error("'lesson' is required for action 'lesson'."),
+        let title = match &p.title {
+            Some(t) => t.clone(),
+            None => return json_error("'title' is required for action 'lesson'."),
+        };
+        let what_happened = match &p.what_happened {
+            Some(w) => w.clone(),
+            None => return json_error("'what_happened' is required for action 'lesson'."),
+        };
+        let root_cause = match &p.root_cause {
+            Some(r) => r.clone(),
+            None => return json_error("'root_cause' is required for action 'lesson'."),
+        };
+        let prevention = match &p.prevention {
+            Some(p) => p.clone(),
+            None => return json_error("'prevention' is required for action 'lesson'."),
         };
 
         let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
@@ -920,10 +938,10 @@ impl WardwellServer {
         let lessons_path = project_dir.join("lessons.jsonl");
         let jsonl_entry = LessonJsonlEntry {
             date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
-            title: lesson.title.clone(),
-            what_happened: lesson.what_happened.clone(),
-            root_cause: lesson.root_cause.clone(),
-            prevention: lesson.prevention.clone(),
+            title,
+            what_happened,
+            root_cause,
+            prevention,
         };
         let json = match serde_json::to_string(&jsonl_entry) {
             Ok(j) => j,

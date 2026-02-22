@@ -284,6 +284,9 @@ fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
 
     let stats = IndexBuilder::build_filtered(&index, &config.vault_path, &config.exclude)?;
     println!("Reindexed {} file(s) ({} skipped, {} error(s)).", stats.indexed, stats.skipped, stats.errors);
+    for detail in &stats.error_details {
+        eprintln!("  error: {detail}");
+    }
     Ok(())
 }
 
