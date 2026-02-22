@@ -92,6 +92,7 @@ impl DomainRegistry {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::config::types::{DomainName, PathGlob};
@@ -99,8 +100,8 @@ mod tests {
 
     fn make_domain(name: &str, path_glob: &str) -> Domain {
         Domain {
-            name: DomainName::new(name).unwrap_or_else(|_| std::process::exit(1)),
-            paths: vec![PathGlob::new(path_glob).unwrap_or_else(|_| std::process::exit(1))],
+            name: DomainName::new(name).unwrap(),
+            paths: vec![PathGlob::new(path_glob).unwrap()],
             aliases: HashMap::new(),
             can_read: Vec::new(),
         }
@@ -137,28 +138,28 @@ mod tests {
 
     #[test]
     fn from_vault_empty_dir() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let reg = DomainRegistry::from_vault(dir.path());
         assert!(reg.is_empty());
     }
 
     #[test]
     fn from_vault_loads_confirmed_domains() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let domains_dir = dir.path().join("domains");
-        std::fs::create_dir_all(&domains_dir).unwrap_or_else(|_| std::process::exit(1));
+        std::fs::create_dir_all(&domains_dir).unwrap();
 
         // Write a confirmed domain file
         std::fs::write(
             domains_dir.join("testdomain.md"),
             "---\ntype: domain\ndomain: testdomain\nconfidence: confirmed\nstatus: active\n---\n## Paths\n- /tmp/test/*\n\n## Aliases\n- code: /tmp/test\n",
-        ).unwrap_or_else(|_| std::process::exit(1));
+        ).unwrap();
 
         // Write an inferred domain file (should be skipped)
         std::fs::write(
             domains_dir.join("inferred.md"),
             "---\ntype: domain\ndomain: inferred\nconfidence: inferred\n---\n## Paths\n- /tmp/inferred/*\n",
-        ).unwrap_or_else(|_| std::process::exit(1));
+        ).unwrap();
 
         let reg = DomainRegistry::from_vault(dir.path());
         assert_eq!(reg.all().len(), 1);

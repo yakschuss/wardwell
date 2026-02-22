@@ -19,6 +19,7 @@ pub enum IndexError {
 }
 
 /// SQLite FTS5 index store. Thread-safe via Mutex.
+#[derive(Debug)]
 pub struct IndexStore {
     conn: Mutex<Connection>,
 }
@@ -192,70 +193,71 @@ impl IndexStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn open_in_memory() {
         let store = IndexStore::in_memory();
-        assert!(store.is_ok());
+        assert!(store.is_ok(), "{store:?}");
     }
 
     #[test]
     fn open_on_disk() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("index.db");
         let store = IndexStore::open(&db_path);
-        assert!(store.is_ok());
+        assert!(store.is_ok(), "{store:?}");
         assert!(db_path.exists());
     }
 
     #[test]
     fn upsert_skips_unchanged() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.md");
         std::fs::write(&file_path, "---\ntype: project\n---\nbody content\n").ok();
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
-        let vf = crate::vault::reader::read_file(&file_path).unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
+        let vf = crate::vault::reader::read_file(&file_path).unwrap();
 
         let updated = store.upsert(&vf, dir.path());
-        assert!(updated.is_ok());
+        assert!(updated.is_ok(), "{updated:?}");
         assert_eq!(updated.ok(), Some(true));
 
         let updated = store.upsert(&vf, dir.path());
-        assert!(updated.is_ok());
+        assert!(updated.is_ok(), "{updated:?}");
         assert_eq!(updated.ok(), Some(false));
     }
 
     #[test]
     fn upsert_updates_changed() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.md");
         std::fs::write(&file_path, "---\ntype: project\n---\noriginal body\n").ok();
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
-        let vf = crate::vault::reader::read_file(&file_path).unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
+        let vf = crate::vault::reader::read_file(&file_path).unwrap();
         store.upsert(&vf, dir.path()).ok();
 
         std::fs::write(&file_path, "---\ntype: project\n---\nupdated body\n").ok();
-        let vf2 = crate::vault::reader::read_file(&file_path).unwrap_or_else(|_| std::process::exit(1));
+        let vf2 = crate::vault::reader::read_file(&file_path).unwrap();
         let updated = store.upsert(&vf2, dir.path());
-        assert!(updated.is_ok());
+        assert!(updated.is_ok(), "{updated:?}");
         assert_eq!(updated.ok(), Some(true));
     }
 
     #[test]
     fn remove_deletes_from_index() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.md");
         std::fs::write(&file_path, "---\ntype: insight\nsummary: Test insight\n---\nbody\n").ok();
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
-        let vf = crate::vault::reader::read_file(&file_path).unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
+        let vf = crate::vault::reader::read_file(&file_path).unwrap();
         store.upsert(&vf, dir.path()).ok();
 
-        let conn = store.lock().unwrap_or_else(|_| std::process::exit(1));
+        let conn = store.lock().unwrap();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM vault_meta WHERE path = 'test.md'", [], |row| row.get(0)
         ).unwrap_or(0);
@@ -264,7 +266,7 @@ mod tests {
 
         store.remove("test.md").ok();
 
-        let conn = store.lock().unwrap_or_else(|_| std::process::exit(1));
+        let conn = store.lock().unwrap();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM vault_meta WHERE path = 'test.md'", [], |row| row.get(0)
         ).unwrap_or(0);

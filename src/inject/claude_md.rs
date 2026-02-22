@@ -45,16 +45,17 @@ pub fn inject(path: &Path, content: &str) -> Result<(), InjectError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn inject_into_empty_file() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("CLAUDE.md");
 
         let result = inject(&path, "wardwell context here");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains(START_MARKER));
@@ -64,12 +65,12 @@ mod tests {
 
     #[test]
     fn inject_appends_to_existing_file() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("CLAUDE.md");
         std::fs::write(&path, "# Existing Content\n\nKeep this.\n").ok();
 
         let result = inject(&path, "injected content");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("# Existing Content"));
@@ -80,7 +81,7 @@ mod tests {
 
     #[test]
     fn inject_replaces_between_markers() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("CLAUDE.md");
         let existing = format!(
             "# Header\n\n{START_MARKER}\nold content\n{END_MARKER}\n\n# Footer\n"
@@ -88,7 +89,7 @@ mod tests {
         std::fs::write(&path, &existing).ok();
 
         let result = inject(&path, "new content");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
 
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("# Header"));
@@ -99,7 +100,7 @@ mod tests {
 
     #[test]
     fn inject_preserves_content_outside_markers() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("CLAUDE.md");
         let existing = format!(
             "# Before\nImportant stuff.\n\n{START_MARKER}\nold\n{END_MARKER}\n\n# After\nMore stuff.\n"
@@ -118,7 +119,7 @@ mod tests {
 
     #[test]
     fn inject_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("CLAUDE.md");
         std::fs::write(&path, "# Existing\n").ok();
 

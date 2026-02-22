@@ -161,6 +161,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -192,24 +193,17 @@ session_sources:
   - /tmp/sessions/
 
 "#;
-        let f = write_config(yaml);
-        if let Some(ref f) = f {
-            let config = load(Some(f.path()));
-            assert!(config.is_ok());
-            let config = config.ok();
-            // Config domains are loaded as fallback (no vault domain files exist)
-            assert_eq!(config.as_ref().map(|c| c.registry.all().len()), Some(2));
-            assert_eq!(
-                config.as_ref().map(|c| c.vault_path.display().to_string()),
-                Some("/tmp/test-vault".to_string())
-            );
-        }
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        // Config domains are loaded as fallback (no vault domain files exist)
+        assert_eq!(config.registry.all().len(), 2);
+        assert_eq!(config.vault_path.display().to_string(), "/tmp/test-vault");
     }
 
     #[test]
     fn load_missing_file_errors() {
         let result = load(Some(Path::new("/nonexistent/config.yml")));
-        assert!(result.is_err());
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
@@ -219,13 +213,9 @@ vault_path: /tmp/vault
 domains: {}
 session_sources: []
 "#;
-        let f = write_config(yaml);
-        if let Some(ref f) = f {
-            let config = load(Some(f.path()));
-            assert!(config.is_ok());
-            let config = config.ok();
-            assert_eq!(config.as_ref().map(|c| c.registry.all().len()), Some(0));
-        }
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert_eq!(config.registry.all().len(), 0);
     }
 
     #[test]
@@ -244,19 +234,39 @@ domains:
 
 session_sources: []
 "#;
-        let f = write_config(yaml);
-        if let Some(ref f) = f {
-            let config = load(Some(f.path()));
-            assert!(config.is_ok());
-            let config = config.unwrap_or_else(|_| std::process::exit(1));
-            let wardwell = config.registry.find("wardwell");
-            assert!(wardwell.is_some());
-            let wardwell = wardwell.unwrap_or_else(|| std::process::exit(1));
-            assert_eq!(wardwell.can_read, vec!["personal", "general"]);
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        let wardwell = config.registry.find("wardwell").unwrap();
+        assert_eq!(wardwell.can_read, vec!["personal", "general"]);
 
-            let personal = config.registry.find("personal");
-            assert!(personal.is_some());
-            assert!(personal.unwrap_or_else(|| std::process::exit(1)).can_read.is_empty());
-        }
+        let personal = config.registry.find("personal").unwrap();
+        assert!(personal.can_read.is_empty());
+    }
+
+    #[test]
+    fn expand_tilde_with_home() {
+        let result = expand_tilde("~/documents");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home.join("documents"));
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path() {
+        let result = expand_tilde("/absolute/path");
+        assert_eq!(result, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn load_config_with_unknown_keys() {
+        let yaml = r#"
+vault_path: /tmp/test-vault
+session_sources: []
+future_key: some_value
+another_unknown:
+  nested: true
+"#;
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path()));
+        assert!(config.is_ok(), "{config:?}");
     }
 }

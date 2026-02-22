@@ -200,6 +200,7 @@ pub fn safe_open_read(path: &Path, boundaries: &[PathGlob]) -> Result<String, Pa
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -207,46 +208,62 @@ mod tests {
 
     #[test]
     fn blocks_classic_traversal() {
-        assert!(check_dangerous_patterns("../etc/passwd").is_err());
-        assert!(check_dangerous_patterns("..\\windows\\system32").is_err());
+        let r1 = check_dangerous_patterns("../etc/passwd");
+        assert!(r1.is_err(), "{r1:?}");
+        let r2 = check_dangerous_patterns("..\\windows\\system32");
+        assert!(r2.is_err(), "{r2:?}");
     }
 
     #[test]
     fn blocks_url_encoded_traversal() {
-        assert!(check_dangerous_patterns("%2e%2e/etc/passwd").is_err());
-        assert!(check_dangerous_patterns("%2E%2E/etc/passwd").is_err());
-        assert!(check_dangerous_patterns("%2e%2e%2f").is_err());
-        assert!(check_dangerous_patterns("%2e%2e%5c").is_err());
+        let r1 = check_dangerous_patterns("%2e%2e/etc/passwd");
+        assert!(r1.is_err(), "{r1:?}");
+        let r2 = check_dangerous_patterns("%2E%2E/etc/passwd");
+        assert!(r2.is_err(), "{r2:?}");
+        let r3 = check_dangerous_patterns("%2e%2e%2f");
+        assert!(r3.is_err(), "{r3:?}");
+        let r4 = check_dangerous_patterns("%2e%2e%5c");
+        assert!(r4.is_err(), "{r4:?}");
     }
 
     #[test]
     fn blocks_double_encoded() {
-        assert!(check_dangerous_patterns("%252e%252e/etc").is_err());
+        let result = check_dangerous_patterns("%252e%252e/etc");
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
     fn blocks_mixed_encoding() {
-        assert!(check_dangerous_patterns("..%2f").is_err());
-        assert!(check_dangerous_patterns("..%5c").is_err());
-        assert!(check_dangerous_patterns("%2e%2e/").is_err());
+        let r1 = check_dangerous_patterns("..%2f");
+        assert!(r1.is_err(), "{r1:?}");
+        let r2 = check_dangerous_patterns("..%5c");
+        assert!(r2.is_err(), "{r2:?}");
+        let r3 = check_dangerous_patterns("%2e%2e/");
+        assert!(r3.is_err(), "{r3:?}");
     }
 
     #[test]
     fn blocks_null_bytes() {
-        assert!(check_dangerous_patterns("/tmp/test\x00.txt").is_err());
-        assert!(check_dangerous_patterns("/tmp/test%00.txt").is_err());
+        let r1 = check_dangerous_patterns("/tmp/test\x00.txt");
+        assert!(r1.is_err(), "{r1:?}");
+        let r2 = check_dangerous_patterns("/tmp/test%00.txt");
+        assert!(r2.is_err(), "{r2:?}");
     }
 
     #[test]
     fn blocks_unicode_normalization() {
-        assert!(check_dangerous_patterns("\u{FF0E}\u{FF0E}/etc/passwd").is_err());
+        let result = check_dangerous_patterns("\u{FF0E}\u{FF0E}/etc/passwd");
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
     fn allows_safe_paths() {
-        assert!(check_dangerous_patterns("/tmp/safe/file.txt").is_ok());
-        assert!(check_dangerous_patterns("/home/user/notes.md").is_ok());
-        assert!(check_dangerous_patterns("relative/path/ok.rs").is_ok());
+        let r1 = check_dangerous_patterns("/tmp/safe/file.txt");
+        assert!(r1.is_ok(), "{r1:?}");
+        let r2 = check_dangerous_patterns("/home/user/notes.md");
+        assert!(r2.is_ok(), "{r2:?}");
+        let r3 = check_dangerous_patterns("relative/path/ok.rs");
+        assert!(r3.is_ok(), "{r3:?}");
     }
 
     // --- Path resolution tests (require filesystem) ---
@@ -255,13 +272,13 @@ mod tests {
     fn resolve_real_path() {
         // /tmp should exist on all unix systems
         let result = resolve_path(Path::new("/tmp"));
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
     fn resolve_nonexistent_path_errors() {
         let result = resolve_path(Path::new("/nonexistent/path/that/doesnt/exist"));
-        assert!(result.is_err());
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]

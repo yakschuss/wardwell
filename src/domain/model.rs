@@ -96,16 +96,17 @@ impl Domain {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::vault::types::Frontmatter;
     use std::path::PathBuf;
 
     fn test_domain() -> Domain {
-        let name = DomainName::new("test").unwrap_or_else(|_| std::process::exit(1));
+        let name = DomainName::new("test").unwrap();
         Domain {
             name,
-            paths: vec![PathGlob::new("/tmp/test/*").unwrap_or_else(|_| std::process::exit(1))],
+            paths: vec![PathGlob::new("/tmp/test/*").unwrap()],
             aliases: HashMap::new(),
             can_read: Vec::new(),
         }
@@ -142,8 +143,8 @@ mod tests {
         };
 
         let domain = Domain::from_vault_file(&vf);
-        assert!(domain.is_ok());
-        let domain = domain.unwrap_or_else(|_| std::process::exit(1));
+        assert!(domain.is_ok(), "{domain:?}");
+        let domain = domain.unwrap();
         assert_eq!(domain.name.as_str(), "myapp");
         assert_eq!(domain.paths.len(), 2);
         assert_eq!(domain.aliases.get("repos").map(|s| s.as_str()), Some("~/Code"));
@@ -169,8 +170,8 @@ mod tests {
         };
 
         let domain = Domain::from_vault_file(&vf);
-        assert!(domain.is_ok());
-        assert_eq!(domain.unwrap_or_else(|_| std::process::exit(1)).name.as_str(), "personal");
+        assert!(domain.is_ok(), "{domain:?}");
+        assert_eq!(domain.unwrap().name.as_str(), "personal");
     }
 
     #[test]
@@ -191,7 +192,8 @@ mod tests {
             body: String::new(),
         };
 
-        assert!(Domain::from_vault_file(&vf).is_err());
+        let result = Domain::from_vault_file(&vf);
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
@@ -212,7 +214,8 @@ mod tests {
             body: "## Paths\n- /tmp/*\n".to_string(),
         };
 
-        assert!(Domain::from_vault_file(&vf).is_err());
+        let result = Domain::from_vault_file(&vf);
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
@@ -234,8 +237,8 @@ mod tests {
         };
 
         let domain = Domain::from_vault_file(&vf);
-        assert!(domain.is_ok());
-        let domain = domain.unwrap_or_else(|_| std::process::exit(1));
+        assert!(domain.is_ok(), "{domain:?}");
+        let domain = domain.unwrap();
         assert_eq!(domain.name.as_str(), "wardwell");
         assert_eq!(domain.can_read, vec!["personal", "general"]);
     }
@@ -259,7 +262,7 @@ mod tests {
         };
 
         let domain = Domain::from_vault_file(&vf);
-        assert!(domain.is_ok());
-        assert!(domain.unwrap_or_else(|_| std::process::exit(1)).can_read.is_empty());
+        assert!(domain.is_ok(), "{domain:?}");
+        assert!(domain.unwrap().can_read.is_empty());
     }
 }

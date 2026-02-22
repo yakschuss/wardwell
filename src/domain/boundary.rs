@@ -61,6 +61,7 @@ impl<'a> BoundaryEnforcer<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::config::types::{DomainName, PathGlob};
@@ -68,15 +69,15 @@ mod tests {
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, Domain) {
-        let dir = TempDir::new().unwrap_or_else(|_| std::process::exit(1));
+        let dir = TempDir::new().unwrap();
 
         let test_file = dir.path().join("allowed.txt");
         std::fs::write(&test_file, "allowed content").ok();
 
         let domain = Domain {
-            name: DomainName::new("test").unwrap_or_else(|_| std::process::exit(1)),
+            name: DomainName::new("test").unwrap(),
             paths: vec![PathGlob::new(&format!("{}/*", dir.path().display()))
-                .unwrap_or_else(|_| std::process::exit(1))],
+                .unwrap()],
             aliases: HashMap::new(),
             can_read: Vec::new(),
         };
@@ -135,7 +136,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let (dir, domain) = setup();
 
-        let outside = TempDir::new().unwrap_or_else(|_| std::process::exit(1));
+        let outside = TempDir::new().unwrap();
         let outside_file = outside.path().join("secret.txt");
         std::fs::write(&outside_file, "secret").ok();
 

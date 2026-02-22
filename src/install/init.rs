@@ -562,3 +562,71 @@ fn is_wardwell_hook(entry: &serde_json::Value) -> bool {
             })
         })
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_path_with_tilde() {
+        let result = expand_path("~/foo");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(result, home.join("foo"));
+    }
+
+    #[test]
+    fn expand_path_absolute() {
+        let result = expand_path("/abs/path");
+        assert_eq!(result, PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn expand_path_relative() {
+        let result = expand_path("relative/path");
+        assert_eq!(result, PathBuf::from("relative/path"));
+    }
+
+    #[test]
+    fn count_files_recursive_with_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::File::create(dir.path().join("a.md")).unwrap();
+        std::fs::File::create(dir.path().join("b.txt")).unwrap();
+        std::fs::File::create(sub.join("c.md")).unwrap();
+        assert_eq!(count_files_recursive(dir.path()), 3);
+    }
+
+    #[test]
+    fn count_files_recursive_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(count_files_recursive(dir.path()), 0);
+    }
+
+    #[test]
+    fn is_wardwell_hook_old_flat_format() {
+        let entry = serde_json::json!({"type": "command", "command": "wardwell inject $(pwd)"});
+        assert!(is_wardwell_hook(&entry));
+    }
+
+    #[test]
+    fn is_wardwell_hook_new_nested_format() {
+        let entry = serde_json::json!({"hooks": [{"type": "command", "command": "/usr/bin/wardwell inject $(pwd)"}]});
+        assert!(is_wardwell_hook(&entry));
+    }
+
+    #[test]
+    fn is_wardwell_hook_non_wardwell() {
+        let entry = serde_json::json!({"type": "command", "command": "echo hello"});
+        assert!(!is_wardwell_hook(&entry));
+    }
+
+    #[test]
+    fn build_injection_content_returns_expected() {
+        let content = build_injection_content(&[]);
+        assert!(content.contains("wardwell_search"), "missing wardwell_search");
+        assert!(content.contains("wardwell_write"), "missing wardwell_write");
+        assert!(content.contains("wardwell_clipboard"), "missing wardwell_clipboard");
+    }
+}

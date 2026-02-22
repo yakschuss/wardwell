@@ -225,3 +225,82 @@ fn format_size(bytes: u64) -> String {
         format!("{bytes}B")
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_size_bytes() {
+        assert_eq!(format_size(500), "500B");
+    }
+
+    #[test]
+    fn format_size_kilobytes() {
+        assert_eq!(format_size(1_500), "1KB");
+    }
+
+    #[test]
+    fn format_size_megabytes() {
+        assert_eq!(format_size(2_500_000), "2MB");
+    }
+
+    #[test]
+    fn format_size_zero() {
+        assert_eq!(format_size(0), "0B");
+    }
+
+    #[test]
+    fn list_vault_domains_with_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("personal")).unwrap();
+        std::fs::create_dir(dir.path().join("work")).unwrap();
+        // File should not appear
+        std::fs::File::create(dir.path().join("readme.md")).unwrap();
+        let domains = list_vault_domains(dir.path());
+        assert_eq!(domains, vec!["personal", "work"]);
+    }
+
+    #[test]
+    fn list_vault_domains_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let domains = list_vault_domains(dir.path());
+        assert!(domains.is_empty());
+    }
+
+    #[test]
+    fn count_md_files_with_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Create .md files
+        std::fs::write(root.join("note.md"), "---\ntype: reference\n---\n# Note\n").unwrap();
+        std::fs::write(root.join("other.md"), "---\ntype: reference\n---\n# Other\n").unwrap();
+        // Create excluded subdir
+        let excluded = root.join("node_modules");
+        std::fs::create_dir(&excluded).unwrap();
+        std::fs::write(excluded.join("pkg.md"), "---\ntype: reference\n---\n# Pkg\n").unwrap();
+        let count = count_md_files(root, &["node_modules".to_string()]);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn check_session_start_hook_detects_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let json = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "hooks": [{"type": "command", "command": "wardwell inject $(pwd)"}]
+                }]
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        assert!(check_session_start_hook(&path));
+    }
+
+    #[test]
+    fn check_session_start_hook_missing_file() {
+        assert!(!check_session_start_hook(std::path::Path::new("/nonexistent")));
+    }
+}

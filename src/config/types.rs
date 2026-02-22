@@ -173,19 +173,24 @@ fn dirs_home() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
     #[test]
     fn domain_name_rejects_empty() {
-        assert!(DomainName::new("").is_err());
-        assert!(DomainName::new("  ").is_err());
+        let r1 = DomainName::new("");
+        assert!(r1.is_err(), "{r1:?}");
+        let r2 = DomainName::new("  ");
+        assert!(r2.is_err(), "{r2:?}");
     }
 
     #[test]
     fn domain_name_rejects_path_separators() {
-        assert!(DomainName::new("foo/bar").is_err());
-        assert!(DomainName::new("foo\\bar").is_err());
+        let r1 = DomainName::new("foo/bar");
+        assert!(r1.is_err(), "{r1:?}");
+        let r2 = DomainName::new("foo\\bar");
+        assert!(r2.is_err(), "{r2:?}");
     }
 
     #[test]
@@ -197,13 +202,16 @@ mod tests {
 
     #[test]
     fn path_glob_rejects_empty() {
-        assert!(PathGlob::new("").is_err());
+        let result = PathGlob::new("");
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
     fn path_glob_accepts_valid() {
-        assert!(PathGlob::new("~/projects/*").is_ok());
-        assert!(PathGlob::new("/tmp/test").is_ok());
+        let r1 = PathGlob::new("~/projects/*");
+        assert!(r1.is_ok(), "{r1:?}");
+        let r2 = PathGlob::new("/tmp/test");
+        assert!(r2.is_ok(), "{r2:?}");
     }
 
     #[test]

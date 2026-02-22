@@ -89,6 +89,7 @@ fn walk_recursive(dir: &Path, exclude: &[String], results: &mut Vec<Result<Vault
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -102,7 +103,7 @@ mod tests {
 
     #[test]
     fn read_project_file() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_vault_file(
             dir.path(),
             "myapp.md",
@@ -110,15 +111,15 @@ mod tests {
         );
 
         let result = read_file(&dir.path().join("myapp.md"));
-        assert!(result.is_ok());
-        let vf = result.unwrap_or_else(|_| std::process::exit(1));
+        assert!(result.is_ok(), "{result:?}");
+        let vf = result.unwrap();
         assert_eq!(vf.frontmatter.file_type, crate::vault::types::VaultType::Project);
         assert!(vf.body.contains("## Summary"));
     }
 
     #[test]
     fn read_decision_file() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_vault_file(
             dir.path(),
             "auth.md",
@@ -126,17 +127,17 @@ mod tests {
         );
 
         let result = read_file(&dir.path().join("auth.md"));
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
     fn read_file_without_frontmatter_uses_defaults() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_vault_file(dir.path(), "plain.md", "# My Notes\nSome content here.");
 
         let result = read_file(&dir.path().join("plain.md"));
-        assert!(result.is_ok());
-        let vf = result.unwrap_or_else(|_| std::process::exit(1));
+        assert!(result.is_ok(), "{result:?}");
+        let vf = result.unwrap();
         assert_eq!(vf.frontmatter.file_type, crate::vault::types::VaultType::Reference);
         assert_eq!(vf.frontmatter.summary.as_deref(), Some("My Notes"));
         assert!(vf.body.contains("Some content here."));
@@ -145,12 +146,12 @@ mod tests {
     #[test]
     fn read_nonexistent_file_returns_error() {
         let result = read_file(Path::new("/nonexistent/file.md"));
-        assert!(result.is_err());
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
     fn walk_vault_finds_all_md_files() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_vault_file(
             dir.path(),
             "project.md",
@@ -174,7 +175,7 @@ mod tests {
 
     #[test]
     fn walk_vault_indexes_files_without_frontmatter() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_vault_file(
             dir.path(),
             "good.md",

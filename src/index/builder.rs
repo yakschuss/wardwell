@@ -71,6 +71,7 @@ pub(crate) fn compute_hash(content: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -99,88 +100,88 @@ mod tests {
 
     #[test]
     fn full_build_populates_index() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
         let stats = IndexBuilder::full_build(&store, dir.path());
-        assert!(stats.is_ok());
-        let stats = stats.unwrap_or_else(|_| std::process::exit(1));
+        assert!(stats.is_ok(), "{stats:?}");
+        let stats = stats.unwrap();
         assert_eq!(stats.indexed, 3);
         assert_eq!(stats.errors, 0);
     }
 
     #[test]
     fn full_build_is_incremental() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
-        let stats = IndexBuilder::full_build(&store, dir.path()).unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
+        let stats = IndexBuilder::full_build(&store, dir.path()).unwrap();
         assert_eq!(stats.indexed, 3);
 
         // Second build should skip all unchanged files
-        let stats2 = IndexBuilder::full_build(&store, dir.path()).unwrap_or_else(|_| std::process::exit(1));
+        let stats2 = IndexBuilder::full_build(&store, dir.path()).unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.skipped, 3);
     }
 
     #[test]
     fn build_filtered_excludes_dirs() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
         // Add a file in an excluded directory
         let nm = dir.path().join("node_modules");
         std::fs::create_dir_all(&nm).ok();
         std::fs::write(nm.join("junk.md"), "---\ntype: reference\n---\njunk\n").ok();
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
         let exclude = vec!["node_modules".to_string()];
-        let stats = IndexBuilder::build_filtered(&store, dir.path(), &exclude).unwrap_or_else(|_| std::process::exit(1));
+        let stats = IndexBuilder::build_filtered(&store, dir.path(), &exclude).unwrap();
         assert_eq!(stats.indexed, 3); // node_modules/junk.md excluded
     }
 
     #[test]
     fn build_removes_stale_entries() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         create_test_vault(dir.path());
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
         IndexBuilder::full_build(&store, dir.path()).ok();
 
         // Remove a file from disk
         std::fs::remove_file(dir.path().join("myapp.md")).ok();
 
-        let stats = IndexBuilder::full_build(&store, dir.path()).unwrap_or_else(|_| std::process::exit(1));
+        let stats = IndexBuilder::full_build(&store, dir.path()).unwrap();
         assert_eq!(stats.removed, 1);
     }
 
     #[test]
     fn full_build_indexes_files_without_frontmatter() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("good.md"), "---\ntype: project\n---\nbody\n").ok();
         std::fs::write(dir.path().join("plain.md"), "no frontmatter").ok();
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
         let stats = IndexBuilder::full_build(&store, dir.path());
-        assert!(stats.is_ok());
-        let stats = stats.unwrap_or_else(|_| std::process::exit(1));
+        assert!(stats.is_ok(), "{stats:?}");
+        let stats = stats.unwrap();
         assert_eq!(stats.indexed, 2);
         assert_eq!(stats.errors, 0);
     }
 
     #[test]
     fn meta_table_populated() {
-        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::exit(1));
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("test.md"),
             "---\ntype: project\ndomain: test\nsummary: Test\n---\nbody\n",
         ).ok();
 
-        let store = IndexStore::in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = IndexStore::in_memory().unwrap();
         IndexBuilder::full_build(&store, dir.path()).ok();
 
-        let conn = store.lock().unwrap_or_else(|_| std::process::exit(1));
+        let conn = store.lock().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vault_meta", [], |row| row.get(0))
             .unwrap_or(0);

@@ -466,6 +466,7 @@ fn content_value_to_text(value: &serde_json::Value) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -480,12 +481,12 @@ mod tests {
     #[test]
     fn session_store_open_in_memory() {
         let store = SessionStore::open_in_memory();
-        assert!(store.is_ok());
+        assert!(store.is_ok(), "{:?}", store.err());
     }
 
     #[test]
     fn session_store_upsert_and_count() {
-        let store = SessionStore::open_in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = SessionStore::open_in_memory().unwrap();
         let meta = SessionMeta {
             session_id: "test-123".to_string(),
             project_dir: "-Users-test".to_string(),
@@ -501,7 +502,7 @@ mod tests {
         };
 
         let result = store.upsert(&meta);
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(result.ok(), Some(true));
 
         let count = store.count();
@@ -510,7 +511,7 @@ mod tests {
 
     #[test]
     fn session_store_upsert_skips_unchanged() {
-        let store = SessionStore::open_in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = SessionStore::open_in_memory().unwrap();
         let meta = SessionMeta {
             session_id: "test-456".to_string(),
             project_dir: "-Users-test".to_string(),
@@ -532,7 +533,7 @@ mod tests {
 
     #[test]
     fn session_store_unsummarized() {
-        let store = SessionStore::open_in_memory().unwrap_or_else(|_| std::process::exit(1));
+        let store = SessionStore::open_in_memory().unwrap();
         let meta = SessionMeta {
             session_id: "unsumm-1".to_string(),
             project_dir: "-Users-test".to_string(),
@@ -548,12 +549,12 @@ mod tests {
         };
 
         store.upsert(&meta).ok();
-        let unsumm = store.unsummarized().unwrap_or_else(|_| std::process::exit(1));
+        let unsumm = store.unsummarized().unwrap();
         assert_eq!(unsumm.len(), 1);
         assert_eq!(unsumm[0].session_id, "unsumm-1");
 
         store.mark_summarized("unsumm-1").ok();
-        let unsumm = store.unsummarized().unwrap_or_else(|_| std::process::exit(1));
+        let unsumm = store.unsummarized().unwrap();
         assert_eq!(unsumm.len(), 0);
     }
 

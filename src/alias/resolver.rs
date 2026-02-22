@@ -180,6 +180,7 @@ fn glob_base(glob: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -199,7 +200,7 @@ mod tests {
     fn resolve_alias_basic() {
         let resolver = test_resolver();
         let result = resolver.resolve("{alias:vault}/INDEX.md");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             result.ok().as_ref().map(|p| p.display().to_string()),
             Some("/tmp/test-vault/INDEX.md".to_string())
@@ -210,7 +211,7 @@ mod tests {
     fn resolve_alias_nested() {
         let resolver = test_resolver();
         let result = resolver.resolve("{alias:agents}/wardwell.md");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             result.ok().as_ref().map(|p| p.display().to_string()),
             Some("/tmp/test-vault/personal/wardwell.md".to_string())
@@ -221,7 +222,7 @@ mod tests {
     fn resolve_domain_reference() {
         let resolver = test_resolver();
         let result = resolver.resolve("{domain:personal}/notes.md");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             result.ok().as_ref().map(|p| p.display().to_string()),
             Some("/tmp/test-vault/notes.md".to_string())
@@ -232,7 +233,7 @@ mod tests {
     fn resolve_unknown_alias_errors() {
         let resolver = test_resolver();
         let result = resolver.resolve("{alias:nonexistent}/file.md");
-        assert!(result.is_err());
+        assert!(result.is_err(), "{result:?}");
         let err = format!("{}", result.err().unwrap_or(AliasError::UnknownAlias { name: String::new() }));
         assert!(err.contains("nonexistent"));
     }
@@ -242,21 +243,21 @@ mod tests {
         let resolver = test_resolver();
         // Path that resolves outside the domain boundary
         let result = resolver.resolve("/etc/passwd");
-        assert!(result.is_err());
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
     fn resolve_plain_path_within_boundary() {
         let resolver = test_resolver();
         let result = resolver.resolve("/tmp/test-vault/some/file.md");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
     fn resolve_unchecked_skips_boundary() {
         let resolver = test_resolver();
         let result = resolver.resolve_unchecked("/etc/passwd");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

@@ -306,6 +306,7 @@ pub async fn claude_cli_call(prompt: &str, model: &str) -> Result<String, Summar
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
