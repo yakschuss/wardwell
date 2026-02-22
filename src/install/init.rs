@@ -416,7 +416,7 @@ Your vault is indexed. Three tools:
 
 **wardwell_write** — Change things.
   action: sync | decide | append_history | lesson
-  - \"sync\": update current_state.md + optionally append history.jsonl
+  - \"sync\": FULL REPLACE of current_state.md + optionally append history.jsonl
   - \"decide\": append to decisions.md
   - \"append_history\": log to history.jsonl without state change
   - \"lesson\": append to lessons.jsonl (what went wrong, why, prevention)
@@ -438,9 +438,16 @@ Your vault is indexed. Three tools:
 - Decisions: the tradeoff, not the implementation
 - Lessons: root cause and prevention, not just what happened
 
-Domains are folders under the vault root. Projects are subfolders.
-Machine-written logs (history.jsonl, lessons.jsonl) are JSONL.
-Human-readable files (INDEX.md, current_state.md, decisions.md) are markdown."
+**File roles:**
+- INDEX.md — rich project notes, architecture, context. Human-edited. Never overwritten by wardwell.
+- current_state.md — lightweight snapshot. FULLY REPLACED on every sync. Do NOT put rich content here.
+- decisions.md — append-only. Human-readable markdown.
+- history.jsonl — append-only machine log. JSONL with schema header.
+- lessons.jsonl — append-only machine log. JSONL with schema header.
+
+Other .md files in a project folder are user-managed — indexed and searchable, but never written or overwritten by wardwell.
+
+Domains are folders under the vault root. Projects are subfolders."
         .to_string()
 }
 

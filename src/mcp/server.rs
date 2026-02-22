@@ -71,9 +71,9 @@ pub struct WriteParams {
     pub commit_message: Option<String>,
 
     // -- shared fields --
-    #[schemars(description = "REQUIRED for decide/append_history/lesson. Optional for sync (if provided, appends history entry).")]
+    #[schemars(description = "REQUIRED for decide/append_history/lesson. For sync: history entry title (defaults to commit_message if omitted).")]
     pub title: Option<String>,
-    #[schemars(description = "REQUIRED for decide/append_history. Optional for sync.")]
+    #[schemars(description = "REQUIRED for decide/append_history. Optional for sync/lesson.")]
     pub body: Option<String>,
 
     // -- lesson fields --
@@ -825,27 +825,25 @@ impl WardwellServer {
         }
         files_written.push(format!("{}/{}/{}/current_state.md", self.vault_root.display(), p.domain, p.project));
 
-        // Optionally append history entry to JSONL
-        if let Some(ref title) = p.title {
-            let history_path = project_dir.join("history.jsonl");
-            let jsonl_entry = HistoryJsonlEntry {
-                date: chrono::Utc::now().to_rfc3339(),
-                title: title.clone(),
-                status: status.clone(),
-                focus: focus.clone(),
-                next_action: next_action.clone(),
-                commit: commit_message.clone(),
-                body: p.body.clone().unwrap_or_default(),
-            };
-            let json = match serde_json::to_string(&jsonl_entry) {
-                Ok(j) => j,
-                Err(e) => return json_error(&format!("Failed to serialize history entry: {e}")),
-            };
-            if let Err(e) = append_jsonl(&history_path, "history", &json) {
-                return json_error(&format!("Failed to write history.jsonl: {e}"));
-            }
-            files_written.push(format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project));
+        // Always append history entry on sync
+        let history_path = project_dir.join("history.jsonl");
+        let jsonl_entry = HistoryJsonlEntry {
+            date: chrono::Utc::now().to_rfc3339(),
+            title: p.title.clone().unwrap_or_else(|| commit_message.clone()),
+            status: status.clone(),
+            focus: focus.clone(),
+            next_action: next_action.clone(),
+            commit: commit_message.clone(),
+            body: p.body.clone().unwrap_or_default(),
+        };
+        let json = match serde_json::to_string(&jsonl_entry) {
+            Ok(j) => j,
+            Err(e) => return json_error(&format!("Failed to serialize history entry: {e}")),
+        };
+        if let Err(e) = append_jsonl(&history_path, "history", &json) {
+            return json_error(&format!("Failed to write history.jsonl: {e}"));
         }
+        files_written.push(format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project));
 
         // Update FTS index for written files
         self.reindex_file(&state_path);
