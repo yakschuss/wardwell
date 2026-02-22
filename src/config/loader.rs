@@ -12,9 +12,6 @@ pub struct WardwellConfig {
     pub registry: DomainRegistry,
     pub session_sources: Vec<PathBuf>,
     pub exclude: Vec<String>,
-    /// Directory containing domain/project folders.
-    /// Absolute path, or relative to vault_path. Defaults to `{vault_path}/Agents`.
-    pub agents_dir: PathBuf,
     pub ai: AiConfig,
 }
 
@@ -51,7 +48,9 @@ struct RawConfig {
     seed_paths: Vec<String>,
     #[serde(default)]
     exclude: Vec<String>,
+    /// Ignored — kept for backwards compatibility with old configs.
     #[serde(default)]
+    #[allow(dead_code)]
     agents_dir: Option<String>,
     #[serde(default)]
     ai: Option<RawAiConfig>,
@@ -122,13 +121,6 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
 
     let session_sources = raw.session_sources.iter().map(|s| expand_tilde(s)).collect();
     let exclude = raw.exclude;
-    let agents_dir = match raw.agents_dir {
-        Some(s) => {
-            let p = expand_tilde(&s);
-            if p.is_absolute() { p } else { vault_path.join(p) }
-        }
-        None => vault_path.join("Agents"),
-    };
 
     let ai = match raw.ai {
         Some(raw_ai) => {
@@ -145,7 +137,6 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         registry,
         session_sources,
         exclude,
-        agents_dir,
         ai,
     })
 }

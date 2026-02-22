@@ -14,16 +14,14 @@ cargo install --path .
 wardwell init
 ```
 
-`wardwell init` does everything: creates `~/.wardwell/`, generates a minimal config, registers the MCP server in Claude Code, installs the SessionStart hook, and scaffolds your first `Agents/` directory.
+`wardwell init` does everything: creates `~/.wardwell/`, generates a minimal config, registers the MCP server in Claude Code, and installs the SessionStart hook.
 
 ## How It Works
 
-**Vault path** points at your notes directory (Obsidian vault, plain markdown folder, whatever you use). Wardwell indexes it for full-text search.
-
-**Agents/** is where project state lives. Each domain (a work area) contains projects. Each project has structured files that the AI reads and writes:
+**Vault path** points at your project knowledge directory. Wardwell indexes it for full-text search. Domains are top-level folders, projects are subfolders within them:
 
 ```
-Agents/
+vault_path/
   work/
     my-project/
       INDEX.md            # what and why
@@ -43,18 +41,18 @@ Agents/
 - `wardwell_write` — sync project state, record decisions, append history, store lessons
 - `wardwell_clipboard` — copy content to system clipboard (asks permission first)
 
-**SessionStart hook** injects project context when you open a Claude Code session. If your current directory matches an `Agents/` domain, the AI gets a summary of active projects and their state — before you type anything.
+**SessionStart hook** injects project context when you open a Claude Code session. If your current directory matches a vault domain, the AI gets a summary of active projects and their state — before you type anything.
 
 ## CLI Commands
 
 ```
 wardwell serve       Start the MCP server (Claude Code calls this automatically)
-wardwell init        First-run setup — config, MCP, hook, Agents/ directory
+wardwell init        First-run setup — config, MCP, hook
 wardwell doctor      Check that everything is wired correctly
 wardwell uninstall   Clean removal — MCP entries, hooks, markers (preserves vault)
 wardwell inject .    Output project context for a directory (used by hooks)
 wardwell reindex     Rebuild the vault search index from scratch
-wardwell seed <path> Create domain or project folders under Agents/
+wardwell seed <path> Create domain or project folders (e.g., work/my-project)
 ```
 
 ### `wardwell seed`
@@ -86,10 +84,9 @@ exclude:
 
 | Key | What it does |
 |-|-|
-| `vault_path` | Root directory to index for search (your notes/vault) |
+| `vault_path` | Root directory — domains and projects live here, indexed for search |
 | `session_sources` | Directories containing Claude Code session data |
-| `exclude` | Glob patterns to skip during indexing |
-| `agents_dir` | Override Agents/ location (defaults to `{vault_path}/Agents`) |
+| `exclude` | Patterns to skip during indexing |
 
 ## Background Services
 

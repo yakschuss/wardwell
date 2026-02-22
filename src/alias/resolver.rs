@@ -186,7 +186,7 @@ mod tests {
     fn test_resolver() -> AliasResolver {
         let mut aliases = HashMap::new();
         aliases.insert("vault".to_string(), "/tmp/test-vault".to_string());
-        aliases.insert("agents".to_string(), "/tmp/test-vault/Agents/personal".to_string());
+        aliases.insert("agents".to_string(), "/tmp/test-vault/personal".to_string());
 
         AliasResolver::new(
             &aliases,
@@ -213,7 +213,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(
             result.ok().as_ref().map(|p| p.display().to_string()),
-            Some("/tmp/test-vault/Agents/personal/wardwell.md".to_string())
+            Some("/tmp/test-vault/personal/wardwell.md".to_string())
         );
     }
 

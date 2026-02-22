@@ -438,7 +438,7 @@ Your vault is indexed. Three tools:
 - Decisions: the tradeoff, not the implementation
 - Lessons: root cause and prevention, not just what happened
 
-Domains are folders under Agents/. Projects are subfolders.
+Domains are folders under the vault root. Projects are subfolders.
 Machine-written logs (history.jsonl, lessons.jsonl) are JSONL.
 Human-readable files (INDEX.md, current_state.md, decisions.md) are markdown."
         .to_string()

@@ -25,17 +25,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     all_ok = false;
                 }
 
-                // Domains — derived from Agents/ subdirectories
-                let agents_dir = config.agents_dir.clone();
-                if agents_dir.exists() {
-                    let domains = list_agent_domains(&agents_dir);
+                // Domains — derived from vault subdirectories
+                if config.vault_path.exists() {
+                    let domains = list_vault_domains(&config.vault_path);
                     if domains.is_empty() {
-                        println!("  Domains                                \u{2717} no subdirectories under Agents/");
+                        println!("  Domains                                \u{2717} no subdirectories in vault");
                     } else {
                         println!("  Domains                                \u{2713} {}", domains.join(", "));
                     }
-                } else {
-                    println!("  Domains                                \u{2717} no Agents/ directory");
                 }
 
                 // Index
@@ -67,12 +64,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Sessions
                 let sessions_db = config_dir().join("sessions.db");
-                if sessions_db.exists() {
-                    if let Ok(store) = crate::daemon::indexer::SessionStore::open(&sessions_db)
-                        && let Ok(count) = store.count()
-                    {
-                        println!("  Sessions                               \u{2713} {} indexed", count);
-                    }
+                if sessions_db.exists()
+                    && let Ok(store) = crate::daemon::indexer::SessionStore::open(&sessions_db)
+                    && let Ok(count) = store.count()
+                {
+                    println!("  Sessions                               \u{2713} {} indexed", count);
                 }
 
                 // MCP configs
@@ -198,15 +194,15 @@ fn check_mcp(name: &str, config_path: &std::path::Path, expected_binary: &str, a
     }
 }
 
-/// List Agents/ subdirectory names.
-fn list_agent_domains(agents_dir: &std::path::Path) -> Vec<String> {
+/// List vault subdirectory names (domains).
+fn list_vault_domains(vault_dir: &std::path::Path) -> Vec<String> {
     let mut domains = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(agents_dir) {
+    if let Ok(entries) = std::fs::read_dir(vault_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    domains.push(name.to_string());
-                }
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                domains.push(name.to_string());
             }
         }
     }

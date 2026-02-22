@@ -18,7 +18,6 @@ pub struct WardwellServer {
     pub config: Arc<WardwellConfig>,
     pub index: Arc<IndexStore>,
     pub vault_root: PathBuf,
-    pub agents_dir: PathBuf,
     pub registry: Arc<RwLock<DomainRegistry>>,
 }
 
@@ -32,7 +31,7 @@ pub struct SearchParams {
     pub query: Option<String>,
     #[schemars(description = "For read: file path relative to vault root.")]
     pub path: Option<String>,
-    #[schemars(description = "Filter to a domain (Agents/ subdirectory). Optional.")]
+    #[schemars(description = "Filter to a domain (vault subdirectory). Optional.")]
     pub domain: Option<String>,
     #[schemars(description = "Filter to a project within a domain. For history queries.")]
     pub project: Option<String>,
@@ -80,7 +79,7 @@ pub struct WriteLessonEntry {
 pub struct WriteParams {
     #[schemars(description = "sync: replace current_state.md and optionally append history. decide: append to decisions.md. append_history: append to history.jsonl. lesson: append to lessons.jsonl.")]
     pub action: String,
-    #[schemars(description = "Domain folder under Agents/ (e.g., 'work', 'personal')")]
+    #[schemars(description = "Domain folder under vault root (e.g., 'work', 'personal')")]
     pub domain: String,
     #[schemars(description = "Project folder within the domain (e.g., 'my-project')")]
     pub project: String,
@@ -104,7 +103,6 @@ pub struct ClipboardParams {
 impl WardwellServer {
     pub fn new(config: WardwellConfig, index: Arc<IndexStore>) -> Self {
         let vault_root = config.vault_path.clone();
-        let agents_dir = config.agents_dir.clone();
         let registry = Arc::new(RwLock::new(DomainRegistry::from_domains(config.registry.all().to_vec())));
 
         Self {
@@ -112,7 +110,6 @@ impl WardwellServer {
             config: Arc::new(config),
             index,
             vault_root,
-            agents_dir,
             registry,
         }
     }
@@ -216,9 +213,9 @@ impl WardwellServer {
             None => return json_error("'query' is required for action 'history'."),
         };
 
-        let agents_dir = self.agents_dir.clone();
-        if !agents_dir.exists() {
-            return json_error(&format!("No {}/ directory found in vault.", self.agents_dir.display()));
+        let vault_dir = self.vault_root.clone();
+        if !vault_dir.exists() {
+            return json_error(&format!("No {}/ directory found in vault.", self.vault_root.display()));
         }
 
         let since_date = p.since.as_deref()
@@ -226,18 +223,18 @@ impl WardwellServer {
 
         let mut all_entries = Vec::new();
 
-        // Walk Agents/ looking for *.history.md or history.md files
+        // Walk vault looking for *.history.md or history.md files
         let dirs_to_scan = match (&p.domain, &p.project) {
-            (Some(d), Some(proj)) => vec![agents_dir.join(d).join(proj)],
-            (Some(d), None) => vec![agents_dir.join(d)],
-            _ => list_subdirs(&agents_dir),
+            (Some(d), Some(proj)) => vec![vault_dir.join(d).join(proj)],
+            (Some(d), None) => vec![vault_dir.join(d)],
+            _ => list_subdirs(&vault_dir),
         };
 
         for dir in &dirs_to_scan {
-            let agents_name = self.agents_dir.file_name()
+            let vault_name = self.vault_root.file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("Agents");
-            walk_history_files(dir, &query_str, since_date, p.limit.unwrap_or(5) * 3, agents_name, &mut all_entries);
+                .unwrap_or("vault");
+            walk_history_files(dir, &query_str, since_date, p.limit.unwrap_or(5) * 3, vault_name, &mut all_entries);
         }
 
         // Sort by date descending
@@ -264,14 +261,14 @@ impl WardwellServer {
     }
 
     fn action_orchestrate(&self, p: &SearchParams) -> String {
-        let agents_dir = self.agents_dir.clone();
-        if !agents_dir.exists() {
-            return json_error(&format!("No {}/ directory found in vault.", self.agents_dir.display()));
+        let vault_dir = self.vault_root.clone();
+        if !vault_dir.exists() {
+            return json_error(&format!("No {}/ directory found in vault.", self.vault_root.display()));
         }
 
         let dirs_to_scan = match &p.domain {
-            Some(d) => vec![agents_dir.join(d)],
-            None => list_subdirs(&agents_dir),
+            Some(d) => vec![vault_dir.join(d)],
+            None => list_subdirs(&vault_dir),
         };
 
         let mut active = Vec::new();
@@ -371,14 +368,14 @@ impl WardwellServer {
             &self.config.ai.summarize_model,
         ).await;
 
-        // Resolve domain/project from agents directory
-        let agents_match = resolve_agents_project(
+        // Resolve domain/project from vault directory
+        let vault_match = resolve_vault_project(
             std::path::Path::new(&project_path),
-            &self.agents_dir,
+            &self.vault_root,
         );
 
         // Pull vault state if we matched a project
-        let vault_state = agents_match.as_ref().and_then(|(_, _, project_dir)| {
+        let vault_state = vault_match.as_ref().and_then(|(_, _, project_dir)| {
             let state_path = project_dir.join("current_state.md");
             if !state_path.exists() {
                 return None;
@@ -412,7 +409,7 @@ impl WardwellServer {
             } else {
                 let query = SearchQuery {
                     query: terms,
-                    domains: agents_match.as_ref().map(|(d, _, _)| vec![d.clone()]),
+                    domains: vault_match.as_ref().map(|(d, _, _)| vec![d.clone()]),
                     types: Vec::new(),
                     status: None,
                     limit: 3,
@@ -429,7 +426,7 @@ impl WardwellServer {
             Vec::new()
         };
 
-        let (domain_name, project_name) = agents_match
+        let (domain_name, project_name) = vault_match
             .map(|(d, p, _)| (Some(d), Some(p)))
             .unwrap_or((None, None));
 
@@ -547,14 +544,14 @@ fn strip_frontmatter(content: &str) -> String {
     content.to_string()
 }
 
-/// Resolve a project path against the agents directory.
-/// Scans agents_dir subdirectories and matches the last path component
+/// Resolve a project path against the vault directory.
+/// Scans vault_dir subdirectories and matches the last path component
 /// of the project path against project folder names (case-insensitive).
-fn resolve_agents_project(
+fn resolve_vault_project(
     project_path: &std::path::Path,
-    agents_dir: &std::path::Path,
+    vault_dir: &std::path::Path,
 ) -> Option<(String, String, PathBuf)> {
-    if !agents_dir.exists() {
+    if !vault_dir.exists() {
         return None;
     }
 
@@ -564,7 +561,7 @@ fn resolve_agents_project(
         .and_then(|n| n.to_str())?
         .to_lowercase();
 
-    let domain_entries = std::fs::read_dir(agents_dir).ok()?;
+    let domain_entries = std::fs::read_dir(vault_dir).ok()?;
     for domain_entry in domain_entries.flatten() {
         let domain_path = domain_entry.path();
         if !domain_path.is_dir() {
@@ -768,7 +765,7 @@ impl WardwellServer {
             None => return json_error("'snapshot' is required for action 'sync'."),
         };
 
-        let project_dir = self.agents_dir.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -816,7 +813,7 @@ impl WardwellServer {
         if let Err(e) = std::fs::write(&state_path, &content) {
             return json_error(&format!("Failed to write current_state.md: {e}"));
         }
-        files_written.push(format!("{}/{}/{}/current_state.md", self.agents_dir.display(), p.domain, p.project));
+        files_written.push(format!("{}/{}/{}/current_state.md", self.vault_root.display(), p.domain, p.project));
 
         // Optionally append history entry to JSONL
         if let Some(ref entry) = p.history_entry {
@@ -837,7 +834,7 @@ impl WardwellServer {
             if let Err(e) = append_jsonl(&history_path, "history", &json) {
                 return json_error(&format!("Failed to write history.jsonl: {e}"));
             }
-            files_written.push(format!("{}/{}/{}/history.jsonl", self.agents_dir.display(), p.domain, p.project));
+            files_written.push(format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project));
         }
 
         serde_json::to_string(&serde_json::json!({
@@ -852,7 +849,7 @@ impl WardwellServer {
             None => return json_error("'decision' is required for action 'decide'."),
         };
 
-        let project_dir = self.agents_dir.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -866,7 +863,7 @@ impl WardwellServer {
             return json_error(&format!("Failed to write decisions.md: {e}"));
         }
 
-        let rel = format!("{}/{}/{}/decisions.md", self.agents_dir.display(), p.domain, p.project);
+        let rel = format!("{}/{}/{}/decisions.md", self.vault_root.display(), p.domain, p.project);
         serde_json::to_string(&serde_json::json!({
             "recorded": true,
             "path": rel,
@@ -879,7 +876,7 @@ impl WardwellServer {
             None => return json_error("'history_entry' is required for action 'append_history'."),
         };
 
-        let project_dir = self.agents_dir.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -902,7 +899,7 @@ impl WardwellServer {
             return json_error(&format!("Failed to write history.jsonl: {e}"));
         }
 
-        let rel = format!("{}/{}/{}/history.jsonl", self.agents_dir.display(), p.domain, p.project);
+        let rel = format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project);
         serde_json::to_string(&serde_json::json!({
             "appended": true,
             "path": rel,
@@ -915,7 +912,7 @@ impl WardwellServer {
             None => return json_error("'lesson' is required for action 'lesson'."),
         };
 
-        let project_dir = self.agents_dir.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -936,7 +933,7 @@ impl WardwellServer {
             return json_error(&format!("Failed to write lessons.jsonl: {e}"));
         }
 
-        let rel = format!("{}/{}/{}/lessons.jsonl", self.agents_dir.display(), p.domain, p.project);
+        let rel = format!("{}/{}/{}/lessons.jsonl", self.vault_root.display(), p.domain, p.project);
         serde_json::to_string(&serde_json::json!({
             "recorded": true,
             "path": rel,
@@ -1027,7 +1024,7 @@ fn walk_history_files(
     query: &str,
     since: Option<chrono::NaiveDate>,
     max: usize,
-    agents_dir_name: &str,
+    vault_dir_name: &str,
     out: &mut Vec<HistoryEntry>,
 ) {
     if !dir.exists() { return; }
@@ -1035,11 +1032,11 @@ fn walk_history_files(
     let query_lower = query.to_lowercase();
 
     // Infer domain/project from a file path
-    let infer_domain_project = |path: &std::path::Path, agents_name: &str| -> (String, String) {
+    let infer_domain_project = |path: &std::path::Path, vault_name: &str| -> (String, String) {
         let path_str = path.to_string_lossy();
         let components: Vec<&str> = path_str.split('/').collect();
-        let agents_idx = components.iter().position(|c| *c == agents_name);
-        match agents_idx {
+        let vault_idx = components.iter().position(|c| *c == vault_name);
+        match vault_idx {
             Some(idx) => {
                 let d = components.get(idx + 1).unwrap_or(&"unknown");
                 let p = components.get(idx + 2)
@@ -1051,12 +1048,12 @@ fn walk_history_files(
         }
     };
 
-    let process_jsonl = |path: &std::path::Path, agents_name: &str, out: &mut Vec<HistoryEntry>| {
+    let process_jsonl = |path: &std::path::Path, vault_name: &str, out: &mut Vec<HistoryEntry>| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return,
         };
-        let (domain, project) = infer_domain_project(path, agents_name);
+        let (domain, project) = infer_domain_project(path, vault_name);
         let source = path.to_string_lossy().to_string();
 
         for line in content.lines() {
@@ -1098,12 +1095,12 @@ fn walk_history_files(
         }
     };
 
-    let process_md = |path: &std::path::Path, agents_name: &str, out: &mut Vec<HistoryEntry>| {
+    let process_md = |path: &std::path::Path, vault_name: &str, out: &mut Vec<HistoryEntry>| {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => return,
         };
-        let (domain, project) = infer_domain_project(path, agents_name);
+        let (domain, project) = infer_domain_project(path, vault_name);
         let source = path.to_string_lossy().to_string();
 
         let mut current_date = String::new();
@@ -1178,20 +1175,20 @@ fn walk_history_files(
     let jsonl_path = dir.join("history.jsonl");
     let md_path = dir.join("history.md");
     if jsonl_path.exists() {
-        process_jsonl(&jsonl_path, agents_dir_name, out);
+        process_jsonl(&jsonl_path, vault_dir_name, out);
     } else if md_path.exists() {
-        process_md(&md_path, agents_dir_name, out);
+        process_md(&md_path, vault_dir_name, out);
     }
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() && p.to_string_lossy().ends_with(".history.jsonl") {
-                process_jsonl(&p, agents_dir_name, out);
+                process_jsonl(&p, vault_dir_name, out);
             } else if p.is_file() && p.to_string_lossy().ends_with(".history.md") {
-                process_md(&p, agents_dir_name, out);
+                process_md(&p, vault_dir_name, out);
             } else if p.is_dir() {
-                walk_history_files(&p, query, since, max, agents_dir_name, out);
+                walk_history_files(&p, query, since, max, vault_dir_name, out);
             }
         }
     }
@@ -1336,13 +1333,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agents_project_matches() {
-        let tmp = std::env::temp_dir().join("wardwell_test_agents_match");
+    fn resolve_vault_project_matches() {
+        let tmp = std::env::temp_dir().join("wardwell_test_vault_match");
         let _ = std::fs::remove_dir_all(&tmp);
         let project_dir = tmp.join("personal").join("wardwell");
         std::fs::create_dir_all(&project_dir).unwrap_or_else(|_| std::process::exit(1));
 
-        let result = resolve_agents_project(
+        let result = resolve_vault_project(
             std::path::Path::new("/Users/jack/Code/wardwell"),
             &tmp,
         );
@@ -1355,13 +1352,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_agents_project_no_match() {
-        let tmp = std::env::temp_dir().join("wardwell_test_agents_nomatch");
+    fn resolve_vault_project_no_match() {
+        let tmp = std::env::temp_dir().join("wardwell_test_vault_nomatch");
         let _ = std::fs::remove_dir_all(&tmp);
         let project_dir = tmp.join("personal").join("other-project");
         std::fs::create_dir_all(&project_dir).unwrap_or_else(|_| std::process::exit(1));
 
-        let result = resolve_agents_project(
+        let result = resolve_vault_project(
             std::path::Path::new("/Users/jack/Code/wardwell"),
             &tmp,
         );

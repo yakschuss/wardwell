@@ -26,7 +26,7 @@ enum Commands {
     },
     /// Rebuild the vault search index from scratch
     Reindex,
-    /// Create a domain or project folder under Agents/ (additive only)
+    /// Create a domain or project folder under the vault (additive only)
     Seed {
         /// Domain or domain/project path (e.g., "work", "work/my-project")
         target: String,
@@ -176,22 +176,20 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;
 
     let config = loader::load(None)?;
-    let agents_dir = config.agents_dir.clone();
+    let vault_path = &config.vault_path;
 
-    if !agents_dir.exists() {
-        // No Agents/ directory — nothing to inject
+    if !vault_path.exists() {
         return Ok(());
     }
 
-    // Try to match cwd to an Agents/ domain by checking if cwd is within
-    // a domain's path patterns, or by matching the directory name
+    // Try to match cwd to a vault domain by checking if cwd directory name
+    // matches a subdirectory of the vault
     let cwd_path = std::path::Path::new(cwd);
     let cwd_name = cwd_path.file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
 
-    // Check if any Agents/ subdirectory name matches the cwd directory name
-    let matched_domain = std::fs::read_dir(&agents_dir).ok()
+    let matched_domain = std::fs::read_dir(vault_path).ok()
         .and_then(|entries| {
             entries.flatten()
                 .find(|e| {
@@ -226,7 +224,6 @@ fn inject_domain_context(domain_dir: &Path) {
     }
 
     // Check subdirectory projects
-    let mut found = false;
     if let Ok(entries) = std::fs::read_dir(domain_dir) {
         for entry in entries.flatten() {
             let p = entry.path();
@@ -247,14 +244,10 @@ fn inject_domain_context(domain_dir: &Path) {
                     if !next.is_empty() {
                         println!("  Next: {next}");
                     }
-                    found = true;
                 }
             }
         }
     }
-
-    // If no current_state.md found, output nothing.
-    // Don't list raw filenames — that's noise, not context.
 }
 
 /// Simple section extractor for inject (no dependency on server module).
@@ -298,14 +291,14 @@ fn run_seed(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;
 
     let config = loader::load(None)?;
-    let agents_dir = &config.agents_dir;
+    let vault_path = &config.vault_path;
 
     let parts: Vec<&str> = target.splitn(2, '/').collect();
     let domain = parts[0];
 
     if parts.len() == 1 {
         // Bare domain — just create the directory
-        let domain_dir = agents_dir.join(domain);
+        let domain_dir = vault_path.join(domain);
         std::fs::create_dir_all(&domain_dir)?;
         println!("{domain}/: domain directory ready");
         if let Ok(entries) = std::fs::read_dir(&domain_dir) {
@@ -322,16 +315,16 @@ fn run_seed(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let project = parts[1];
-    let project_dir = agents_dir.join(domain).join(project);
+    let project_dir = vault_path.join(domain).join(project);
 
     if project_dir.exists() {
-        eprintln!("Project already exists at Agents/{domain}/{project}/");
+        eprintln!("Project already exists at {domain}/{project}/");
         return Ok(());
     }
 
     let title = slug_to_title(project);
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
-    let rel = format!("Agents/{domain}/{project}");
+    let rel = format!("{domain}/{project}");
 
     std::fs::create_dir_all(&project_dir)?;
     println!("  Creating  {rel}/                {:>width$}", "\u{2713}", width = 40_usize.saturating_sub(rel.len() + 12));
