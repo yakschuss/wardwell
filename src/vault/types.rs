@@ -52,6 +52,8 @@ impl std::fmt::Display for VaultType {
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Active,
+    Completed,
+    Blocked,
     Resolved,
     Abandoned,
     Superseded,
@@ -61,6 +63,8 @@ impl std::fmt::Display for Status {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Active => write!(f, "active"),
+            Self::Completed => write!(f, "completed"),
+            Self::Blocked => write!(f, "blocked"),
             Self::Resolved => write!(f, "resolved"),
             Self::Abandoned => write!(f, "abandoned"),
             Self::Superseded => write!(f, "superseded"),

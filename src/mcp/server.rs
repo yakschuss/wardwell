@@ -847,6 +847,9 @@ impl WardwellServer {
             files_written.push(format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project));
         }
 
+        // Update FTS index for written files
+        self.reindex_file(&state_path);
+
         serde_json::to_string(&serde_json::json!({
             "synced": true,
             "files_written": files_written,
@@ -876,6 +879,8 @@ impl WardwellServer {
         if let Err(e) = prepend_to_file(&decisions_path, &format!("# {} Decisions", p.project), &entry) {
             return json_error(&format!("Failed to write decisions.md: {e}"));
         }
+
+        self.reindex_file(&decisions_path);
 
         let rel = format!("{}/{}/{}/decisions.md", self.vault_root.display(), p.domain, p.project);
         serde_json::to_string(&serde_json::json!({
@@ -964,6 +969,13 @@ impl WardwellServer {
             "recorded": true,
             "path": rel,
         })).unwrap_or_default()
+    }
+
+    /// Re-read a file from disk and upsert it into the FTS index.
+    fn reindex_file(&self, path: &std::path::Path) {
+        if let Ok(vf) = crate::vault::reader::read_file(path) {
+            let _ = self.index.upsert(&vf, &self.vault_root);
+        }
     }
 }
 
