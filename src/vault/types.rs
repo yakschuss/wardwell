@@ -152,6 +152,9 @@ where
     Ok(opt.and_then(|s| match s.as_str() {
         "active" => Some(Status::Active),
         "resolved" => Some(Status::Resolved),
+        "completed" => Some(Status::Completed),
+        "blocked" => Some(Status::Blocked),
+        "paused" => Some(Status::Paused),
         "abandoned" => Some(Status::Abandoned),
         "superseded" => Some(Status::Superseded),
         _ => None,

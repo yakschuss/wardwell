@@ -377,10 +377,23 @@ impl WardwellServer {
                         continue;
                     }
 
+                    let updated_str = vf.frontmatter.updated
+                        .map(|d| d.to_string())
+                        .or_else(|| {
+                            std::fs::metadata(&state_path).ok()
+                                .and_then(|m| m.modified().ok())
+                                .map(|t| {
+                                    let dt: chrono::DateTime<chrono::Local> = t.into();
+                                    dt.format("%Y-%m-%d").to_string()
+                                })
+                        })
+                        .unwrap_or_default();
+
                     let entry = serde_json::json!({
                         "domain": domain_name,
                         "project": project_name,
                         "status": status_str,
+                        "updated": updated_str,
                         "focus": focus,
                         "next_action": next_action,
                     });
@@ -388,6 +401,7 @@ impl WardwellServer {
                     match status_str.as_str() {
                         "blocked" => blocked.push(entry),
                         "completed" | "resolved" => completed_recently.push(entry),
+                        "paused" | "abandoned" | "superseded" => {} // excluded from queue
                         _ => active.push(entry),
                     }
                 }
