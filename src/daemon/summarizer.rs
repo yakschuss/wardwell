@@ -230,6 +230,12 @@ Frameworks, heuristics, or principles the user applied or articulated. Not "hide
 ## Context Changes
 State changes worth tracking: project phase shifts, blockers hit or resolved, scope changes, new collaborators, deadlines. Only if they affect future sessions.
 
+## Completed
+Bullet list of things that were finished in this session. Be specific — "shipped credential filter PR", not "made progress". Omit if nothing was completed.
+
+## Remaining
+Bullet list of concrete work items that were discussed or planned but NOT finished by the end of the session. These are handoff items for the next session. Each bullet should be actionable — "build email template components for each notification type", not "continue working on emails". Omit if everything was completed.
+
 If a section has nothing worth extracting, omit it entirely. Do not pad with low-signal observations.
 
 For a 30-minute session, 0-3 extractions is normal. Returning nothing is better than returning noise."#;
