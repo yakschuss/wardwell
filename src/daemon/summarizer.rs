@@ -175,18 +175,29 @@ fn build_summary_frontmatter(session: &UnsummarizedSession) -> String {
     )
 }
 
-/// Build a condensed conversation for the prompt.
+/// Build a condensed conversation for the summary prompt.
 /// Truncates to stay within token budget (~100k chars ≈ 25k tokens).
 pub fn build_conversation_payload(conversation: &[ConversationMessage]) -> String {
+    build_conversation_payload_with_limit(conversation, 100_000, 5_000)
+}
+
+/// Build a conversation payload for resume — higher limits since plans can be long.
+/// ~180k chars ≈ 45k tokens, individual messages up to 15k chars.
+pub fn build_resume_payload(conversation: &[ConversationMessage]) -> String {
+    build_conversation_payload_with_limit(conversation, 180_000, 15_000)
+}
+
+fn build_conversation_payload_with_limit(
+    conversation: &[ConversationMessage],
+    max_chars: usize,
+    max_msg_chars: usize,
+) -> String {
     let mut payload = String::new();
-    let max_chars: usize = 100_000;
 
     for msg in conversation {
         let role_label = if msg.role == "user" { "User" } else { "Assistant" };
-        // Truncate individual messages that are very long
-        let text = if msg.text.len() > 5000 {
-            // Find a valid char boundary at or before 5000
-            let end = msg.text.floor_char_boundary(5000);
+        let text = if msg.text.len() > max_msg_chars {
+            let end = msg.text.floor_char_boundary(max_msg_chars);
             format!("{}...[truncated]", &msg.text[..end])
         } else {
             msg.text.clone()
@@ -230,15 +241,38 @@ Frameworks, heuristics, or principles the user applied or articulated. Not "hide
 ## Context Changes
 State changes worth tracking: project phase shifts, blockers hit or resolved, scope changes, new collaborators, deadlines. Only if they affect future sessions.
 
-## Completed
-Bullet list of things that were finished in this session. Be specific — "shipped credential filter PR", not "made progress". Omit if nothing was completed.
-
-## Remaining
-Bullet list of concrete work items that were discussed or planned but NOT finished by the end of the session. These are handoff items for the next session. Each bullet should be actionable — "build email template components for each notification type", not "continue working on emails". Omit if everything was completed.
-
 If a section has nothing worth extracting, omit it entirely. Do not pad with low-signal observations.
 
 For a 30-minute session, 0-3 extractions is normal. Returning nothing is better than returning noise."#;
+
+/// Prompt for session handoff/resume. Extracts the plan, progress, and remaining work
+/// so a new session can pick up where the previous one left off.
+pub const RESUME_PROMPT: &str = r#"You are analyzing a Claude Code session transcript to help a NEW session pick up where this one left off. Extract everything the next session needs to continue the work.
+
+## Plan
+The overall plan or spec being worked on. If there's a written plan (plan file, spec, task list), reproduce it or summarize it faithfully. Include file paths, architecture decisions, and design choices. If no explicit plan exists, reconstruct the implicit one from the conversation.
+
+## Progress
+What was completed in this session. Be specific — file paths, function names, test results. The next session needs to know exactly what's done so it doesn't redo work.
+
+## Remaining
+Bullet list of concrete work items that are NOT finished. Each bullet should be actionable and specific enough to execute without re-reading the full conversation. Include:
+- Implementation tasks not yet started
+- Tasks started but not completed (note what's done and what's left)
+- Tests that need to be written or are failing
+- Known issues discovered but not fixed
+
+## Current State
+The state of the codebase at the end of the session:
+- What files were modified (committed or uncommitted)
+- What branch you're on
+- Any failing tests or build errors
+- Any temporary hacks or TODOs left in place
+
+## Key Decisions
+Architectural or design decisions made during the session that the next session must respect. Include the reasoning — "chose X over Y because Z."
+
+Omit empty sections. Prioritize completeness over brevity — this is a handoff document, not a summary."#;
 
 /// Call the claude CLI to summarize a conversation.
 async fn call_claude(

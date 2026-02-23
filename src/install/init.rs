@@ -407,14 +407,15 @@ fn build_injection_content(_domains: &[String]) -> String {
 Your vault is indexed. Three tools:
 
 **wardwell_search** — Find things.
-  action: search | read | history | orchestrate | retrospective | patterns | context
+  action: search | read | history | orchestrate | retrospective | patterns | context | resume
   - \"search\": FTS query across vault
   - \"read\": full file by path
   - \"history\": query across history.jsonl files
   - \"orchestrate\": prioritized project queue
   - \"retrospective\": what happened in a time period (requires since date)
   - \"patterns\": recurring blockers, stale threads, hot topics (defaults to 90 days)
-  - \"context\": full session context by ID
+  - \"context\": session summary by ID (lightweight, cached)
+  - \"resume\": full session handoff by ID — plan, progress, remaining work (always fresh, uses AI)
 
 **wardwell_write** — Change things.
   action: sync | decide | append_history | lesson
@@ -435,6 +436,7 @@ Your vault is indexed. Three tools:
 - User asks \"what did I accomplish this week\" → retrospective
 - User asks \"what keeps blocking me\" → patterns
 - User asks \"catch me up on session X\" → context
+- User asks \"pick up from session X\" or gives a session ID to continue → resume
 
 **Quality bar:**
 - Snapshots: one sentence focus, concrete next action

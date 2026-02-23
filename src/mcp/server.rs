@@ -30,7 +30,7 @@ pub struct WardwellServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    #[schemars(description = "search: FTS query across vault. read: full file content. history: query across history files. orchestrate: prioritized project queue. retrospective: what happened in a time period. patterns: recurring blockers, stale threads, hot topics. context: full session context by ID.")]
+    #[schemars(description = "search: FTS query across vault. read: full file content. history: query across history files. orchestrate: prioritized project queue. retrospective: what happened in a time period. patterns: recurring blockers, stale threads, hot topics. context: session summary by ID. resume: full session handoff with plan, progress, remaining work by ID.")]
     pub action: String,
     #[schemars(description = "For search: FTS query. For history: what to look for.")]
     pub query: Option<String>,
@@ -126,7 +126,8 @@ impl WardwellServer {
             "retrospective" => self.action_retrospective(&p),
             "patterns" => self.action_patterns(&p),
             "context" => self.action_context(&p).await,
-            other => json_error(&format!("Unknown action: '{other}'. Use search, read, history, orchestrate, retrospective, patterns, or context.")),
+            "resume" => self.action_resume(&p).await,
+            other => json_error(&format!("Unknown action: '{other}'. Use search, read, history, orchestrate, retrospective, patterns, context, or resume.")),
         }
     }
 
@@ -832,6 +833,79 @@ impl WardwellServer {
             "related": related,
         })).unwrap_or_default()
     }
+
+    /// Resume a previous session — generates a handoff document with plan, progress,
+    /// remaining work, and current state. Always generates fresh (ignores cache).
+    async fn action_resume(&self, p: &SearchParams) -> String {
+        let session_id = match &p.session_id {
+            Some(id) => id.clone(),
+            None => return json_error("'session_id' is required for action 'resume'."),
+        };
+
+        let jsonl_path = match crate::daemon::summarizer::find_session_file_by_id(
+            &session_id,
+            &self.config.session_sources,
+        ) {
+            Some(p) => p,
+            None => return json_error(&format!("Session not found: '{session_id}'.")),
+        };
+
+        let project_dir_name = jsonl_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let project_path = crate::daemon::indexer::decode_project_dir(project_dir_name);
+
+        let (started, message_count) = parse_session_metadata(&jsonl_path);
+
+        // Always generate fresh with RESUME_PROMPT (no cache)
+        let conversation = match crate::daemon::indexer::extract_conversation(&jsonl_path) {
+            Ok(c) => c,
+            Err(e) => return json_error(&format!("Failed to extract conversation: {e}")),
+        };
+
+        if conversation.is_empty() {
+            return json_error("Empty session — nothing to resume.");
+        }
+
+        let payload = crate::daemon::summarizer::build_resume_payload(&conversation);
+        let prompt = format!(
+            "{}\n\n---\n\nThis session was for the project at `{project_path}`.\n\n---\n\n{payload}",
+            crate::daemon::summarizer::RESUME_PROMPT,
+        );
+
+        let resume_doc = match crate::daemon::summarizer::claude_cli_call(
+            &prompt,
+            &self.config.ai.summarize_model,
+        ).await {
+            Ok(doc) => doc,
+            Err(e) => return json_error(&format!("Failed to generate resume document: {e}")),
+        };
+
+        // Resolve vault project for context
+        let vault_match = resolve_vault_project(
+            std::path::Path::new(&project_path),
+            &self.vault_root,
+        );
+        let (domain_name, project_name) = vault_match
+            .map(|(d, p, _)| (Some(d), Some(p)))
+            .unwrap_or((None, None));
+
+        if let (Some(d), Some(p)) = (&domain_name, &project_name) {
+            self.record_access(d, p);
+        }
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "session_id": session_id,
+            "project_path": project_path,
+            "started": started,
+            "message_count": message_count,
+            "domain": domain_name,
+            "project": project_name,
+            "resume": resume_doc,
+        })).unwrap_or_default()
+    }
 }
 
 /// Parse first JSONL line for timestamp and count user+assistant messages.
@@ -1397,7 +1471,7 @@ impl ServerHandler for WardwellServer {
     fn get_info(&self) -> ServerInfo {
         let instructions =
             "Wardwell: Personal AI knowledge vault. Three tools: \
-             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context), \
+             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume), \
              wardwell_write (action: sync|decide|append_history|lesson), \
              wardwell_clipboard (copy to clipboard, ask first)."
                 .to_string();
