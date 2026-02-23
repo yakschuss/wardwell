@@ -407,11 +407,13 @@ fn build_injection_content(_domains: &[String]) -> String {
 Your vault is indexed. Three tools:
 
 **wardwell_search** — Find things.
-  action: search | read | history | orchestrate | context
+  action: search | read | history | orchestrate | retrospective | patterns | context
   - \"search\": FTS query across vault
   - \"read\": full file by path
   - \"history\": query across history.jsonl files
   - \"orchestrate\": prioritized project queue
+  - \"retrospective\": what happened in a time period (requires since date)
+  - \"patterns\": recurring blockers, stale threads, hot topics (defaults to 90 days)
   - \"context\": full session context by ID
 
 **wardwell_write** — Change things.
@@ -430,6 +432,8 @@ Your vault is indexed. Three tools:
 - Something broke → offer to record the lesson
 - User asks \"what's next\" → orchestrate
 - User asks \"how has X evolved\" → history query
+- User asks \"what did I accomplish this week\" → retrospective
+- User asks \"what keeps blocking me\" → patterns
 - User asks \"catch me up on session X\" → context
 
 **Quality bar:**

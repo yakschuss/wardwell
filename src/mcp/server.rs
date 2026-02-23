@@ -30,7 +30,7 @@ pub struct WardwellServer {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchParams {
-    #[schemars(description = "search: FTS query across vault. read: full file content. history: query across history files. orchestrate: prioritized project queue. context: full session context by ID.")]
+    #[schemars(description = "search: FTS query across vault. read: full file content. history: query across history files. orchestrate: prioritized project queue. retrospective: what happened in a time period. patterns: recurring blockers, stale threads, hot topics. context: full session context by ID.")]
     pub action: String,
     #[schemars(description = "For search: FTS query. For history: what to look for.")]
     pub query: Option<String>,
@@ -46,6 +46,8 @@ pub struct SearchParams {
     pub limit: Option<usize>,
     #[schemars(description = "For context: Claude Code session ID.")]
     pub session_id: Option<String>,
+    #[schemars(description = "Include archived projects in retrospective/patterns. Default false.")]
+    pub include_archived: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -121,8 +123,10 @@ impl WardwellServer {
             "read" => self.action_read(&p),
             "history" => self.action_history(&p),
             "orchestrate" => self.action_orchestrate(&p),
+            "retrospective" => self.action_retrospective(&p),
+            "patterns" => self.action_patterns(&p),
             "context" => self.action_context(&p).await,
-            other => json_error(&format!("Unknown action: '{other}'. Use search, read, history, orchestrate, or context.")),
+            other => json_error(&format!("Unknown action: '{other}'. Use search, read, history, orchestrate, retrospective, patterns, or context.")),
         }
     }
 
@@ -403,6 +407,306 @@ impl WardwellServer {
             "queue": active,
             "blocked": blocked,
             "completed_recently": completed_recently,
+        })).unwrap_or_default()
+    }
+}
+
+// -- Retrospective & patterns actions --
+
+/// A parsed history entry with domain/project context attached.
+struct ParsedHistoryEntry {
+    domain: String,
+    project: String,
+    date: String,
+    title: String,
+    status: String,
+    focus: String,
+    body: String,
+}
+
+/// Walk the vault and collect all history.jsonl entries, filtered by date and domain.
+fn collect_history_entries(
+    vault_root: &std::path::Path,
+    since: Option<chrono::NaiveDate>,
+    domain_filter: Option<&str>,
+    skip_archive: bool,
+) -> Vec<ParsedHistoryEntry> {
+    let mut entries = Vec::new();
+    let dirs_to_scan = match domain_filter {
+        Some(d) => vec![vault_root.join(d)],
+        None => list_subdirs(vault_root),
+    };
+
+    for domain_dir in &dirs_to_scan {
+        if !domain_dir.is_dir() { continue; }
+        if skip_archive && domain_dir.file_name().is_some_and(|n| n == "archive") {
+            continue;
+        }
+        let domain_name = domain_dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        for project_dir in list_subdirs(domain_dir) {
+            if skip_archive && project_dir.file_name().is_some_and(|n| n == "archive") {
+                continue;
+            }
+            let project_name = project_dir.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            let jsonl_path = project_dir.join("history.jsonl");
+            if !jsonl_path.exists() { continue; }
+            let content = match std::fs::read_to_string(&jsonl_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            for line in content.lines() {
+                if line.trim().is_empty() || line.starts_with("{\"_schema\":") || line.starts_with("{\"_schema\" :") {
+                    continue;
+                }
+                let entry: HistoryJsonlEntry = match serde_json::from_str(line) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                // Date filter
+                let date_str = entry.date.get(..10).unwrap_or(&entry.date);
+                if let Some(s) = since
+                    && chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d").is_ok_and(|d| d < s) {
+                    continue;
+                }
+
+                entries.push(ParsedHistoryEntry {
+                    domain: domain_name.clone(),
+                    project: project_name.clone(),
+                    date: date_str.to_string(),
+                    title: entry.title,
+                    status: entry.status,
+                    focus: entry.focus,
+                    body: entry.body,
+                });
+            }
+        }
+    }
+
+    // Sort by date descending
+    entries.sort_by(|a, b| b.date.cmp(&a.date));
+    entries
+}
+
+impl WardwellServer {
+    fn action_retrospective(&self, p: &SearchParams) -> String {
+        let since_str = match &p.since {
+            Some(s) => s.clone(),
+            None => return json_error("'since' is required for action 'retrospective'. Use ISO date (e.g. '2026-02-15')."),
+        };
+        let since = match chrono::NaiveDate::parse_from_str(&since_str, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => return json_error(&format!("Invalid date format: '{since_str}'. Use YYYY-MM-DD.")),
+        };
+
+        let skip_archive = !p.include_archived.unwrap_or(false);
+        let entries = collect_history_entries(
+            &self.vault_root,
+            Some(since),
+            p.domain.as_deref(),
+            skip_archive,
+        );
+
+        // Group by domain/project
+        let mut groups: std::collections::HashMap<String, Vec<&ParsedHistoryEntry>> = std::collections::HashMap::new();
+        for e in &entries {
+            let key = format!("{}/{}", e.domain, e.project);
+            groups.entry(key).or_default().push(e);
+        }
+
+        let mut completed = Vec::new();
+        let mut still_active = Vec::new();
+        let mut per_project = Vec::new();
+
+        for (key, project_entries) in &groups {
+            let entry_count = project_entries.len();
+            let first_status = project_entries.last().map(|e| e.status.as_str()).unwrap_or("");
+            let last_status = project_entries.first().map(|e| e.status.as_str()).unwrap_or("");
+            let titles: Vec<&str> = project_entries.iter().map(|e| e.title.as_str()).collect();
+
+            let status_flow = if first_status == last_status {
+                last_status.to_string()
+            } else {
+                format!("{first_status} → {last_status}")
+            };
+
+            let parts: Vec<&str> = key.split('/').collect();
+            let domain = parts.first().unwrap_or(&"unknown");
+            let project = parts.get(1).unwrap_or(&"unknown");
+
+            per_project.push(serde_json::json!({
+                "project": key,
+                "domain": domain,
+                "entries": entry_count,
+                "status_flow": status_flow,
+                "titles": titles,
+            }));
+
+            if last_status == "completed" || last_status == "resolved" {
+                completed.push(key.clone());
+            } else {
+                still_active.push(key.clone());
+            }
+
+            // Track accessed projects
+            self.record_access(domain, project);
+        }
+
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "period": format!("{since_str} to {today}"),
+            "projects_touched": groups.len(),
+            "completed": completed,
+            "still_active": still_active,
+            "per_project": per_project,
+        })).unwrap_or_default()
+    }
+
+    fn action_patterns(&self, p: &SearchParams) -> String {
+        let since = p.since.as_deref()
+            .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| chrono::Local::now().date_naive() - chrono::Duration::days(90));
+
+        let skip_archive = !p.include_archived.unwrap_or(false);
+        let entries = collect_history_entries(
+            &self.vault_root,
+            Some(since),
+            p.domain.as_deref(),
+            skip_archive,
+        );
+
+        // -- Recurring blockers --
+        let blocked_terms = ["blocked", "waiting", "stuck", "blocker"];
+        let mut blocker_counts: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for e in &entries {
+            let text = format!("{} {} {}", e.status, e.focus, e.body).to_lowercase();
+            if blocked_terms.iter().any(|t| text.contains(t)) {
+                let key = format!("{}/{}", e.domain, e.project);
+                blocker_counts.entry(key).or_default().push(e.title.clone());
+            }
+        }
+        let recurring_blockers: Vec<serde_json::Value> = blocker_counts.iter()
+            .filter(|(_, titles)| titles.len() >= 2)
+            .map(|(project, titles)| serde_json::json!({
+                "project": project,
+                "count": titles.len(),
+                "titles": titles,
+            }))
+            .collect();
+
+        // -- Stale threads --
+        let mut latest_by_project: std::collections::HashMap<String, (&str, &str)> = std::collections::HashMap::new();
+        for e in &entries {
+            let key = format!("{}/{}", e.domain, e.project);
+            latest_by_project.entry(key)
+                .and_modify(|(date, status)| {
+                    if e.date.as_str() > *date {
+                        *date = &e.date;
+                        *status = &e.status;
+                    }
+                })
+                .or_insert((&e.date, &e.status));
+        }
+        let today = chrono::Local::now().date_naive();
+        let stale_threads: Vec<serde_json::Value> = latest_by_project.iter()
+            .filter_map(|(project, (date, status))| {
+                if *status == "completed" || *status == "resolved" {
+                    return None;
+                }
+                let last = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+                let days = (today - last).num_days();
+                if days >= 14 {
+                    Some(serde_json::json!({
+                        "project": project,
+                        "last_entry": date,
+                        "days_stale": days,
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // -- Hot topics --
+        let stopwords: &[&str] = &[
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "shall", "can", "need", "to", "of", "in",
+            "for", "on", "with", "at", "by", "from", "as", "into", "through",
+            "during", "before", "after", "between", "out", "off", "over", "under",
+            "again", "further", "then", "once", "that", "this", "these", "those",
+            "not", "no", "and", "but", "or", "so", "if", "when", "it", "its",
+            "he", "she", "they", "them", "we", "you", "complete", "active",
+            "project", "focus", "next", "action", "status", "none", "still",
+        ];
+        let mut word_projects: std::collections::HashMap<String, HashSet<String>> = std::collections::HashMap::new();
+        let mut word_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in &entries {
+            let project_key = format!("{}/{}", e.domain, e.project);
+            for word in e.title.split_whitespace() {
+                let clean = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                if clean.len() > 2 && !stopwords.contains(&clean.as_str()) {
+                    *word_counts.entry(clean.clone()).or_default() += 1;
+                    word_projects.entry(clean).or_default().insert(project_key.clone());
+                }
+            }
+        }
+        let mut hot_topics: Vec<(String, usize, Vec<String>)> = word_counts.into_iter()
+            .filter(|(_, count)| *count >= 3)
+            .map(|(term, count)| {
+                let projects: Vec<String> = word_projects.get(&term)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                (term, count, projects)
+            })
+            .collect();
+        hot_topics.sort_by(|a, b| b.1.cmp(&a.1));
+        hot_topics.truncate(10);
+        let hot_topics_json: Vec<serde_json::Value> = hot_topics.into_iter()
+            .map(|(term, count, projects)| serde_json::json!({
+                "term": term,
+                "mentions": count,
+                "projects": projects,
+            }))
+            .collect();
+
+        // -- Status oscillations --
+        let mut status_flows: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        // Entries are date desc, reverse for chronological order
+        for e in entries.iter().rev() {
+            let key = format!("{}/{}", e.domain, e.project);
+            let flow = status_flows.entry(key).or_default();
+            if !e.status.is_empty() && flow.last().map(|s| s.as_str()) != Some(&e.status) {
+                flow.push(e.status.clone());
+            }
+        }
+        let oscillations: Vec<serde_json::Value> = status_flows.into_iter()
+            .filter(|(_, flow)| flow.len() >= 3)
+            .map(|(project, flow)| serde_json::json!({
+                "project": project,
+                "flow": flow,
+            }))
+            .collect();
+
+        let since_str = since.format("%Y-%m-%d").to_string();
+        let today_str = today.format("%Y-%m-%d").to_string();
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "period": format!("{since_str} to {today_str}"),
+            "recurring_blockers": recurring_blockers,
+            "stale_threads": stale_threads,
+            "hot_topics": hot_topics_json,
+            "status_oscillations": oscillations,
         })).unwrap_or_default()
     }
 }
@@ -1093,7 +1397,7 @@ impl ServerHandler for WardwellServer {
     fn get_info(&self) -> ServerInfo {
         let instructions =
             "Wardwell: Personal AI knowledge vault. Three tools: \
-             wardwell_search (action: search|read|history|orchestrate|context), \
+             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context), \
              wardwell_write (action: sync|decide|append_history|lesson), \
              wardwell_clipboard (copy to clipboard, ask first)."
                 .to_string();
@@ -1733,6 +2037,201 @@ mod tests {
         let key = "work/sentry-bot";
         let was_accessed = accessed.contains(key);
         assert!(was_accessed);
+    }
+
+    // -- Retrospective & patterns tests --
+
+    fn make_history_jsonl(entries: &[(&str, &str, &str, &str)]) -> String {
+        let mut lines = vec!["{\"_schema\": \"history\", \"_version\": \"1.0\"}".to_string()];
+        for (date, title, status, focus) in entries {
+            lines.push(format!(
+                "{{\"date\":\"{date}T10:00:00Z\",\"title\":\"{title}\",\"status\":\"{status}\",\"focus\":\"{focus}\",\"next_action\":\"\",\"commit\":\"\",\"body\":\"\"}}"
+            ));
+        }
+        lines.join("\n")
+    }
+
+    fn setup_test_vault(name: &str, projects: &[(&str, &str, &str)]) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&tmp);
+        for (domain, project, content) in projects {
+            let dir = tmp.join(domain).join(project);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("history.jsonl"), content).unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn collect_history_entries_parses_and_filters() {
+        let content = make_history_jsonl(&[
+            ("2026-02-20", "Recent entry", "active", "working"),
+            ("2026-01-01", "Old entry", "active", "old stuff"),
+        ]);
+        let tmp = setup_test_vault("wardwell_test_collect", &[
+            ("work", "proj-a", &content),
+        ]);
+
+        let since = chrono::NaiveDate::parse_from_str("2026-02-01", "%Y-%m-%d").unwrap();
+        let entries = collect_history_entries(&tmp, Some(since), None, true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Recent entry");
+        assert_eq!(entries[0].domain, "work");
+        assert_eq!(entries[0].project, "proj-a");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_history_entries_skips_archive() {
+        let content = make_history_jsonl(&[
+            ("2026-02-20", "Archived entry", "resolved", "done"),
+        ]);
+        let tmp = setup_test_vault("wardwell_test_archive", &[
+            ("work", "archive", &content),
+        ]);
+
+        let entries = collect_history_entries(&tmp, None, None, true);
+        assert!(entries.is_empty());
+
+        let entries_with_archive = collect_history_entries(&tmp, None, None, false);
+        assert_eq!(entries_with_archive.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_history_entries_domain_filter() {
+        let work_content = make_history_jsonl(&[("2026-02-20", "Work", "active", "w")]);
+        let personal_content = make_history_jsonl(&[("2026-02-20", "Personal", "active", "p")]);
+        let tmp = setup_test_vault("wardwell_test_domain_filter", &[
+            ("work", "proj-a", &work_content),
+            ("personal", "proj-b", &personal_content),
+        ]);
+
+        let entries = collect_history_entries(&tmp, None, Some("work"), true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].title, "Work");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn retrospective_groups_by_project() {
+        let content = make_history_jsonl(&[
+            ("2026-02-20", "Entry A", "active", "focus a"),
+            ("2026-02-18", "Entry B", "active", "focus b"),
+        ]);
+        let tmp = setup_test_vault("wardwell_test_retro", &[
+            ("work", "proj-a", &content),
+        ]);
+
+        let entries = collect_history_entries(&tmp, Some(chrono::NaiveDate::parse_from_str("2026-02-01", "%Y-%m-%d").unwrap()), None, true);
+        let mut groups: std::collections::HashMap<String, Vec<&ParsedHistoryEntry>> = std::collections::HashMap::new();
+        for e in &entries {
+            groups.entry(format!("{}/{}", e.domain, e.project)).or_default().push(e);
+        }
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups["work/proj-a"].len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn retrospective_classifies_completed() {
+        let active_content = make_history_jsonl(&[("2026-02-20", "Still going", "active", "f")]);
+        let done_content = make_history_jsonl(&[("2026-02-20", "Done", "completed", "f")]);
+        let tmp = setup_test_vault("wardwell_test_retro_classify", &[
+            ("work", "active-proj", &active_content),
+            ("work", "done-proj", &done_content),
+        ]);
+
+        let entries = collect_history_entries(&tmp, None, None, true);
+        let mut completed = Vec::new();
+        let mut still_active = Vec::new();
+        let mut groups: std::collections::HashMap<String, Vec<&ParsedHistoryEntry>> = std::collections::HashMap::new();
+        for e in &entries {
+            groups.entry(format!("{}/{}", e.domain, e.project)).or_default().push(e);
+        }
+        for (key, project_entries) in &groups {
+            let last_status = project_entries.first().map(|e| e.status.as_str()).unwrap_or("");
+            if last_status == "completed" || last_status == "resolved" {
+                completed.push(key.clone());
+            } else {
+                still_active.push(key.clone());
+            }
+        }
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].contains("done-proj"));
+        assert_eq!(still_active.len(), 1);
+        assert!(still_active[0].contains("active-proj"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn patterns_detects_stale_threads() {
+        let old_content = make_history_jsonl(&[("2026-01-01", "Old work", "active", "f")]);
+        let recent_content = make_history_jsonl(&[("2026-02-20", "Recent", "active", "f")]);
+        let tmp = setup_test_vault("wardwell_test_stale", &[
+            ("work", "stale-proj", &old_content),
+            ("work", "fresh-proj", &recent_content),
+        ]);
+
+        let entries = collect_history_entries(&tmp, None, None, true);
+        let today = chrono::Local::now().date_naive();
+        let mut latest: std::collections::HashMap<String, (&str, &str)> = std::collections::HashMap::new();
+        for e in &entries {
+            let key = format!("{}/{}", e.domain, e.project);
+            latest.entry(key)
+                .and_modify(|(date, status)| {
+                    if e.date.as_str() > *date { *date = &e.date; *status = &e.status; }
+                })
+                .or_insert((&e.date, &e.status));
+        }
+        let stale: Vec<&String> = latest.iter()
+            .filter(|(_, (date, status))| {
+                *status != "completed" && *status != "resolved"
+                    && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                        .is_ok_and(|d| (today - d).num_days() >= 14)
+            })
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].contains("stale-proj"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn patterns_detects_hot_topics() {
+        let content_a = make_history_jsonl(&[
+            ("2026-02-20", "Nebula deploy fix", "active", "f"),
+            ("2026-02-19", "Nebula monitoring", "active", "f"),
+            ("2026-02-18", "Nebula cost analysis", "active", "f"),
+        ]);
+        let content_b = make_history_jsonl(&[
+            ("2026-02-20", "Nebula integration", "active", "f"),
+        ]);
+        let tmp = setup_test_vault("wardwell_test_hot_topics", &[
+            ("work", "proj-a", &content_a),
+            ("work", "proj-b", &content_b),
+        ]);
+
+        let entries = collect_history_entries(&tmp, None, None, true);
+        let stopwords: &[&str] = &["the", "a", "an", "is", "for", "and"];
+        let mut word_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for e in &entries {
+            for word in e.title.split_whitespace() {
+                let clean = word.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+                if clean.len() > 2 && !stopwords.contains(&clean.as_str()) {
+                    *word_counts.entry(clean).or_default() += 1;
+                }
+            }
+        }
+        assert!(word_counts.get("nebula").is_some_and(|c| *c >= 3));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
