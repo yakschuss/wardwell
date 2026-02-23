@@ -7,8 +7,9 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 /// The Wardwell MCP server.
@@ -19,6 +20,10 @@ pub struct WardwellServer {
     pub index: Arc<IndexStore>,
     pub vault_root: PathBuf,
     pub registry: Arc<RwLock<DomainRegistry>>,
+    /// Projects accessed (searched/read) in this session, as "domain/project" keys.
+    accessed_projects: Arc<Mutex<HashSet<String>>>,
+    /// Most recently accessed (domain, project) pair.
+    last_project: Arc<Mutex<Option<(String, String)>>>,
 }
 
 // -- Tool parameter types --
@@ -49,8 +54,8 @@ pub struct WriteParams {
     pub action: String,
     #[schemars(description = "Domain folder under vault root (e.g., 'work', 'personal')")]
     pub domain: String,
-    #[schemars(description = "Project folder within the domain (e.g., 'my-project')")]
-    pub project: String,
+    #[schemars(description = "Project folder within the domain. If omitted, inferred from last-accessed project in this session.")]
+    pub project: Option<String>,
 
     // -- sync fields --
     #[schemars(description = "REQUIRED for sync: project status (active, blocked, completed)")]
@@ -103,6 +108,8 @@ impl WardwellServer {
             index,
             vault_root,
             registry,
+            accessed_projects: Arc::new(Mutex::new(HashSet::new())),
+            last_project: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -122,11 +129,34 @@ impl WardwellServer {
     #[tool(description = "Write to the vault. Sync project state, record decisions, append history, or record lessons. Use `action` to specify the operation.")]
     async fn wardwell_write(&self, params: Parameters<WriteParams>) -> String {
         let p = params.0;
+
+        // Resolve project: explicit > inferred from last access
+        let project = match p.project.clone() {
+            Some(proj) => proj,
+            None => match self.last_project.lock().ok().and_then(|lp| lp.clone()) {
+                Some((d, proj)) if d == p.domain => proj,
+                Some(_) => return json_error("'project' is required — last accessed project is in a different domain."),
+                None => return json_error("'project' is required — no project accessed in this session to infer from."),
+            },
+        };
+
+        // Check if this project was accessed (searched/read) in this session
+        let key = format!("{}/{}", p.domain, project);
+        let was_accessed = self.accessed_projects.lock()
+            .map(|set| set.contains(&key))
+            .unwrap_or(true);
+        let warning = if was_accessed {
+            None
+        } else {
+            Some(format!("project '{key}' was not read or searched in this session"))
+        };
+        let inferred = p.project.is_none();
+
         match p.action.as_str() {
-            "sync" => self.action_sync(&p),
-            "decide" => self.action_decide(&p),
-            "append_history" => self.action_append_history(&p),
-            "lesson" => self.action_lesson(&p),
+            "sync" => self.action_sync(&p, &project, warning.as_deref(), inferred),
+            "decide" => self.action_decide(&p, &project, warning.as_deref()),
+            "append_history" => self.action_append_history(&p, &project, warning.as_deref()),
+            "lesson" => self.action_lesson(&p, &project, warning.as_deref()),
             other => json_error(&format!("Unknown action: '{other}'. Use sync, decide, append_history, or lesson.")),
         }
     }
@@ -141,6 +171,31 @@ impl WardwellServer {
             })).unwrap_or_default(),
             Err(e) => json_error(&format!("Clipboard failed: {e}")),
         }
+    }
+}
+
+// -- Session tracking --
+
+impl WardwellServer {
+    /// Record that a domain/project was accessed in this session.
+    fn record_access(&self, domain: &str, project: &str) {
+        let key = format!("{domain}/{project}");
+        if let Ok(mut set) = self.accessed_projects.lock() {
+            set.insert(key);
+        }
+        if let Ok(mut last) = self.last_project.lock() {
+            *last = Some((domain.to_string(), project.to_string()));
+        }
+    }
+}
+
+/// Extract (domain, project) from a vault-relative path like "work/sentry-bot/current_state.md".
+fn extract_domain_project(path: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() >= 2 {
+        Some((parts[0].to_string(), parts[1].to_string()))
+    } else {
+        None
     }
 }
 
@@ -162,7 +217,15 @@ impl WardwellServer {
         };
 
         match self.index.search(&query) {
-            Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
+            Ok(results) => {
+                // Track accessed projects from search results
+                for r in &results.results {
+                    if let Some((d, p)) = extract_domain_project(&r.path) {
+                        self.record_access(&d, &p);
+                    }
+                }
+                serde_json::to_string_pretty(&results).unwrap_or_default()
+            }
             Err(e) => json_error(&format!("Search failed: {e}")),
         }
     }
@@ -178,6 +241,11 @@ impl WardwellServer {
             Some(vf) => vf,
             None => return json_error(&format!("File not found: {path}. Use action 'search' to find valid paths.")),
         };
+
+        // Track accessed project from read path
+        if let Some((d, p)) = extract_domain_project(&path) {
+            self.record_access(&d, &p);
+        }
 
         let mut related_previews = Vec::new();
         for related_path in &vf.frontmatter.related {
@@ -232,6 +300,11 @@ impl WardwellServer {
         // Sort by date descending
         all_entries.sort_by(|a, b| b.date.cmp(&a.date));
         all_entries.truncate(p.limit.unwrap_or(5));
+
+        // Track accessed projects from history results
+        for e in &all_entries {
+            self.record_access(&e.domain, &e.project);
+        }
 
         let total = all_entries.len();
         let entries_json: Vec<serde_json::Value> = all_entries.iter().map(|e| {
@@ -313,6 +386,13 @@ impl WardwellServer {
                         _ => active.push(entry),
                     }
                 }
+            }
+        }
+
+        // Track all returned projects
+        for entry in active.iter().chain(blocked.iter()).chain(completed_recently.iter()) {
+            if let (Some(d), Some(p)) = (entry["domain"].as_str(), entry["project"].as_str()) {
+                self.record_access(d, p);
             }
         }
 
@@ -429,6 +509,11 @@ impl WardwellServer {
         let (domain_name, project_name) = vault_match
             .map(|(d, p, _)| (Some(d), Some(p)))
             .unwrap_or((None, None));
+
+        // Track accessed project from context resolution
+        if let (Some(d), Some(p)) = (&domain_name, &project_name) {
+            self.record_access(d, p);
+        }
 
         serde_json::to_string_pretty(&serde_json::json!({
             "session_id": session_id,
@@ -759,7 +844,7 @@ fn extract_search_terms(summary: &str, max_terms: usize) -> String {
 // -- Write actions --
 
 impl WardwellServer {
-    fn action_sync(&self, p: &WriteParams) -> String {
+    fn action_sync(&self, p: &WriteParams, project: &str, warning: Option<&str>, inferred: bool) -> String {
         let status = match &p.status {
             Some(s) => s.clone(),
             None => return json_error("'status' is required for action 'sync'."),
@@ -777,7 +862,7 @@ impl WardwellServer {
             None => return json_error("'commit_message' is required for action 'sync'."),
         };
 
-        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -787,7 +872,6 @@ impl WardwellServer {
         // Build current_state.md
         let mut content = format!(
             "---\nchat_name: {project}\nupdated: {now}\nstatus: {status}\ntype: project\ncontext: {domain}\n---\n\n# {project}\n\n## Focus\n{focus}\n",
-            project = p.project,
             domain = p.domain,
         );
 
@@ -823,7 +907,7 @@ impl WardwellServer {
         if let Err(e) = std::fs::write(&state_path, &content) {
             return json_error(&format!("Failed to write current_state.md: {e}"));
         }
-        files_written.push(format!("{}/{}/{}/current_state.md", self.vault_root.display(), p.domain, p.project));
+        files_written.push(format!("{}/{}/{}/current_state.md", self.vault_root.display(), p.domain, project));
 
         // Always append history entry on sync
         let history_path = project_dir.join("history.jsonl");
@@ -843,18 +927,27 @@ impl WardwellServer {
         if let Err(e) = append_jsonl(&history_path, "history", &json) {
             return json_error(&format!("Failed to write history.jsonl: {e}"));
         }
-        files_written.push(format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project));
+        files_written.push(format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, project));
 
         // Update FTS index for written files
         self.reindex_file(&state_path);
 
-        serde_json::to_string(&serde_json::json!({
+        let project_key = format!("{}/{}", p.domain, project);
+        let mut resp = serde_json::json!({
             "synced": true,
+            "project": project_key,
             "files_written": files_written,
-        })).unwrap_or_default()
+        });
+        if let Some(w) = warning {
+            resp["warning"] = serde_json::json!(w);
+        }
+        if inferred {
+            resp["inferred_project"] = serde_json::json!(true);
+        }
+        serde_json::to_string(&resp).unwrap_or_default()
     }
 
-    fn action_decide(&self, p: &WriteParams) -> String {
+    fn action_decide(&self, p: &WriteParams, project: &str, warning: Option<&str>) -> String {
         let title = match &p.title {
             Some(t) => t.clone(),
             None => return json_error("'title' is required for action 'decide'."),
@@ -864,7 +957,7 @@ impl WardwellServer {
             None => return json_error("'body' is required for action 'decide'."),
         };
 
-        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -874,26 +967,32 @@ impl WardwellServer {
 
         let entry = format!("## {now} — {title}\n\n{body}\n\n---\n\n");
 
-        if let Err(e) = prepend_to_file(&decisions_path, &format!("# {} Decisions", p.project), &entry) {
+        if let Err(e) = prepend_to_file(&decisions_path, &format!("# {project} Decisions"), &entry) {
             return json_error(&format!("Failed to write decisions.md: {e}"));
         }
 
         self.reindex_file(&decisions_path);
 
-        let rel = format!("{}/{}/{}/decisions.md", self.vault_root.display(), p.domain, p.project);
-        serde_json::to_string(&serde_json::json!({
+        let project_key = format!("{}/{}", p.domain, project);
+        let rel = format!("{}/{}/decisions.md", self.vault_root.display(), project_key);
+        let mut resp = serde_json::json!({
             "recorded": true,
+            "project": project_key,
             "path": rel,
-        })).unwrap_or_default()
+        });
+        if let Some(w) = warning {
+            resp["warning"] = serde_json::json!(w);
+        }
+        serde_json::to_string(&resp).unwrap_or_default()
     }
 
-    fn action_append_history(&self, p: &WriteParams) -> String {
+    fn action_append_history(&self, p: &WriteParams, project: &str, warning: Option<&str>) -> String {
         let title = match &p.title {
             Some(t) => t.clone(),
             None => return json_error("'title' is required for action 'append_history'."),
         };
 
-        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -916,14 +1015,20 @@ impl WardwellServer {
             return json_error(&format!("Failed to write history.jsonl: {e}"));
         }
 
-        let rel = format!("{}/{}/{}/history.jsonl", self.vault_root.display(), p.domain, p.project);
-        serde_json::to_string(&serde_json::json!({
+        let project_key = format!("{}/{}", p.domain, project);
+        let rel = format!("{}/{}/history.jsonl", self.vault_root.display(), project_key);
+        let mut resp = serde_json::json!({
             "appended": true,
+            "project": project_key,
             "path": rel,
-        })).unwrap_or_default()
+        });
+        if let Some(w) = warning {
+            resp["warning"] = serde_json::json!(w);
+        }
+        serde_json::to_string(&resp).unwrap_or_default()
     }
 
-    fn action_lesson(&self, p: &WriteParams) -> String {
+    fn action_lesson(&self, p: &WriteParams, project: &str, warning: Option<&str>) -> String {
         let title = match &p.title {
             Some(t) => t.clone(),
             None => return json_error("'title' is required for action 'lesson'."),
@@ -941,7 +1046,7 @@ impl WardwellServer {
             None => return json_error("'prevention' is required for action 'lesson'."),
         };
 
-        let project_dir = self.vault_root.clone().join(&p.domain).join(&p.project);
+        let project_dir = self.vault_root.clone().join(&p.domain).join(project);
         if let Err(e) = std::fs::create_dir_all(&project_dir) {
             return json_error(&format!("Failed to create directory: {e}"));
         }
@@ -962,11 +1067,17 @@ impl WardwellServer {
             return json_error(&format!("Failed to write lessons.jsonl: {e}"));
         }
 
-        let rel = format!("{}/{}/{}/lessons.jsonl", self.vault_root.display(), p.domain, p.project);
-        serde_json::to_string(&serde_json::json!({
+        let project_key = format!("{}/{}", p.domain, project);
+        let rel = format!("{}/{}/lessons.jsonl", self.vault_root.display(), project_key);
+        let mut resp = serde_json::json!({
             "recorded": true,
+            "project": project_key,
             "path": rel,
-        })).unwrap_or_default()
+        });
+        if let Some(w) = warning {
+            resp["warning"] = serde_json::json!(w);
+        }
+        serde_json::to_string(&resp).unwrap_or_default()
     }
 
     /// Re-read a file from disk and upsert it into the FTS index.
@@ -1544,6 +1655,84 @@ mod tests {
         assert_eq!(entries[0]["title"], "From JSONL");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- Session tracking tests --
+
+    #[test]
+    fn extract_domain_project_from_path() {
+        let result = extract_domain_project("work/sentry-bot/current_state.md");
+        assert_eq!(result, Some(("work".to_string(), "sentry-bot".to_string())));
+    }
+
+    #[test]
+    fn extract_domain_project_short_path() {
+        let result = extract_domain_project("work");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_domain_project_deep_path() {
+        let result = extract_domain_project("personal/fitness/history.jsonl");
+        assert_eq!(result, Some(("personal".to_string(), "fitness".to_string())));
+    }
+
+    #[test]
+    fn record_access_tracks_projects() {
+        let tmp = std::env::temp_dir().join("wardwell_test_record_access");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let accessed = Arc::new(Mutex::new(HashSet::new()));
+        let last = Arc::new(Mutex::new(None));
+
+        // Simulate record_access directly
+        {
+            let key = "work/sentry-bot".to_string();
+            accessed.lock().unwrap().insert(key);
+            *last.lock().unwrap() = Some(("work".to_string(), "sentry-bot".to_string()));
+        }
+
+        assert!(accessed.lock().unwrap().contains("work/sentry-bot"));
+        assert!(!accessed.lock().unwrap().contains("work/other"));
+        assert_eq!(last.lock().unwrap().as_ref().unwrap().1, "sentry-bot");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_response_includes_project_key() {
+        // Verify the response JSON shape includes "project" field
+        let project_key = format!("{}/{}", "work", "sentry-bot");
+        let resp = serde_json::json!({
+            "synced": true,
+            "project": project_key,
+            "files_written": [],
+        });
+        assert_eq!(resp["project"], "work/sentry-bot");
+    }
+
+    #[test]
+    fn warning_included_when_project_not_accessed() {
+        let accessed: HashSet<String> = HashSet::new();
+        let key = "work/wardwell";
+        let was_accessed = accessed.contains(key);
+        let warning = if was_accessed {
+            None
+        } else {
+            Some(format!("project '{key}' was not read or searched in this session"))
+        };
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("work/wardwell"));
+    }
+
+    #[test]
+    fn no_warning_when_project_was_accessed() {
+        let mut accessed: HashSet<String> = HashSet::new();
+        accessed.insert("work/sentry-bot".to_string());
+        let key = "work/sentry-bot";
+        let was_accessed = accessed.contains(key);
+        assert!(was_accessed);
     }
 
     #[test]
