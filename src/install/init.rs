@@ -418,11 +418,12 @@ Your vault is indexed. Three tools:
   - \"resume\": full session handoff by ID — plan, progress, remaining work (always fresh, uses AI)
 
 **wardwell_write** — Change things.
-  action: sync | decide | append_history | lesson
+  action: sync | decide | append_history | lesson | append
   - \"sync\": FULL REPLACE of current_state.md + optionally append history.jsonl
   - \"decide\": append to decisions.md
   - \"append_history\": log to history.jsonl without state change
   - \"lesson\": append to lessons.jsonl (what went wrong, why, prevention)
+  - \"append\": append to a named JSONL list (requires 'list' param, e.g. 'future-ideas'). Check existing lists first. ASK the user before creating a new list — never create lists speculatively.
 
 **wardwell_clipboard** — Copy to clipboard (ALWAYS ask first).
 

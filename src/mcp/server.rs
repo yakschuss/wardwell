@@ -52,7 +52,7 @@ pub struct SearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteParams {
-    #[schemars(description = "sync: replace current_state.md and optionally append history. decide: append to decisions.md. append_history: append to history.jsonl. lesson: append to lessons.jsonl.")]
+    #[schemars(description = "sync: replace current_state.md and optionally append history. decide: append to decisions.md. append_history: append to history.jsonl. lesson: append to lessons.jsonl. append: append to a named JSONL list (requires 'list' param). IMPORTANT for append: check existing lists first (they're returned if list doesn't exist). ASK the user before creating a new list — do not create lists speculatively.")]
     pub action: String,
     #[schemars(description = "Domain folder under vault root (e.g., 'work', 'personal')")]
     pub domain: String,
@@ -82,6 +82,12 @@ pub struct WriteParams {
     pub title: Option<String>,
     #[schemars(description = "REQUIRED for decide/append_history. Optional for sync/lesson.")]
     pub body: Option<String>,
+
+    // -- append (generic list) fields --
+    #[schemars(description = "For append: list name without extension (e.g., 'future-ideas'). Writes to {list}.jsonl in the project dir.")]
+    pub list: Option<String>,
+    #[schemars(description = "For append: set to true to confirm creating a NEW list. Required when the list doesn't exist yet.")]
+    pub confirmed: Option<bool>,
 
     // -- lesson fields --
     #[schemars(description = "REQUIRED for lesson: what went wrong")]
@@ -162,7 +168,8 @@ impl WardwellServer {
             "decide" => self.action_decide(&p, &project, warning.as_deref()),
             "append_history" => self.action_append_history(&p, &project, warning.as_deref()),
             "lesson" => self.action_lesson(&p, &project, warning.as_deref()),
-            other => json_error(&format!("Unknown action: '{other}'. Use sync, decide, append_history, or lesson.")),
+            "append" => self.action_append_list(&p, &project, warning.as_deref()),
+            other => json_error(&format!("Unknown action: '{other}'. Use sync, decide, append_history, lesson, or append.")),
         }
     }
 
@@ -1472,6 +1479,86 @@ impl WardwellServer {
         serde_json::to_string(&resp).unwrap_or_default()
     }
 
+    fn action_append_list(&self, p: &WriteParams, project: &str, warning: Option<&str>) -> String {
+        let list_name = match &p.list {
+            Some(l) => l.clone(),
+            None => return json_error("'list' is required for action 'append'."),
+        };
+
+        // Sanitize: alphanumeric, hyphens, underscores only
+        if !list_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            return json_error("'list' must contain only alphanumeric characters, hyphens, and underscores.");
+        }
+
+        // Reserved names — use the dedicated actions instead
+        if matches!(list_name.as_str(), "history" | "lessons") {
+            return json_error(&format!("'{list_name}' is a built-in list. Use action '{}'.", if list_name == "history" { "append_history" } else { "lesson" }));
+        }
+
+        let title = match &p.title {
+            Some(t) => t.clone(),
+            None => return json_error("'title' is required for action 'append'."),
+        };
+
+        let project_dir = self.vault_root.join(&p.domain).join(project);
+        let list_path = project_dir.join(format!("{list_name}.jsonl"));
+
+        // If list doesn't exist yet, require explicit confirmation
+        if !list_path.exists() && !p.confirmed.unwrap_or(false) {
+            // Collect existing .jsonl lists in this project
+            let existing: Vec<String> = std::fs::read_dir(&project_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".jsonl") {
+                        Some(name.trim_end_matches(".jsonl").to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            return serde_json::to_string_pretty(&serde_json::json!({
+                "error": false,
+                "needs_confirmation": true,
+                "message": format!("List '{list_name}' does not exist yet. Set confirmed=true to create it, or use an existing list."),
+                "existing_lists": existing,
+                "project": format!("{}/{}", p.domain, project),
+            })).unwrap_or_default();
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&project_dir) {
+            return json_error(&format!("Failed to create directory: {e}"));
+        }
+
+        let entry = serde_json::json!({
+            "date": chrono::Utc::now().to_rfc3339(),
+            "title": title,
+            "body": p.body.clone().unwrap_or_default(),
+        });
+        let json = match serde_json::to_string(&entry) {
+            Ok(j) => j,
+            Err(e) => return json_error(&format!("Failed to serialize entry: {e}")),
+        };
+        if let Err(e) = append_jsonl(&list_path, &list_name, &json) {
+            return json_error(&format!("Failed to write {list_name}.jsonl: {e}"));
+        }
+
+        let project_key = format!("{}/{}", p.domain, project);
+        let mut resp = serde_json::json!({
+            "appended": true,
+            "list": list_name,
+            "project": project_key,
+            "path": list_path.display().to_string(),
+        });
+        if let Some(w) = warning {
+            resp["warning"] = serde_json::json!(w);
+        }
+        serde_json::to_string(&resp).unwrap_or_default()
+    }
+
     /// Re-read a file from disk and upsert it into the FTS index.
     fn reindex_file(&self, path: &std::path::Path) {
         if let Ok(vf) = crate::vault::reader::read_file(path) {
@@ -1486,7 +1573,7 @@ impl ServerHandler for WardwellServer {
         let instructions =
             "Wardwell: Personal AI knowledge vault. Three tools: \
              wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume), \
-             wardwell_write (action: sync|decide|append_history|lesson), \
+             wardwell_write (action: sync|decide|append_history|lesson|append), \
              wardwell_clipboard (copy to clipboard, ask first)."
                 .to_string();
 
@@ -1828,6 +1915,19 @@ fn clipboard_copy(content: &str) -> Result<usize, String> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn make_test_server(vault_root: &std::path::Path) -> WardwellServer {
+        let db_path = vault_root.join("_test_index.db");
+        let index = Arc::new(crate::index::store::IndexStore::open(&db_path).unwrap());
+        let config = crate::config::loader::WardwellConfig {
+            vault_path: vault_root.to_path_buf(),
+            registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
+            session_sources: vec![],
+            exclude: vec![],
+            ai: Default::default(),
+        };
+        WardwellServer::new(config, index)
+    }
 
     #[test]
     fn extract_search_terms_from_summary() {
@@ -2334,6 +2434,128 @@ mod tests {
         let entries = read_recent_history_from_dir(&tmp, 5);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["title"], "From MD");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn append_list_requires_confirmation_for_new_list() {
+        let tmp = std::env::temp_dir().join("wardwell_test_append_new_list");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project_dir = tmp.join("personal").join("test-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Write an existing list so we can verify it appears in existing_lists
+        append_jsonl(&project_dir.join("ideas.jsonl"), "ideas", r#"{"title":"old"}"#).unwrap();
+
+        let server = make_test_server(&tmp);
+        let params = WriteParams {
+            action: "append".to_string(),
+            domain: "personal".to_string(),
+            project: Some("test-proj".to_string()),
+            list: Some("future-ideas".to_string()),
+            confirmed: None,
+            title: Some("Test idea".to_string()),
+            body: Some("Details".to_string()),
+            status: None, focus: None, why_this_matters: None, next_action: None,
+            open_questions: None, blockers: None, waiting_on: None, commit_message: None,
+            what_happened: None, root_cause: None, prevention: None,
+        };
+        let result = server.action_append_list(&params, "test-proj", None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["needs_confirmation"], true);
+        assert!(parsed["existing_lists"].as_array().unwrap().iter().any(|v| v == "ideas"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn append_list_creates_and_appends_with_confirmation() {
+        let tmp = std::env::temp_dir().join("wardwell_test_append_confirmed");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project_dir = tmp.join("personal").join("test-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let server = make_test_server(&tmp);
+        let params = WriteParams {
+            action: "append".to_string(),
+            domain: "personal".to_string(),
+            project: Some("test-proj".to_string()),
+            list: Some("future-ideas".to_string()),
+            confirmed: Some(true),
+            title: Some("Build a rocket".to_string()),
+            body: Some("Literally".to_string()),
+            status: None, focus: None, why_this_matters: None, next_action: None,
+            open_questions: None, blockers: None, waiting_on: None, commit_message: None,
+            what_happened: None, root_cause: None, prevention: None,
+        };
+        let result = server.action_append_list(&params, "test-proj", None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["appended"], true);
+        assert_eq!(parsed["list"], "future-ideas");
+
+        let content = std::fs::read_to_string(project_dir.join("future-ideas.jsonl")).unwrap();
+        assert!(content.contains("Build a rocket"));
+        assert!(content.contains("\"_schema\": \"future-ideas\""));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn append_list_rejects_reserved_names() {
+        let tmp = std::env::temp_dir().join("wardwell_test_append_reserved");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let server = make_test_server(&tmp);
+        let params = WriteParams {
+            action: "append".to_string(),
+            domain: "personal".to_string(),
+            project: Some("test-proj".to_string()),
+            list: Some("history".to_string()),
+            confirmed: None,
+            title: Some("Test".to_string()),
+            body: None,
+            status: None, focus: None, why_this_matters: None, next_action: None,
+            open_questions: None, blockers: None, waiting_on: None, commit_message: None,
+            what_happened: None, root_cause: None, prevention: None,
+        };
+        let result = server.action_append_list(&params, "test-proj", None);
+        assert!(result.contains("built-in list"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn append_list_existing_list_no_confirmation_needed() {
+        let tmp = std::env::temp_dir().join("wardwell_test_append_existing");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project_dir = tmp.join("personal").join("test-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        // Pre-create the list
+        append_jsonl(&project_dir.join("bookmarks.jsonl"), "bookmarks", r#"{"title":"first"}"#).unwrap();
+
+        let server = make_test_server(&tmp);
+        let params = WriteParams {
+            action: "append".to_string(),
+            domain: "personal".to_string(),
+            project: Some("test-proj".to_string()),
+            list: Some("bookmarks".to_string()),
+            confirmed: None, // not needed — list exists
+            title: Some("Second entry".to_string()),
+            body: None,
+            status: None, focus: None, why_this_matters: None, next_action: None,
+            open_questions: None, blockers: None, waiting_on: None, commit_message: None,
+            what_happened: None, root_cause: None, prevention: None,
+        };
+        let result = server.action_append_list(&params, "test-proj", None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["appended"], true);
+
+        let content = std::fs::read_to_string(project_dir.join("bookmarks.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3); // schema + first + second
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

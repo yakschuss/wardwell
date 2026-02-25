@@ -29,6 +29,7 @@ impl IndexStore {
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let fts_exists: bool = conn
             .query_row(
