@@ -532,6 +532,16 @@ fn install_hook() -> Result<(), Box<dyn std::error::Error>> {
     // Install SessionStart hook
     install_hook_entry(hooks_obj, "SessionStart", &start_hook)?;
 
+    // Stop: resolve session against last Desktop intent
+    let resolve_command = format!("{} resolve", binary_path.display());
+    let stop_hook = serde_json::json!({
+        "hooks": [{
+            "type": "command",
+            "command": resolve_command
+        }]
+    });
+    install_hook_entry(hooks_obj, "Stop", &stop_hook)?;
+
     // Remove SessionEnd hook if present
     hooks_obj.remove("SessionEnd");
 

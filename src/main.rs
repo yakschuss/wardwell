@@ -24,6 +24,8 @@ enum Commands {
         #[arg(default_value = ".")]
         path: String,
     },
+    /// Stop hook — check if session should sync before exit (reads JSON from stdin)
+    Resolve,
     /// Rebuild the vault search index from scratch
     Reindex,
     /// Create a domain or project folder under the vault (additive only)
@@ -42,6 +44,7 @@ async fn main() {
         Commands::Doctor => wardwell::install::doctor::run(),
         Commands::Uninstall => wardwell::install::uninstall::run(),
         Commands::Inject { ref path } => run_inject(path),
+        Commands::Resolve => run_resolve(),
         Commands::Reindex => run_reindex(),
         Commands::Seed { ref target } => run_seed(target),
     };
@@ -262,6 +265,123 @@ fn extract_section_simple(body: &str, heading: &str) -> String {
     rest[..end].trim().to_string()
 }
 
+
+fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
+    use wardwell::config::loader;
+    use wardwell::domain::registry::DomainRegistry;
+
+    // Read Stop hook JSON from stdin
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let hook_data: serde_json::Value = serde_json::from_str(&input)
+        .unwrap_or_else(|_| serde_json::json!({}));
+
+    let cwd = hook_data["cwd"].as_str().unwrap_or(".");
+
+    let config = loader::load(None)?;
+    let registry = DomainRegistry::from_domains(config.registry.all().to_vec());
+    let cwd_path = std::path::Path::new(cwd);
+
+    // Resolve domain from cwd
+    let domain = match registry.resolve(cwd_path) {
+        Some(d) => d,
+        None => return Ok(()), // no domain → nothing to resolve
+    };
+
+    // Find project: walk vault domain dir, find project whose path matches cwd
+    let domain_dir = config.vault_path.join(domain.name.as_str());
+    if !domain_dir.exists() {
+        return Ok(());
+    }
+
+    let project_name = find_project_for_cwd(&domain_dir, cwd_path);
+    let project = match &project_name {
+        Some(p) => p.as_str(),
+        None => return Ok(()), // no project → nothing to resolve
+    };
+
+    // Read history.jsonl, find last source:desktop entry
+    let history_path = domain_dir.join(project).join("history.jsonl");
+    if !history_path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&history_path)?;
+    let last_desktop = content.lines()
+        .rev()
+        .filter(|line| !line.starts_with("{\"_schema\""))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|entry| entry["source"].as_str() == Some("desktop"));
+
+    let intent = match last_desktop {
+        Some(entry) => entry,
+        None => return Ok(()), // no desktop sync → nothing to resolve
+    };
+
+    // Check if a code sync already resolved this intent
+    // (last entry with source:code is newer than the desktop entry)
+    let desktop_date = intent["date"].as_str().unwrap_or("");
+    let already_resolved = content.lines()
+        .rev()
+        .filter(|line| !line.starts_with("{\"_schema\""))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|entry| {
+            entry["source"].as_str() == Some("code")
+                && entry["date"].as_str().unwrap_or("") > desktop_date
+        });
+
+    if already_resolved {
+        return Ok(()); // already synced from code since last desktop intent
+    }
+
+    // Build the block reason
+    let focus = intent["focus"].as_str().unwrap_or("(no focus)");
+    let next_action = intent["next_action"].as_str().unwrap_or("");
+
+    let mut reason = format!(
+        "Before ending: sync this session against the last Desktop intent.\n\n\
+         **Intent (from Desktop):**\n- Focus: {focus}\n"
+    );
+    if !next_action.is_empty() {
+        reason.push_str(&format!("- Next action: {next_action}\n"));
+    }
+    reason.push_str(&format!(
+        "\nCall `wardwell_write` with action:sync, source:code for project {}/{project}. \
+         Summarize what you accomplished against this intent. \
+         If nothing meaningful happened, set the same focus and next_action to preserve the Desktop intent.",
+        domain.name
+    ));
+
+    // Exit code 2 = block stop, continue conversation with reason
+    let response = serde_json::json!({
+        "decision": "block",
+        "reason": reason,
+    });
+    println!("{}", serde_json::to_string(&response)?);
+    std::process::exit(2);
+}
+
+/// Find which project directory under a domain matches the given cwd.
+fn find_project_for_cwd(domain_dir: &Path, cwd: &Path) -> Option<String> {
+    // Check if cwd basename matches a project dir
+    let cwd_name = cwd.file_name()?.to_str()?;
+    let candidate = domain_dir.join(cwd_name);
+    if candidate.is_dir() && candidate.join("current_state.md").exists() {
+        return Some(cwd_name.to_string());
+    }
+
+    // Check if any project's path patterns match cwd
+    // (look at current_state.md frontmatter for context matching)
+    for entry in std::fs::read_dir(domain_dir).ok()?.flatten() {
+        if entry.path().is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == cwd_name {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
 
 fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;
