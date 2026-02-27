@@ -344,17 +344,16 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     let next_action = intent["next_action"].as_str().unwrap_or("");
 
     let mut reason = format!(
-        "Before ending: sync this session against the last Desktop intent.\n\n\
-         **Intent (from Desktop):**\n- Focus: {focus}\n"
+        "There's an unresolved Desktop intent for **{domain_name}/{project}**:\n\
+         - Focus: {focus}\n"
     );
     if !next_action.is_empty() {
         reason.push_str(&format!("- Next action: {next_action}\n"));
     }
     reason.push_str(&format!(
-        "\nCall `wardwell_write` with action:sync, source:code for project {}/{project}. \
-         Summarize what you accomplished against this intent. \
-         If nothing meaningful happened, set the same focus and next_action to preserve the Desktop intent.",
-        domain_name
+        "\nIf this session did relevant work against that intent, sync with \
+         `wardwell_write` action:sync, source:code for {domain_name}/{project}. \
+         If not, just say so and exit."
     ));
 
     // Exit code 2 = block stop, continue conversation with reason
