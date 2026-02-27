@@ -1322,7 +1322,7 @@ impl WardwellServer {
             focus: focus.clone(),
             next_action: next_action.clone(),
             commit: commit_message.clone(),
-            body: p.body.clone().unwrap_or_default(),
+            body: p.body.clone().unwrap_or_else(|| commit_message.clone()),
             source: source.to_string(),
         };
         let json = match serde_json::to_string(&jsonl_entry) {
