@@ -439,6 +439,12 @@ Your vault is indexed. Three tools:
 - User asks \"catch me up on session X\" → context
 - User asks \"pick up from session X\" or gives a session ID to continue → resume
 
+**Source tagging:**
+All writes accept an optional 'source' param. Always pass it:
+- 'desktop' — from Claude Desktop or claude.ai
+- 'code' — from Claude Code
+- 'manual' — human-edited
+
 **Quality bar:**
 - Snapshots: one sentence focus, concrete next action
 - History entries: what changed and why, not what was discussed

@@ -89,6 +89,10 @@ pub struct WriteParams {
     #[schemars(description = "For append: set to true to confirm creating a NEW list. Required when the list doesn't exist yet.")]
     pub confirmed: Option<bool>,
 
+    // -- source tagging --
+    #[schemars(description = "Where this write originates: 'desktop' (Claude Desktop / claude.ai), 'code' (Claude Code), or 'manual'. Used to track intent vs execution.")]
+    pub source: Option<String>,
+
     // -- lesson fields --
     #[schemars(description = "REQUIRED for lesson: what went wrong")]
     pub what_happened: Option<String>,
@@ -1269,8 +1273,9 @@ impl WardwellServer {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
 
         // Build current_state.md
+        let source = p.source.as_deref().unwrap_or("unknown");
         let mut content = format!(
-            "---\nchat_name: {project}\nupdated: {now}\nstatus: {status}\ntype: project\ncontext: {domain}\n---\n\n# {project}\n\n## Focus\n{focus}\n",
+            "---\nchat_name: {project}\nupdated: {now}\nstatus: {status}\ntype: project\ncontext: {domain}\nsource: {source}\n---\n\n# {project}\n\n## Focus\n{focus}\n",
             domain = p.domain,
         );
 
@@ -1318,6 +1323,7 @@ impl WardwellServer {
             next_action: next_action.clone(),
             commit: commit_message.clone(),
             body: p.body.clone().unwrap_or_default(),
+            source: source.to_string(),
         };
         let json = match serde_json::to_string(&jsonl_entry) {
             Ok(j) => j,
@@ -1405,6 +1411,7 @@ impl WardwellServer {
             next_action: String::new(),
             commit: String::new(),
             body: p.body.clone().unwrap_or_default(),
+            source: p.source.clone().unwrap_or_default(),
         };
         let json = match serde_json::to_string(&jsonl_entry) {
             Ok(j) => j,
@@ -1457,6 +1464,7 @@ impl WardwellServer {
             what_happened,
             root_cause,
             prevention,
+            source: p.source.clone().unwrap_or_default(),
         };
         let json = match serde_json::to_string(&jsonl_entry) {
             Ok(j) => j,
@@ -1841,6 +1849,8 @@ struct HistoryJsonlEntry {
     next_action: String,
     commit: String,
     body: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1850,6 +1860,8 @@ struct LessonJsonlEntry {
     what_happened: String,
     root_cause: String,
     prevention: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source: String,
 }
 
 // -- Write helpers --
@@ -2088,6 +2100,7 @@ mod tests {
             what_happened: "Re-inserted all files".to_string(),
             root_cause: "No existence check".to_string(),
             prevention: "Use upsert".to_string(),
+            source: String::new(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         append_jsonl(&path, "lessons", &json).unwrap();
@@ -2459,7 +2472,7 @@ mod tests {
             body: Some("Details".to_string()),
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None,
+            what_happened: None, root_cause: None, prevention: None, source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -2487,7 +2500,7 @@ mod tests {
             body: Some("Literally".to_string()),
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None,
+            what_happened: None, root_cause: None, prevention: None, source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -2518,7 +2531,7 @@ mod tests {
             body: None,
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None,
+            what_happened: None, root_cause: None, prevention: None, source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         assert!(result.contains("built-in list"));
@@ -2547,7 +2560,7 @@ mod tests {
             body: None,
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None,
+            what_happened: None, root_cause: None, prevention: None, source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
