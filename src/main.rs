@@ -277,6 +277,11 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
 
     let cwd = hook_data["cwd"].as_str().unwrap_or(".");
 
+    // If this is already a retry (agent synced but hook fired again), let it through
+    if hook_data["stop_hook_active"].as_bool().unwrap_or(false) {
+        return Ok(());
+    }
+
     let config = loader::load(None)?;
     let cwd_path = std::path::Path::new(cwd);
 
