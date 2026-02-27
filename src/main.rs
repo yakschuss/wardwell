@@ -268,7 +268,6 @@ fn extract_section_simple(body: &str, heading: &str) -> String {
 
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;
-    use wardwell::domain::registry::DomainRegistry;
 
     // Read Stop hook JSON from stdin
     let mut input = String::new();
@@ -279,29 +278,30 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = hook_data["cwd"].as_str().unwrap_or(".");
 
     let config = loader::load(None)?;
-    let registry = DomainRegistry::from_domains(config.registry.all().to_vec());
     let cwd_path = std::path::Path::new(cwd);
 
-    // Resolve domain from cwd
-    let domain = match registry.resolve(cwd_path) {
-        Some(d) => d,
-        None => return Ok(()), // no domain → nothing to resolve
+    // Try registry first, fall back to scanning vault folders by cwd name
+    let registry = wardwell::domain::registry::DomainRegistry::from_domains(
+        config.registry.all().to_vec(),
+    );
+    let (domain_name, project) = if let Some(d) = registry.resolve(cwd_path) {
+        let domain_dir = config.vault_path.join(d.name.as_str());
+        match find_project_for_cwd(&domain_dir, cwd_path) {
+            Some(p) => (d.name.to_string(), p),
+            None => return Ok(()),
+        }
+    } else {
+        // No domain registry — scan vault folders for a matching project
+        match find_project_in_vault(&config.vault_path, cwd_path) {
+            Some((d, p)) => (d, p),
+            None => return Ok(()),
+        }
     };
 
-    // Find project: walk vault domain dir, find project whose path matches cwd
-    let domain_dir = config.vault_path.join(domain.name.as_str());
-    if !domain_dir.exists() {
-        return Ok(());
-    }
-
-    let project_name = find_project_for_cwd(&domain_dir, cwd_path);
-    let project = match &project_name {
-        Some(p) => p.as_str(),
-        None => return Ok(()), // no project → nothing to resolve
-    };
+    let domain_dir = config.vault_path.join(&domain_name);
 
     // Read history.jsonl, find last source:desktop entry
-    let history_path = domain_dir.join(project).join("history.jsonl");
+    let history_path = domain_dir.join(&project).join("history.jsonl");
     if !history_path.exists() {
         return Ok(());
     }
@@ -349,7 +349,7 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
         "\nCall `wardwell_write` with action:sync, source:code for project {}/{project}. \
          Summarize what you accomplished against this intent. \
          If nothing meaningful happened, set the same focus and next_action to preserve the Desktop intent.",
-        domain.name
+        domain_name
     ));
 
     // Exit code 2 = block stop, continue conversation with reason
@@ -378,6 +378,24 @@ fn find_project_for_cwd(domain_dir: &Path, cwd: &Path) -> Option<String> {
             if name == cwd_name {
                 return Some(name);
             }
+        }
+    }
+    None
+}
+
+/// Scan all domain folders in the vault for a project matching cwd basename.
+/// Returns (domain_name, project_name) if found.
+fn find_project_in_vault(vault_path: &Path, cwd: &Path) -> Option<(String, String)> {
+    let cwd_name = cwd.file_name()?.to_str()?;
+    for domain_entry in std::fs::read_dir(vault_path).ok()?.flatten() {
+        let domain_path = domain_entry.path();
+        if !domain_path.is_dir() {
+            continue;
+        }
+        let domain_name = domain_entry.file_name().to_string_lossy().to_string();
+        let candidate = domain_path.join(cwd_name);
+        if candidate.is_dir() && candidate.join("current_state.md").exists() {
+            return Some((domain_name, cwd_name.to_string()));
         }
     }
     None
