@@ -309,13 +309,13 @@ If so, I can log a quick summary to your vault. Just tell me the domain/project 
 (or I'll suggest one), and I'll write a 1-2 sentence entry via \
 `wardwell_write` action:`append_history`, source:`code`.";
 
-    // Exit code 2 = block stop, continue conversation with reason
+    // Exit 0 with decision:block — reason goes to agent only, not shown to user
     let response = serde_json::json!({
         "decision": "block",
         "reason": reason,
     });
     println!("{}", serde_json::to_string(&response)?);
-    std::process::exit(2);
+    Ok(())
 }
 
 
