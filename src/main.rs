@@ -304,11 +304,10 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let reason = "\
-If this session accomplished meaningful work (features, bug fixes, decisions, \
-or architectural changes), log it before closing:\n\n\
-1. Ask the user which domain/project this belongs to (or suggest one based on the cwd)\n\
-2. Write a 1-2 sentence summary using `wardwell_write` action:`append_history`, source:`code`\n\n\
-If the session was just a quick question or exploration, say so and exit.";
+Before closing — did this session produce anything worth remembering? \
+If so, I can log a quick summary to your vault. Just tell me the domain/project \
+(or I'll suggest one), and I'll write a 1-2 sentence entry via \
+`wardwell_write` action:`append_history`, source:`code`.";
 
     // Exit code 2 = block stop, continue conversation with reason
     let response = serde_json::json!({
