@@ -284,21 +284,8 @@ fn extract_section_simple(body: &str, heading: &str) -> String {
 
 
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
-    use wardwell::config::loader;
-
-    // Read Stop hook JSON from stdin
-    let mut input = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-    let hook_data: serde_json::Value = serde_json::from_str(&input)
-        .unwrap_or_else(|_| serde_json::json!({}));
-
-    // If this is already a retry (agent synced but hook fired again), let it through
-    if hook_data["stop_hook_active"].as_bool().unwrap_or(false) {
-        return Ok(());
-    }
-
-    // Stop hook is a no-op. Session logging is handled by CLAUDE.md behavioral rules.
-    // The hook entry is kept so wardwell can re-enable blocking in the future if
+    // No-op. Session logging is handled by CLAUDE.md behavioral rules.
+    // The hook entry is kept so wardwell can re-enable blocking if
     // Claude Code adds a silent block mechanism.
     Ok(())
 }
