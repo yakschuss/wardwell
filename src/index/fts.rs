@@ -356,4 +356,30 @@ mod tests {
             assert_eq!(r.frontmatter.domain.as_deref(), Some("myapp"));
         }
     }
+
+    #[test]
+    fn domain_inferred_from_path_when_frontmatter_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        // File under work/ with no domain in frontmatter
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(
+            work_dir.join("notes.md"),
+            "---\ntype: reference\nstatus: active\nsummary: Work notes\n---\nSome work notes.\n",
+        ).unwrap();
+
+        let store = IndexStore::in_memory().unwrap();
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+
+        // Search with domain filter should find it
+        let q = SearchQuery {
+            query: "work notes".to_string(),
+            domains: Some(vec!["work".to_string()]),
+            limit: 5,
+            ..Default::default()
+        };
+        let results = store.search(&q).unwrap();
+        assert_eq!(results.total, 1);
+        assert_eq!(results.results[0].frontmatter.domain.as_deref(), Some("work"));
+    }
 }

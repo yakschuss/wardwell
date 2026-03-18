@@ -235,7 +235,12 @@ impl IndexStore {
         // Insert fresh
         let fm = &vf.frontmatter;
         let file_type = fm.file_type.to_string();
-        let domain = fm.domain.as_deref().unwrap_or("");
+        // Infer domain from first path component if frontmatter doesn't specify one
+        let domain = fm.domain.as_deref()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| {
+                abs_path.split('/').next().unwrap_or("")
+            });
         let status = fm.status.as_ref().map(|s| s.to_string()).unwrap_or_default();
         let confidence = fm.confidence.as_ref().map(|c| c.to_string()).unwrap_or_default();
         let summary = fm.summary.as_deref().unwrap_or("");

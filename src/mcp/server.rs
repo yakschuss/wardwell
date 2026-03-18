@@ -1649,11 +1649,13 @@ fn json_error(msg: &str) -> String {
 
 /// Resolve a vault path: try vault root first, then each source directory.
 fn resolve_path(vault_root: &std::path::Path, path: &str) -> Option<PathBuf> {
-    let p = std::path::Path::new(path);
+    // Strip leading slash from relative paths (common copy-paste error)
+    let clean = path.strip_prefix('/').unwrap_or(path);
+    let p = std::path::Path::new(clean);
     if p.is_absolute() && p.exists() {
         return Some(p.to_path_buf());
     }
-    let vault_candidate = vault_root.join(path);
+    let vault_candidate = vault_root.join(clean);
     if vault_candidate.exists() {
         return Some(vault_candidate);
     }
