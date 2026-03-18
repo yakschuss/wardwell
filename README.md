@@ -264,7 +264,7 @@ Single Rust binary, no runtime dependencies beyond `claude` CLI (optional, for s
 # Lint (must pass clean — warnings are errors)
 cargo clippy --lib --bin wardwell
 
-# Test (133 tests)
+# Test (187 tests)
 cargo test
 
 # Build release
@@ -275,10 +275,11 @@ Strict lints: `deny(clippy::unwrap_used, expect_used, panic, todo, unimplemented
 
 ## Requirements
 
-- Rust 1.75+ (edition 2024)
-- macOS or Linux
+- macOS (Apple Silicon) or Linux (x86_64)
 - Claude Code (for MCP integration)
 - `claude` CLI (optional — only needed for session summarization)
+
+Intel Macs are not supported — the ONNX Runtime dependency (used for semantic search embeddings) does not provide prebuilt binaries for x86_64-apple-darwin. You can build from source with `cargo install --path .` if you need it, but embedding may not work.
 
 ## License
 
