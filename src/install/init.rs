@@ -273,7 +273,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         let index_path = config_dir().join("index.db");
         if let Ok(index) = crate::index::store::IndexStore::open(&index_path) {
-            match crate::index::builder::IndexBuilder::build_filtered(&index, &vault_path, &exclude) {
+            match crate::index::builder::IndexBuilder::build_filtered(&index, &vault_path, &exclude, None) {
                 Ok(stats) => println!("  \u{2713} Indexed {} files ({} skipped, {} errors)", stats.indexed, stats.skipped, stats.errors),
                 Err(e) => println!("  \u{2717} Index build failed: {e}"),
             }
@@ -408,7 +408,7 @@ Your vault is indexed. Three tools:
 
 **wardwell_search** — Find things.
   action: search | read | history | orchestrate | retrospective | patterns | context | resume
-  - \"search\": FTS query across vault
+  - \"search\": FTS query across vault (default). Add mode:\"semantic\" for hybrid BM25+vector search — returns chunk-level results with full text. Use limit to control depth (3=surgical, 20=broad).
   - \"read\": full file by path
   - \"history\": query across history.jsonl files
   - \"orchestrate\": prioritized project queue
@@ -430,6 +430,7 @@ Your vault is indexed. Three tools:
 **When to use:**
 - User references a project → search first
 - Session produced state changes → offer to sync
+- Meaningful work completed (commits, multi-file edits, feature shipped) → proactively offer to sync
 - Real tradeoff decision made → offer to record it
 - Something broke → offer to record the lesson
 - User asks \"what's next\" → orchestrate
@@ -448,7 +449,7 @@ All writes accept an optional 'source' param. Always pass it:
 **Quality bar:**
 - Snapshots: one sentence focus, concrete next action
 - History entries: what changed and why, not what was discussed
-- Decisions: the tradeoff, not the implementation
+- Decisions: the tradeoff and rejected alternatives, not the implementation
 - Lessons: root cause and prevention, not just what happened
 
 **File roles:**

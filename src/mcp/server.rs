@@ -24,6 +24,8 @@ pub struct WardwellServer {
     accessed_projects: Arc<Mutex<HashSet<String>>>,
     /// Most recently accessed (domain, project) pair.
     last_project: Arc<Mutex<Option<(String, String)>>>,
+    /// Embedder for hybrid semantic search. None if model not available.
+    pub embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>,
 }
 
 // -- Tool parameter types --
@@ -48,6 +50,8 @@ pub struct SearchParams {
     pub session_id: Option<String>,
     #[schemars(description = "Include archived projects in retrospective/patterns. Default false.")]
     pub include_archived: Option<bool>,
+    #[schemars(description = "Search mode: 'keyword' (FTS5 only, default) or 'semantic' (hybrid BM25 + vector + RRF). Semantic returns chunk-level results with full text.")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -110,7 +114,7 @@ pub struct ClipboardParams {
 
 #[tool_router(router = tool_router)]
 impl WardwellServer {
-    pub fn new(config: WardwellConfig, index: Arc<IndexStore>) -> Self {
+    pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>) -> Self {
         let vault_root = config.vault_path.clone();
         let registry = Arc::new(RwLock::new(DomainRegistry::from_domains(config.registry.all().to_vec())));
 
@@ -122,6 +126,7 @@ impl WardwellServer {
             registry,
             accessed_projects: Arc::new(Mutex::new(HashSet::new())),
             last_project: Arc::new(Mutex::new(None)),
+            embedder,
         }
     }
 
@@ -224,6 +229,11 @@ impl WardwellServer {
             None => return json_error("'query' is required for action 'search'."),
         };
 
+        // Check if semantic/hybrid mode requested
+        if p.mode.as_deref() == Some("semantic") {
+            return self.action_search_semantic(&query_str, p);
+        }
+
         let query = SearchQuery {
             query: query_str,
             domains: p.domain.as_ref().map(|d| vec![d.clone()]),
@@ -243,6 +253,43 @@ impl WardwellServer {
                 serde_json::to_string_pretty(&results).unwrap_or_default()
             }
             Err(e) => json_error(&format!("Search failed: {e}")),
+        }
+    }
+
+    fn action_search_semantic(&self, query: &str, p: &SearchParams) -> String {
+        let mut emb_guard = match self.embedder.lock() {
+            Ok(g) => g,
+            Err(_) => return json_error("Embedder lock poisoned."),
+        };
+
+        let embedder = match emb_guard.as_mut() {
+            Some(e) => e,
+            None => return json_error(
+                "Semantic search unavailable. The embedding model has not been initialized. \
+                 Run `wardwell reindex` to download the model and build the vector index."
+            ),
+        };
+
+        let limit = p.limit.unwrap_or(5);
+        let domains: Option<Vec<String>> = p.domain.as_ref().map(|d| vec![d.clone()]);
+
+        match crate::index::hybrid::hybrid_search(
+            &self.index,
+            embedder,
+            query,
+            limit,
+            domains.as_deref(),
+        ) {
+            Ok(results) => {
+                // Track accessed projects from chunk results
+                for chunk in &results.chunks {
+                    if let Some((d, p)) = extract_domain_project(&chunk.path) {
+                        self.record_access(&d, &p);
+                    }
+                }
+                serde_json::to_string_pretty(&results).unwrap_or_default()
+            }
+            Err(e) => json_error(&format!("Semantic search failed: {e}")),
         }
     }
 
@@ -1580,7 +1627,7 @@ impl ServerHandler for WardwellServer {
     fn get_info(&self) -> ServerInfo {
         let instructions =
             "Wardwell: Personal AI knowledge vault. Three tools: \
-             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume), \
+             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; search supports mode:'semantic' for hybrid vector+keyword chunk-level results), \
              wardwell_write (action: sync|decide|append_history|lesson|append), \
              wardwell_clipboard (copy to clipboard, ask first)."
                 .to_string();
@@ -1938,7 +1985,7 @@ mod tests {
             exclude: vec![],
             ai: Default::default(),
         };
-        WardwellServer::new(config, index)
+        WardwellServer::new(config, index, Arc::new(Mutex::new(None)))
     }
 
     #[test]
@@ -2373,14 +2420,15 @@ mod tests {
     #[test]
     fn patterns_detects_stale_threads() {
         let old_content = make_history_jsonl(&[("2026-01-01", "Old work", "active", "f")]);
-        let recent_content = make_history_jsonl(&[("2026-02-20", "Recent", "active", "f")]);
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let recent_content = make_history_jsonl(&[(&today, "Recent", "active", "f")]);
         let tmp = setup_test_vault("wardwell_test_stale", &[
             ("work", "stale-proj", &old_content),
             ("work", "fresh-proj", &recent_content),
         ]);
 
         let entries = collect_history_entries(&tmp, None, None, true);
-        let today = chrono::Local::now().date_naive();
+        let today_date = chrono::Local::now().date_naive();
         let mut latest: std::collections::HashMap<String, (&str, &str)> = std::collections::HashMap::new();
         for e in &entries {
             let key = format!("{}/{}", e.domain, e.project);
@@ -2394,7 +2442,7 @@ mod tests {
             .filter(|(_, (date, status))| {
                 *status != "completed" && *status != "resolved"
                     && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                        .is_ok_and(|d| (today - d).num_days() >= 14)
+                        .is_ok_and(|d| (today_date - d).num_days() >= 14)
             })
             .map(|(k, _)| k)
             .collect();

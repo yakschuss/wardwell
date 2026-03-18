@@ -1,3 +1,5 @@
+use crate::index::chunk::chunk_file;
+use crate::index::embed::Embedder;
 use crate::index::store::{IndexError, IndexStore};
 use crate::vault::reader::walk_vault_filtered;
 use sha2::{Digest, Sha256};
@@ -11,6 +13,7 @@ pub struct BuildStats {
     pub skipped: usize,
     pub removed: usize,
     pub errors: usize,
+    pub chunks_embedded: usize,
     pub error_details: Vec<String>,
 }
 
@@ -19,16 +22,27 @@ pub struct IndexBuilder;
 
 impl IndexBuilder {
     /// Incremental build: upsert changed files, remove stale entries.
-    pub fn full_build(store: &IndexStore, vault_root: &Path) -> Result<BuildStats, IndexError> {
-        Self::build_filtered(store, vault_root, &[])
+    /// Pass `embedder` to generate vector embeddings for hybrid search.
+    pub fn full_build(
+        store: &IndexStore,
+        vault_root: &Path,
+        embedder: Option<&mut Embedder>,
+    ) -> Result<BuildStats, IndexError> {
+        Self::build_filtered(store, vault_root, &[], embedder)
     }
 
     /// Incremental build with exclusion patterns.
-    pub fn build_filtered(store: &IndexStore, vault_root: &Path, exclude: &[String]) -> Result<BuildStats, IndexError> {
+    pub fn build_filtered(
+        store: &IndexStore,
+        vault_root: &Path,
+        exclude: &[String],
+        mut embedder: Option<&mut Embedder>,
+    ) -> Result<BuildStats, IndexError> {
         let results = walk_vault_filtered(vault_root, exclude);
         let mut indexed = 0;
         let mut skipped = 0;
         let mut errors = 0;
+        let mut chunks_embedded = 0;
         let mut error_details = Vec::new();
         let mut seen_paths = HashSet::new();
 
@@ -42,7 +56,46 @@ impl IndexBuilder {
                         .to_string();
                     seen_paths.insert(rel_path.clone());
                     match store.upsert(&vf, vault_root) {
-                        Ok(true) => indexed += 1,
+                        Ok(true) => {
+                            indexed += 1;
+
+                            // Chunk the file and upsert chunks
+                            let chunks = chunk_file(&vf.path, &vf.body);
+                            if !chunks.is_empty() {
+                                match store.upsert_chunks(&rel_path, &chunks) {
+                                    Ok(changed_ids) => {
+                                        // Embed changed chunks if embedder available
+                                        if let Some(ref mut emb) = embedder
+                                            && !changed_ids.is_empty() {
+                                                // Collect texts for changed chunks
+                                                let texts: Vec<String> = changed_ids.iter()
+                                                    .filter_map(|id| {
+                                                        chunks.iter()
+                                                            .find(|c| format!("{rel_path}::{}", c.index) == *id)
+                                                            .map(|c| c.body.clone())
+                                                    })
+                                                    .collect();
+
+                                                match emb.embed_batch(&texts) {
+                                                    Ok(vecs) => {
+                                                        if let Err(e) = store.upsert_embeddings(&changed_ids, &vecs) {
+                                                            error_details.push(format!("{rel_path} embeddings: {e}"));
+                                                        } else {
+                                                            chunks_embedded += vecs.len();
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error_details.push(format!("{rel_path} embed: {e}"));
+                                                    }
+                                                }
+                                            }
+                                    }
+                                    Err(e) => {
+                                        error_details.push(format!("{rel_path} chunks: {e}"));
+                                    }
+                                }
+                            }
+                        }
                         Ok(false) => skipped += 1,
                         Err(e) => {
                             error_details.push(format!("{rel_path}: {e}"));
@@ -60,7 +113,7 @@ impl IndexBuilder {
         // Remove stale entries (files that no longer exist on disk)
         let removed = store.remove_stale(&seen_paths)?;
 
-        Ok(BuildStats { indexed, skipped, removed, errors, error_details })
+        Ok(BuildStats { indexed, skipped, removed, errors, chunks_embedded, error_details })
     }
 }
 
@@ -104,7 +157,7 @@ mod tests {
         create_test_vault(dir.path());
 
         let store = IndexStore::in_memory().unwrap();
-        let stats = IndexBuilder::full_build(&store, dir.path());
+        let stats = IndexBuilder::full_build(&store, dir.path(), None);
         assert!(stats.is_ok(), "{stats:?}");
         let stats = stats.unwrap();
         assert_eq!(stats.indexed, 3);
@@ -117,11 +170,11 @@ mod tests {
         create_test_vault(dir.path());
 
         let store = IndexStore::in_memory().unwrap();
-        let stats = IndexBuilder::full_build(&store, dir.path()).unwrap();
+        let stats = IndexBuilder::full_build(&store, dir.path(), None).unwrap();
         assert_eq!(stats.indexed, 3);
 
         // Second build should skip all unchanged files
-        let stats2 = IndexBuilder::full_build(&store, dir.path()).unwrap();
+        let stats2 = IndexBuilder::full_build(&store, dir.path(), None).unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.skipped, 3);
     }
@@ -137,7 +190,7 @@ mod tests {
 
         let store = IndexStore::in_memory().unwrap();
         let exclude = vec!["node_modules".to_string()];
-        let stats = IndexBuilder::build_filtered(&store, dir.path(), &exclude).unwrap();
+        let stats = IndexBuilder::build_filtered(&store, dir.path(), &exclude, None).unwrap();
         assert_eq!(stats.indexed, 3); // node_modules/junk.md excluded
     }
 
@@ -147,12 +200,12 @@ mod tests {
         create_test_vault(dir.path());
 
         let store = IndexStore::in_memory().unwrap();
-        IndexBuilder::full_build(&store, dir.path()).ok();
+        IndexBuilder::full_build(&store, dir.path(), None).ok();
 
         // Remove a file from disk
         std::fs::remove_file(dir.path().join("myapp.md")).ok();
 
-        let stats = IndexBuilder::full_build(&store, dir.path()).unwrap();
+        let stats = IndexBuilder::full_build(&store, dir.path(), None).unwrap();
         assert_eq!(stats.removed, 1);
     }
 
@@ -163,7 +216,7 @@ mod tests {
         std::fs::write(dir.path().join("plain.md"), "no frontmatter").ok();
 
         let store = IndexStore::in_memory().unwrap();
-        let stats = IndexBuilder::full_build(&store, dir.path());
+        let stats = IndexBuilder::full_build(&store, dir.path(), None);
         assert!(stats.is_ok(), "{stats:?}");
         let stats = stats.unwrap();
         assert_eq!(stats.indexed, 2);
@@ -179,7 +232,7 @@ mod tests {
         ).ok();
 
         let store = IndexStore::in_memory().unwrap();
-        IndexBuilder::full_build(&store, dir.path()).ok();
+        IndexBuilder::full_build(&store, dir.path(), None).ok();
 
         let conn = store.lock().unwrap();
         let count: i64 = conn

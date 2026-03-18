@@ -94,7 +94,7 @@ impl std::fmt::Display for Confidence {
 }
 
 /// Parsed frontmatter from a vault file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frontmatter {
     #[serde(rename = "type", default)]
     pub file_type: VaultType,

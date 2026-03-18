@@ -168,7 +168,7 @@ impl IndexStore {
     }
 }
 
-fn parse_vault_type(s: &str) -> VaultType {
+pub fn parse_vault_type(s: &str) -> VaultType {
     match s {
         "project" => VaultType::Project,
         "decision" => VaultType::Decision,
@@ -180,7 +180,7 @@ fn parse_vault_type(s: &str) -> VaultType {
     }
 }
 
-fn parse_status(s: &str) -> Option<Status> {
+pub fn parse_status(s: &str) -> Option<Status> {
     match s {
         "active" => Some(Status::Active),
         "resolved" => Some(Status::Resolved),
@@ -190,7 +190,7 @@ fn parse_status(s: &str) -> Option<Status> {
     }
 }
 
-fn parse_confidence(s: &str) -> Option<Confidence> {
+pub fn parse_confidence(s: &str) -> Option<Confidence> {
     match s {
         "inferred" => Some(Confidence::Inferred),
         "proposed" => Some(Confidence::Proposed),
@@ -234,7 +234,7 @@ mod tests {
         );
 
         let store = IndexStore::in_memory().unwrap();
-        IndexBuilder::full_build(&store, dir.path()).ok();
+        IndexBuilder::full_build(&store, dir.path(), None).ok();
         store
     }
 

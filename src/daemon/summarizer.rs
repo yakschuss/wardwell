@@ -226,7 +226,7 @@ Ignore:
 Extract:
 
 ## Decisions
-Architectural or strategic choices where the user faced a real tradeoff and chose a direction. Not "used Faraday" but "chose client-level retry over application-level retry because [reason]." Only include if the reasoning would apply to future projects.
+Architectural or strategic choices where the user faced a real tradeoff and chose a direction. Not "used Faraday" but "chose client-level retry over application-level retry because [reason]." Include what was rejected and why — these rejected paths prevent future revisiting of settled questions. Only include if the reasoning would apply to future projects.
 
 ## Patterns
 Repeated behaviors or preferences. How does this person approach problems? What do they reach for first? What do they avoid? Examples:

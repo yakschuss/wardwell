@@ -76,17 +76,34 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let index = Arc::new(index);
 
-    // Index in background so the MCP server starts immediately
+    // Initialize embedder for hybrid semantic search
+    let models_dir = config_dir.join("models");
+    let embedder: Arc<std::sync::Mutex<Option<wardwell::index::embed::Embedder>>> = match wardwell::index::embed::Embedder::new(&models_dir) {
+        Ok(e) => {
+            eprintln!("wardwell: embedding model loaded");
+            Arc::new(std::sync::Mutex::new(Some(e)))
+        }
+        Err(e) => {
+            eprintln!("wardwell: embedding model unavailable (semantic search disabled): {e}");
+            Arc::new(std::sync::Mutex::new(None))
+        }
+    };
+
+    // Index + embed in background so the MCP server starts immediately
     let bg_index = Arc::clone(&index);
     let bg_roots = all_index_roots.clone();
     let bg_exclude = config.exclude.clone();
+    let bg_embedder = Arc::clone(&embedder);
     tokio::spawn(async move {
         for root in &bg_roots {
-            match IndexBuilder::build_filtered(&bg_index, root, &bg_exclude) {
+            let mut emb_guard = bg_embedder.lock().unwrap_or_else(|e| e.into_inner());
+            let result = IndexBuilder::build_filtered(&bg_index, root, &bg_exclude, emb_guard.as_mut());
+            drop(emb_guard);
+            match result {
                 Ok(stats) => {
                     if stats.indexed > 0 || stats.removed > 0 {
-                        eprintln!("wardwell: indexed {} files from {} ({} skipped, {} removed, {} errors)",
-                            stats.indexed, root.display(), stats.skipped, stats.removed, stats.errors);
+                        eprintln!("wardwell: indexed {} files from {} ({} skipped, {} removed, {} chunks embedded, {} errors)",
+                            stats.indexed, root.display(), stats.skipped, stats.removed, stats.chunks_embedded, stats.errors);
                     }
                 }
                 Err(e) => eprintln!("wardwell: index error for {}: {e}", root.display()),
@@ -94,7 +111,7 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let server = WardwellServer::new(config, Arc::clone(&index));
+    let server = WardwellServer::new(config, Arc::clone(&index), embedder);
     let shared_registry = server.registry.clone();
 
     // Spawn vault file watcher for vault + sources
@@ -305,56 +322,79 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
 
     let domain_dir = config.vault_path.join(&domain_name);
 
-    // Read history.jsonl, find last source:desktop entry
+    // Read history.jsonl for sync resolution
     let history_path = domain_dir.join(&project).join("history.jsonl");
-    if !history_path.exists() {
+    let content = if history_path.exists() {
+        std::fs::read_to_string(&history_path)?
+    } else {
+        String::new()
+    };
+
+    // If already synced from code today, don't nag
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let already_synced_today = content.lines()
+        .rev()
+        .filter(|line| !line.starts_with("{\"_schema\""))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|entry| {
+            entry["source"].as_str() == Some("code")
+                && entry["date"].as_str().unwrap_or("").starts_with(&today)
+        });
+
+    if already_synced_today {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&history_path)?;
+    // Check for unresolved desktop intent (strong prompt)
     let last_desktop = content.lines()
         .rev()
         .filter(|line| !line.starts_with("{\"_schema\""))
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find(|entry| entry["source"].as_str() == Some("desktop"));
 
-    let intent = match last_desktop {
-        Some(entry) => entry,
-        None => return Ok(()), // no desktop sync → nothing to resolve
+    let reason = if let Some(intent) = last_desktop {
+        let desktop_date = intent["date"].as_str().unwrap_or("");
+        let already_resolved = content.lines()
+            .rev()
+            .filter(|line| !line.starts_with("{\"_schema\""))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|entry| {
+                entry["source"].as_str() == Some("code")
+                    && entry["date"].as_str().unwrap_or("") > desktop_date
+            });
+
+        if already_resolved {
+            return Ok(());
+        }
+
+        let focus = intent["focus"].as_str().unwrap_or("(no focus)");
+        let next_action = intent["next_action"].as_str().unwrap_or("");
+        let mut msg = format!(
+            "There's an unresolved Desktop intent for **{domain_name}/{project}**:\n\
+             - Focus: {focus}\n"
+        );
+        if !next_action.is_empty() {
+            msg.push_str(&format!("- Next action: {next_action}\n"));
+        }
+        msg.push_str(&format!(
+            "\nIf this session did relevant work against that intent, sync with \
+             `wardwell_write` action:sync, source:code for {domain_name}/{project}. \
+             If not, just say so and exit."
+        ));
+        msg
+    } else {
+        // No desktop intent — check if this is a tracked project
+        let state_path = domain_dir.join(&project).join("current_state.md");
+        if !state_path.exists() {
+            return Ok(());
+        }
+        format!(
+            "This session worked in tracked project **{domain_name}/{project}**.\n\n\
+             If you made meaningful progress, consider syncing with \
+             `wardwell_write` action:sync, source:code for {domain_name}/{project}.\n\
+             If not, just say so and exit."
+        )
     };
-
-    // Check if a code sync already resolved this intent
-    // (last entry with source:code is newer than the desktop entry)
-    let desktop_date = intent["date"].as_str().unwrap_or("");
-    let already_resolved = content.lines()
-        .rev()
-        .filter(|line| !line.starts_with("{\"_schema\""))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|entry| {
-            entry["source"].as_str() == Some("code")
-                && entry["date"].as_str().unwrap_or("") > desktop_date
-        });
-
-    if already_resolved {
-        return Ok(()); // already synced from code since last desktop intent
-    }
-
-    // Build the block reason
-    let focus = intent["focus"].as_str().unwrap_or("(no focus)");
-    let next_action = intent["next_action"].as_str().unwrap_or("");
-
-    let mut reason = format!(
-        "There's an unresolved Desktop intent for **{domain_name}/{project}**:\n\
-         - Focus: {focus}\n"
-    );
-    if !next_action.is_empty() {
-        reason.push_str(&format!("- Next action: {next_action}\n"));
-    }
-    reason.push_str(&format!(
-        "\nIf this session did relevant work against that intent, sync with \
-         `wardwell_write` action:sync, source:code for {domain_name}/{project}. \
-         If not, just say so and exit."
-    ));
 
     // Exit code 2 = block stop, continue conversation with reason
     let response = serde_json::json!({
@@ -424,8 +464,24 @@ fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let stats = IndexBuilder::build_filtered(&index, &config.vault_path, &config.exclude)?;
+    // Initialize embedder for vector index
+    let models_dir = config_dir.join("models");
+    let mut embedder = match wardwell::index::embed::Embedder::new(&models_dir) {
+        Ok(e) => {
+            println!("Embedding model loaded.");
+            Some(e)
+        }
+        Err(e) => {
+            eprintln!("Embedding model unavailable (skipping vector index): {e}");
+            None
+        }
+    };
+
+    let stats = IndexBuilder::build_filtered(&index, &config.vault_path, &config.exclude, embedder.as_mut())?;
     println!("Reindexed {} file(s) ({} skipped, {} error(s)).", stats.indexed, stats.skipped, stats.errors);
+    if stats.chunks_embedded > 0 {
+        println!("Embedded {} chunks.", stats.chunks_embedded);
+    }
     for detail in &stats.error_details {
         eprintln!("  error: {detail}");
     }
