@@ -303,8 +303,9 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Exit 2 to block stop — no stdout so nothing shown to user.
+    // Exit 2 to block stop. Minimal stderr avoids "No stderr output" message.
     // The behavioral prompt to log session work lives in CLAUDE.md.
+    eprint!(" ");
     std::process::exit(2);
 }
 
