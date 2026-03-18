@@ -303,10 +303,11 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Exit 2 to block stop. Minimal stderr avoids "No stderr output" message.
+    // Exit 0 with decision:block — avoids the error UX of exit 2.
     // The behavioral prompt to log session work lives in CLAUDE.md.
-    eprint!(" ");
-    std::process::exit(2);
+    let response = serde_json::json!({ "decision": "block" });
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
 }
 
 
