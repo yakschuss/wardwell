@@ -297,16 +297,9 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Check config toggle
-    let config = loader::load(None)?;
-    if !config.stop_hook {
-        return Ok(());
-    }
-
-    // Exit 0 with decision:block — avoids the error UX of exit 2.
-    // The behavioral prompt to log session work lives in CLAUDE.md.
-    let response = serde_json::json!({ "decision": "block" });
-    println!("{}", serde_json::to_string(&response)?);
+    // Stop hook is a no-op. Session logging is handled by CLAUDE.md behavioral rules.
+    // The hook entry is kept so wardwell can re-enable blocking in the future if
+    // Claude Code adds a silent block mechanism.
     Ok(())
 }
 
