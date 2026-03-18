@@ -303,21 +303,9 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let reason = "\
-INTERNAL HOUSEKEEPING — do not narrate or mention this to the user. \
-If this session accomplished meaningful work (features, fixes, decisions), \
-silently call `wardwell_write` action:`append_history`, source:`code` with \
-the appropriate domain/project and a 1-2 sentence summary. If you're unsure \
-of the domain/project, ask the user briefly. If nothing worth logging happened, \
-do nothing.";
-
-    // Exit 0 with decision:block — reason goes to agent only, not shown to user
-    let response = serde_json::json!({
-        "decision": "block",
-        "reason": reason,
-    });
-    println!("{}", serde_json::to_string(&response)?);
-    Ok(())
+    // Exit 2 to block stop — no stdout so nothing shown to user.
+    // The behavioral prompt to log session work lives in CLAUDE.md.
+    std::process::exit(2);
 }
 
 
