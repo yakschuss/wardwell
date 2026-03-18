@@ -292,109 +292,23 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     let hook_data: serde_json::Value = serde_json::from_str(&input)
         .unwrap_or_else(|_| serde_json::json!({}));
 
-    let cwd = hook_data["cwd"].as_str().unwrap_or(".");
-
     // If this is already a retry (agent synced but hook fired again), let it through
     if hook_data["stop_hook_active"].as_bool().unwrap_or(false) {
         return Ok(());
     }
 
+    // Check config toggle
     let config = loader::load(None)?;
-    let cwd_path = std::path::Path::new(cwd);
-
-    // Try registry first, fall back to scanning vault folders by cwd name
-    let registry = wardwell::domain::registry::DomainRegistry::from_domains(
-        config.registry.all().to_vec(),
-    );
-    let (domain_name, project) = if let Some(d) = registry.resolve(cwd_path) {
-        let domain_dir = config.vault_path.join(d.name.as_str());
-        match find_project_for_cwd(&domain_dir, cwd_path) {
-            Some(p) => (d.name.to_string(), p),
-            None => return Ok(()),
-        }
-    } else {
-        // No domain registry — scan vault folders for a matching project
-        match find_project_in_vault(&config.vault_path, cwd_path) {
-            Some((d, p)) => (d, p),
-            None => return Ok(()),
-        }
-    };
-
-    let domain_dir = config.vault_path.join(&domain_name);
-
-    // Read history.jsonl for sync resolution
-    let history_path = domain_dir.join(&project).join("history.jsonl");
-    let content = if history_path.exists() {
-        std::fs::read_to_string(&history_path)?
-    } else {
-        String::new()
-    };
-
-    // If already synced from code today, don't nag
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let already_synced_today = content.lines()
-        .rev()
-        .filter(|line| !line.starts_with("{\"_schema\""))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .any(|entry| {
-            entry["source"].as_str() == Some("code")
-                && entry["date"].as_str().unwrap_or("").starts_with(&today)
-        });
-
-    if already_synced_today {
+    if !config.stop_hook {
         return Ok(());
     }
 
-    // Check for unresolved desktop intent (strong prompt)
-    let last_desktop = content.lines()
-        .rev()
-        .filter(|line| !line.starts_with("{\"_schema\""))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|entry| entry["source"].as_str() == Some("desktop"));
-
-    let reason = if let Some(intent) = last_desktop {
-        let desktop_date = intent["date"].as_str().unwrap_or("");
-        let already_resolved = content.lines()
-            .rev()
-            .filter(|line| !line.starts_with("{\"_schema\""))
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .any(|entry| {
-                entry["source"].as_str() == Some("code")
-                    && entry["date"].as_str().unwrap_or("") > desktop_date
-            });
-
-        if already_resolved {
-            return Ok(());
-        }
-
-        let focus = intent["focus"].as_str().unwrap_or("(no focus)");
-        let next_action = intent["next_action"].as_str().unwrap_or("");
-        let mut msg = format!(
-            "There's an unresolved Desktop intent for **{domain_name}/{project}**:\n\
-             - Focus: {focus}\n"
-        );
-        if !next_action.is_empty() {
-            msg.push_str(&format!("- Next action: {next_action}\n"));
-        }
-        msg.push_str(&format!(
-            "\nIf this session did relevant work against that intent, sync with \
-             `wardwell_write` action:sync, source:code for {domain_name}/{project}. \
-             If not, just say so and exit."
-        ));
-        msg
-    } else {
-        // No desktop intent — check if this is a tracked project
-        let state_path = domain_dir.join(&project).join("current_state.md");
-        if !state_path.exists() {
-            return Ok(());
-        }
-        format!(
-            "This session worked in tracked project **{domain_name}/{project}**.\n\n\
-             If you made meaningful progress, consider syncing with \
-             `wardwell_write` action:sync, source:code for {domain_name}/{project}.\n\
-             If not, just say so and exit."
-        )
-    };
+    let reason = "\
+If this session accomplished meaningful work (features, bug fixes, decisions, \
+or architectural changes), log it before closing:\n\n\
+1. Ask the user which domain/project this belongs to (or suggest one based on the cwd)\n\
+2. Write a 1-2 sentence summary using `wardwell_write` action:`append_history`, source:`code`\n\n\
+If the session was just a quick question or exploration, say so and exit.";
 
     // Exit code 2 = block stop, continue conversation with reason
     let response = serde_json::json!({
@@ -405,45 +319,6 @@ fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     std::process::exit(2);
 }
 
-/// Find which project directory under a domain matches the given cwd.
-fn find_project_for_cwd(domain_dir: &Path, cwd: &Path) -> Option<String> {
-    // Check if cwd basename matches a project dir
-    let cwd_name = cwd.file_name()?.to_str()?;
-    let candidate = domain_dir.join(cwd_name);
-    if candidate.is_dir() && candidate.join("current_state.md").exists() {
-        return Some(cwd_name.to_string());
-    }
-
-    // Check if any project's path patterns match cwd
-    // (look at current_state.md frontmatter for context matching)
-    for entry in std::fs::read_dir(domain_dir).ok()?.flatten() {
-        if entry.path().is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == cwd_name {
-                return Some(name);
-            }
-        }
-    }
-    None
-}
-
-/// Scan all domain folders in the vault for a project matching cwd basename.
-/// Returns (domain_name, project_name) if found.
-fn find_project_in_vault(vault_path: &Path, cwd: &Path) -> Option<(String, String)> {
-    let cwd_name = cwd.file_name()?.to_str()?;
-    for domain_entry in std::fs::read_dir(vault_path).ok()?.flatten() {
-        let domain_path = domain_entry.path();
-        if !domain_path.is_dir() {
-            continue;
-        }
-        let domain_name = domain_entry.file_name().to_string_lossy().to_string();
-        let candidate = domain_path.join(cwd_name);
-        if candidate.is_dir() && candidate.join("current_state.md").exists() {
-            return Some((domain_name, cwd_name.to_string()));
-        }
-    }
-    None
-}
 
 fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;

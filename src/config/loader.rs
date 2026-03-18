@@ -13,6 +13,8 @@ pub struct WardwellConfig {
     pub session_sources: Vec<PathBuf>,
     pub exclude: Vec<String>,
     pub ai: AiConfig,
+    /// Whether the stop hook prompts for session logging. Defaults to true.
+    pub stop_hook: bool,
 }
 
 /// AI configuration for session summarization.
@@ -54,6 +56,12 @@ struct RawConfig {
     agents_dir: Option<String>,
     #[serde(default)]
     ai: Option<RawAiConfig>,
+    #[serde(default = "default_true")]
+    stop_hook: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +146,7 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         session_sources,
         exclude,
         ai,
+        stop_hook: raw.stop_hook,
     })
 }
 

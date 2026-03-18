@@ -1984,6 +1984,7 @@ mod tests {
             session_sources: vec![],
             exclude: vec![],
             ai: Default::default(),
+            stop_hook: true,
         };
         WardwellServer::new(config, index, Arc::new(Mutex::new(None)))
     }
