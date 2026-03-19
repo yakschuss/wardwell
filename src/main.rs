@@ -76,37 +76,55 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let index = Arc::new(index);
 
-    // Initialize embedder for hybrid semantic search
-    let models_dir = config_dir.join("models");
-    let embedder: Arc<std::sync::Mutex<Option<wardwell::index::embed::Embedder>>> = match wardwell::index::embed::Embedder::new(&models_dir) {
-        Ok(e) => {
-            eprintln!("wardwell: embedding model loaded");
-            Arc::new(std::sync::Mutex::new(Some(e)))
-        }
-        Err(e) => {
-            eprintln!("wardwell: embedding model unavailable (semantic search disabled): {e}");
-            Arc::new(std::sync::Mutex::new(None))
-        }
-    };
+    // Embedder starts as None — loaded in background so MCP server starts immediately
+    let embedder: Arc<std::sync::Mutex<Option<wardwell::index::embed::Embedder>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
-    // Index + embed in background so the MCP server starts immediately
+    // Index + load embedder in background
     let bg_index = Arc::clone(&index);
     let bg_roots = all_index_roots.clone();
     let bg_exclude = config.exclude.clone();
     let bg_embedder = Arc::clone(&embedder);
+    let models_dir = config_dir.join("models");
     tokio::spawn(async move {
+        // 1. Index with FTS only (fast, no embedder needed)
         for root in &bg_roots {
-            let mut emb_guard = bg_embedder.lock().unwrap_or_else(|e| e.into_inner());
-            let result = IndexBuilder::build_filtered(&bg_index, root, &bg_exclude, emb_guard.as_mut());
-            drop(emb_guard);
-            match result {
+            match IndexBuilder::build_filtered(&bg_index, root, &bg_exclude, None) {
                 Ok(stats) => {
                     if stats.indexed > 0 || stats.removed > 0 {
-                        eprintln!("wardwell: indexed {} files from {} ({} skipped, {} removed, {} chunks embedded, {} errors)",
-                            stats.indexed, root.display(), stats.skipped, stats.removed, stats.chunks_embedded, stats.errors);
+                        eprintln!("wardwell: indexed {} files from {} ({} skipped, {} removed, {} errors)",
+                            stats.indexed, root.display(), stats.skipped, stats.removed, stats.errors);
                     }
                 }
                 Err(e) => eprintln!("wardwell: index error for {}: {e}", root.display()),
+            }
+        }
+
+        // 2. Load embedder (may download model ~33MB on first run)
+        match wardwell::index::embed::Embedder::new(&models_dir) {
+            Ok(e) => {
+                eprintln!("wardwell: embedding model loaded");
+                let mut guard = bg_embedder.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(e);
+                drop(guard);
+
+                // 3. Re-index with embeddings for any files that need chunk vectors
+                for root in &bg_roots {
+                    let mut emb_guard = bg_embedder.lock().unwrap_or_else(|e| e.into_inner());
+                    let result = IndexBuilder::build_filtered(&bg_index, root, &bg_exclude, emb_guard.as_mut());
+                    drop(emb_guard);
+                    match result {
+                        Ok(stats) => {
+                            if stats.chunks_embedded > 0 {
+                                eprintln!("wardwell: embedded {} chunks from {}", stats.chunks_embedded, root.display());
+                            }
+                        }
+                        Err(e) => eprintln!("wardwell: embedding index error for {}: {e}", root.display()),
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("wardwell: embedding model unavailable (semantic search disabled): {e}");
             }
         }
     });
