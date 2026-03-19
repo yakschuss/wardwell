@@ -50,7 +50,7 @@ pub struct SearchParams {
     pub session_id: Option<String>,
     #[schemars(description = "Include archived projects in retrospective/patterns. Default false.")]
     pub include_archived: Option<bool>,
-    #[schemars(description = "Search mode: 'keyword' (FTS5 only, default) or 'semantic' (hybrid BM25 + vector + RRF). Semantic returns chunk-level results with full text.")]
+    #[schemars(description = "Search mode: 'keyword' (FTS5 only, default) or 'semantic' (hybrid BM25 + vector + RRF). Use 'semantic' for broad/conceptual queries. Use default 'keyword' for exact terms or file names.")]
     pub mode: Option<String>,
 }
 
@@ -1627,7 +1627,8 @@ impl ServerHandler for WardwellServer {
     fn get_info(&self) -> ServerInfo {
         let instructions =
             "Wardwell: Personal AI knowledge vault. Three tools: \
-             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; search supports mode:'semantic' for hybrid vector+keyword chunk-level results), \
+             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
+             search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append), \
              wardwell_clipboard (copy to clipboard, ask first)."
                 .to_string();
