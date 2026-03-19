@@ -118,7 +118,7 @@ impl IndexStore {
             )?;
         }
 
-        // sqlite-vec virtual table for embeddings
+        // sqlite-vec virtual table for embeddings (optional — server works without it)
         let vec_exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='chunk_vec'",
@@ -128,13 +128,15 @@ impl IndexStore {
             .map(|c| c > 0)
             .unwrap_or(false);
 
-        if !vec_exists {
-            conn.execute_batch(
+        if !vec_exists
+            && let Err(e) = conn.execute_batch(
                 "CREATE VIRTUAL TABLE chunk_vec USING vec0(
                     chunk_id TEXT PRIMARY KEY,
                     embedding FLOAT[384]
                 );"
-            )?;
+            )
+        {
+            eprintln!("wardwell: sqlite-vec unavailable (semantic search disabled): {e}");
         }
 
         Ok(Self { conn: Mutex::new(conn) })

@@ -62,11 +62,14 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::index::store::IndexStore;
     use wardwell::mcp::server::WardwellServer;
 
+    eprintln!("wardwell: loading config");
     let config = loader::load(None)?;
 
     let config_dir = loader::config_dir();
     let index_path = config_dir.join("index.db");
+    eprintln!("wardwell: opening index");
     let index = IndexStore::open(&index_path)?;
+    eprintln!("wardwell: index ready");
 
     // Index vault path on startup
     let mut all_index_roots: Vec<std::path::PathBuf> = Vec::new();
@@ -129,6 +132,7 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    eprintln!("wardwell: starting MCP server");
     let server = WardwellServer::new(config, Arc::clone(&index), embedder);
     let shared_registry = server.registry.clone();
 
