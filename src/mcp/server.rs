@@ -289,7 +289,22 @@ impl WardwellServer {
                 }
                 serde_json::to_string_pretty(&results).unwrap_or_default()
             }
-            Err(e) => json_error(&format!("Semantic search failed: {e}")),
+            Err(e) => {
+                eprintln!("wardwell: semantic search failed, falling back to keyword: {e}");
+                // Fall back to keyword search instead of returning an error
+                drop(emb_guard);
+                let fallback_query = SearchQuery {
+                    query: query.to_string(),
+                    domains: p.domain.as_ref().map(|d| vec![d.clone()]),
+                    types: Vec::new(),
+                    status: None,
+                    limit,
+                };
+                match self.index.search(&fallback_query) {
+                    Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
+                    Err(e2) => json_error(&format!("Search failed: {e2}")),
+                }
+            }
         }
     }
 
