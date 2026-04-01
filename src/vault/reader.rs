@@ -13,9 +13,16 @@ pub fn read_file(path: &Path) -> Result<VaultFile, VaultError> {
 
     // JSONL files → synthetic history frontmatter
     if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-        let summary = path.file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| format!("{s} history"));
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("history");
+        let summary = if stem == "history" {
+            // Infer from parent directory name (the project)
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|p| format!("{p} history"))
+        } else {
+            Some(format!("{stem} history"))
+        };
         return Ok(VaultFile {
             path: path.to_path_buf(),
             frontmatter: crate::vault::types::Frontmatter {
