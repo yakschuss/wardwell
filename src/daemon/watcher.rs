@@ -22,7 +22,7 @@ pub async fn watch_vault(
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                         for path in event.paths {
-                            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                            if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| ext == "md" || ext == "jsonl") {
                                 let _ = rt_tx.blocking_send(path);
                             }
                         }
@@ -66,10 +66,26 @@ pub async fn watch_vault(
             // File created or modified — upsert
             match crate::vault::reader::read_file(&path) {
                 Ok(vf) => {
-                    match index.upsert(&vf, &vault_root) {
-                        Ok(true) => eprintln!("wardwell: indexed {}", path.display()),
-                        Ok(false) => {} // unchanged
-                        Err(e) => eprintln!("wardwell: index error for {}: {e}", path.display()),
+                    let is_jsonl = path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+                    if is_jsonl {
+                        // Use incremental indexing for JSONL (append-only)
+                        let rel_path = path.strip_prefix(&vault_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .to_string();
+                        match crate::index::builder::index_jsonl_incremental_public(
+                            &index, &vf, &rel_path, &vault_root,
+                        ) {
+                            Ok(n) if n > 0 => eprintln!("wardwell: indexed {n} new history entries from {}", path.display()),
+                            Ok(_) => {} // no new entries
+                            Err(e) => eprintln!("wardwell: index error for {}: {e}", path.display()),
+                        }
+                    } else {
+                        match index.upsert(&vf, &vault_root) {
+                            Ok(true) => eprintln!("wardwell: indexed {}", path.display()),
+                            Ok(false) => {} // unchanged
+                            Err(e) => eprintln!("wardwell: index error for {}: {e}", path.display()),
+                        }
                     }
                 }
                 Err(e) => eprintln!("wardwell: parse error for {}: {e}", path.display()),
@@ -83,6 +99,10 @@ pub async fn watch_vault(
                 .to_string();
             if let Err(e) = index.remove(&relative) {
                 eprintln!("wardwell: remove error for {relative}: {e}");
+            }
+            // Clean up watermark if it was a JSONL file
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                let _ = index.remove_watermark(&relative);
             }
         }
     }

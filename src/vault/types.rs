@@ -12,6 +12,7 @@ pub enum VaultType {
     Insight,
     Thread,
     Domain,
+    History,
     #[default]
     Reference,
 }
@@ -28,6 +29,7 @@ impl<'de> Deserialize<'de> for VaultType {
             "insight" => VaultType::Insight,
             "thread" => VaultType::Thread,
             "domain" => VaultType::Domain,
+            "history" => VaultType::History,
             "reference" => VaultType::Reference,
             _ => VaultType::Reference, // unknown types → Reference
         })
@@ -42,6 +44,7 @@ impl std::fmt::Display for VaultType {
             Self::Insight => write!(f, "insight"),
             Self::Thread => write!(f, "thread"),
             Self::Domain => write!(f, "domain"),
+            Self::History => write!(f, "history"),
             Self::Reference => write!(f, "reference"),
         }
     }

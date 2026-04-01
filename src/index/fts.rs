@@ -175,6 +175,7 @@ pub fn parse_vault_type(s: &str) -> VaultType {
         "insight" => VaultType::Insight,
         "thread" => VaultType::Thread,
         "domain" => VaultType::Domain,
+        "history" => VaultType::History,
         "reference" => VaultType::Reference,
         _ => VaultType::Reference, // fallback
     }

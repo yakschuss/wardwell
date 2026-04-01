@@ -4,11 +4,28 @@ use std::path::{Path, PathBuf};
 
 /// Read a single vault file, parsing its frontmatter and body.
 /// Files without frontmatter are indexed with default metadata (type: reference).
+/// JSONL files get synthetic frontmatter with type: history.
 pub fn read_file(path: &Path) -> Result<VaultFile, VaultError> {
     let content = std::fs::read_to_string(path).map_err(|e| VaultError::Io {
         path: path.display().to_string(),
         source: e,
     })?;
+
+    // JSONL files → synthetic history frontmatter
+    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        let summary = path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| format!("{s} history"));
+        return Ok(VaultFile {
+            path: path.to_path_buf(),
+            frontmatter: crate::vault::types::Frontmatter {
+                file_type: crate::vault::types::VaultType::History,
+                summary,
+                ..Default::default()
+            },
+            body: content,
+        });
+    }
 
     match parse_frontmatter(&content) {
         Ok((frontmatter, body)) => Ok(VaultFile {
@@ -82,7 +99,7 @@ fn walk_recursive(dir: &Path, exclude: &[String], results: &mut Vec<Result<Vault
         }
         if path.is_dir() {
             walk_recursive(&path, exclude, results);
-        } else if path.extension().is_some_and(|ext| ext == "md") {
+        } else if path.extension().is_some_and(|ext| ext == "md" || ext == "jsonl") {
             results.push(read_file(&path));
         }
     }

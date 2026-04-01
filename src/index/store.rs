@@ -118,6 +118,15 @@ impl IndexStore {
             )?;
         }
 
+        // Watermark table for incremental JSONL indexing (append-only files)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS jsonl_watermark (
+                path TEXT PRIMARY KEY,
+                line_count INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL
+            );"
+        )?;
+
         // sqlite-vec virtual table for embeddings (optional — server works without it)
         let vec_exists: bool = conn
             .query_row(
@@ -185,6 +194,12 @@ impl IndexStore {
             CREATE VIRTUAL TABLE chunk_vec USING vec0(
                 chunk_id TEXT PRIMARY KEY,
                 embedding FLOAT[384]
+            );
+
+            CREATE TABLE jsonl_watermark (
+                path TEXT PRIMARY KEY,
+                line_count INTEGER NOT NULL,
+                indexed_at TEXT NOT NULL
             );"
         )?;
 
@@ -573,8 +588,44 @@ impl IndexStore {
             conn.execute("DELETE FROM vault_chunks WHERE path = ?1", rusqlite::params![path])?;
             conn.execute("DELETE FROM vault_search WHERE path = ?1", rusqlite::params![path])?;
             conn.execute("DELETE FROM vault_meta WHERE path = ?1", rusqlite::params![path])?;
+            // Clean up watermark for JSONL files
+            conn.execute("DELETE FROM jsonl_watermark WHERE path = ?1", rusqlite::params![path])?;
         }
         Ok(stale.len())
+    }
+
+    /// Get the watermark (last indexed line count) for a JSONL file.
+    /// Returns 0 if no watermark exists.
+    pub fn get_watermark(&self, path: &str) -> Result<usize, IndexError> {
+        let conn = self.lock()?;
+        let count: Option<i64> = conn.query_row(
+            "SELECT line_count FROM jsonl_watermark WHERE path = ?1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        ).ok();
+        Ok(count.unwrap_or(0) as usize)
+    }
+
+    /// Set the watermark (last indexed line count) for a JSONL file.
+    pub fn set_watermark(&self, path: &str, line_count: usize) -> Result<(), IndexError> {
+        let conn = self.lock()?;
+        let indexed_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO jsonl_watermark (path, line_count, indexed_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![path, line_count as i64, indexed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Remove watermark for a JSONL file (used when the file is deleted).
+    pub fn remove_watermark(&self, path: &str) -> Result<(), IndexError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM jsonl_watermark WHERE path = ?1",
+            rusqlite::params![path],
+        )?;
+        Ok(())
     }
 }
 
