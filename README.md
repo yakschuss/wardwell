@@ -154,13 +154,14 @@ The hook runs `wardwell inject "$(pwd)"` and outputs the content of `current_sta
 ## CLI Commands
 
 ```
-wardwell serve       Start the MCP server (Claude Code calls this automatically)
-wardwell init        First-run setup — interactive walkthrough
-wardwell doctor      Check that everything is wired correctly
-wardwell uninstall   Clean removal — MCP entries, hooks, markers (preserves vault)
-wardwell inject .    Output project context for a directory (used by hooks)
-wardwell reindex     Rebuild the vault search index from scratch
-wardwell seed <path> Create domain or project folders
+wardwell serve                Start the MCP server (full access)
+wardwell serve --domain work  Start scoped to a specific domain
+wardwell init                 First-run setup — interactive walkthrough
+wardwell doctor               Check that everything is wired correctly
+wardwell uninstall            Clean removal — MCP entries, hooks, markers (preserves vault)
+wardwell inject .             Output project context for a directory (used by hooks)
+wardwell reindex              Rebuild the vault search index from scratch
+wardwell seed <path>          Create domain or project folders
 ```
 
 ### wardwell init
@@ -231,6 +232,60 @@ exclude:
 | `domains` | Optional domain config with path patterns and aliases (migration path) |
 | `ai.summarize_model` | Claude model for session summarization (default: `haiku`) |
 
+## Domain Scoping
+
+Wardwell supports domain-level access control. When started with `--domain`, the server is scoped to that domain and its `can_read` peers — all other domains are invisible.
+
+```bash
+# Scoped to work domain only
+wardwell serve --domain work
+
+# Or via environment variable
+WARDWELL_DOMAIN=work wardwell serve
+```
+
+In scoped mode:
+- **Search** returns only results from allowed domains
+- **Read** rejects paths outside allowed domains
+- **Write** rejects writes to other domains
+- **Orchestrate/history/retrospective/patterns** only see allowed domains
+- Client-provided domain parameters cannot override the scope
+
+Without `--domain`, the server runs in domainless mode with full access (backwards compatible).
+
+### MCP config for multi-domain isolation
+
+```json
+{
+  "mcpServers": {
+    "wardwell-work": {
+      "command": "wardwell",
+      "args": ["serve", "--domain", "work"]
+    },
+    "wardwell-personal": {
+      "command": "wardwell",
+      "args": ["serve", "--domain", "personal"]
+    }
+  }
+}
+```
+
+### Cross-domain read access
+
+Domains can grant read access to other domains via `can_read` in the domain vault file:
+
+```yaml
+---
+type: domain
+domain: work
+confidence: confirmed
+can_read:
+  - shared
+---
+```
+
+This allows the `work` session to search and read from `shared`, but not write to it.
+
 ## Background Services
 
 When running as an MCP server (`wardwell serve`), Wardwell runs background tasks:
@@ -264,7 +319,7 @@ Single Rust binary, no runtime dependencies beyond `claude` CLI (optional, for s
 # Lint (must pass clean — warnings are errors)
 cargo clippy --lib --bin wardwell
 
-# Test (187 tests)
+# Test (193 tests)
 cargo test
 
 # Build release
@@ -283,4 +338,4 @@ Intel Macs are not supported — the ONNX Runtime dependency (used for semantic 
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Business Source License 1.1 — see [LICENSE](LICENSE). Non-commercial use permitted. Converts to Apache 2.0 on April 6, 2030.
