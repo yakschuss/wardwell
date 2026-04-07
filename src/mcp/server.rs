@@ -179,6 +179,11 @@ impl WardwellServer {
     async fn wardwell_write(&self, params: Parameters<WriteParams>) -> String {
         let p = params.0;
 
+        // ACL: check domain access before any write
+        if let Err(e) = self.check_domain_access(&p.domain, "write") {
+            return json_error(&e);
+        }
+
         // Resolve project: explicit > inferred from last access
         let project = match p.project.clone() {
             Some(proj) => proj,
@@ -224,6 +229,42 @@ impl WardwellServer {
     }
 }
 
+// -- ACL enforcement --
+
+impl WardwellServer {
+    /// Check if a domain is within this session's allowed scope.
+    /// Returns Ok(()) if allowed, Err(error_string) if denied.
+    fn check_domain_access(&self, domain: &str, action: &str) -> Result<(), String> {
+        if self.allowed_domains.is_empty() {
+            return Ok(()); // domainless mode — full access
+        }
+        if self.allowed_domains.iter().any(|d| d == domain) {
+            Ok(())
+        } else {
+            eprintln!("[WARDWELL ACL] DENIED: session_domain={:?} attempted={} action={}",
+                self.session_domain, domain, action);
+            Err(format!("Access denied: domain '{}' is outside allowed domains {:?}", domain, self.allowed_domains))
+        }
+    }
+
+    /// Filter domains for vault-walking actions. Returns the list of domain dirs to scan.
+    fn scoped_domain_dirs(&self, vault_dir: &std::path::Path, client_domain: Option<&str>) -> Vec<PathBuf> {
+        if !self.allowed_domains.is_empty() {
+            // Scoped mode: only scan allowed domains, ignore client filter
+            self.allowed_domains.iter()
+                .map(|d| vault_dir.join(d))
+                .filter(|p| p.is_dir())
+                .collect()
+        } else {
+            // Domainless mode: honor client filter
+            match client_domain {
+                Some(d) => vec![vault_dir.join(d)],
+                None => list_subdirs(vault_dir),
+            }
+        }
+    }
+}
+
 // -- Session tracking --
 
 impl WardwellServer {
@@ -263,9 +304,17 @@ impl WardwellServer {
             return self.action_search_semantic(&query_str, p);
         }
 
+        let search_domains = if self.allowed_domains.is_empty() {
+            // Domainless mode: honor client filter
+            p.domain.as_ref().map(|d| vec![d.clone()])
+        } else {
+            // Scoped mode: enforce server-side, ignore client domain param
+            Some(self.allowed_domains.clone())
+        };
+
         let query = SearchQuery {
             query: query_str,
-            domains: p.domain.as_ref().map(|d| vec![d.clone()]),
+            domains: search_domains,
             types: Vec::new(),
             status: None,
             limit: p.limit.unwrap_or(5),
@@ -300,7 +349,11 @@ impl WardwellServer {
         };
 
         let limit = p.limit.unwrap_or(5);
-        let domains: Option<Vec<String>> = p.domain.as_ref().map(|d| vec![d.clone()]);
+        let domains: Option<Vec<String>> = if self.allowed_domains.is_empty() {
+            p.domain.as_ref().map(|d| vec![d.clone()])
+        } else {
+            Some(self.allowed_domains.clone())
+        };
 
         match crate::index::hybrid::hybrid_search(
             &self.index,
@@ -322,9 +375,14 @@ impl WardwellServer {
                 eprintln!("wardwell: semantic search failed, falling back to keyword: {e}");
                 // Fall back to keyword search instead of returning an error
                 drop(emb_guard);
+                let fallback_domains = if self.allowed_domains.is_empty() {
+                    p.domain.as_ref().map(|d| vec![d.clone()])
+                } else {
+                    Some(self.allowed_domains.clone())
+                };
                 let fallback_query = SearchQuery {
                     query: query.to_string(),
-                    domains: p.domain.as_ref().map(|d| vec![d.clone()]),
+                    domains: fallback_domains,
                     types: Vec::new(),
                     status: None,
                     limit,
@@ -342,6 +400,16 @@ impl WardwellServer {
             Some(path) => path.clone(),
             None => return json_error("'path' is required for action 'read'."),
         };
+
+        // ACL: check domain access before reading
+        if !self.allowed_domains.is_empty() {
+            let clean = path.strip_prefix('/').unwrap_or(&path);
+            if let Some(file_domain) = clean.split('/').next() {
+                if let Err(e) = self.check_domain_access(file_domain, "read") {
+                    return json_error(&e);
+                }
+            }
+        }
 
         let full_path = resolve_path(&self.vault_root, &path);
         let vf = match full_path.and_then(|fp| crate::vault::reader::read_file(&fp).ok()) {
@@ -385,16 +453,31 @@ impl WardwellServer {
             return json_error(&format!("No {}/ directory found in vault.", self.vault_root.display()));
         }
 
+        // ACL: validate client domain param if scoped
+        if let Some(ref d) = p.domain {
+            if let Err(e) = self.check_domain_access(d, "history") {
+                return json_error(&e);
+            }
+        }
+
         let since_date = p.since.as_deref()
             .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
 
         let mut all_entries = Vec::new();
 
         // Walk vault looking for *.history.md or history.md files
-        let dirs_to_scan = match (&p.domain, &p.project) {
-            (Some(d), Some(proj)) => vec![vault_dir.join(d).join(proj)],
-            (Some(d), None) => vec![vault_dir.join(d)],
-            _ => list_subdirs(&vault_dir),
+        let dirs_to_scan = if !self.allowed_domains.is_empty() {
+            match (&p.domain, &p.project) {
+                (Some(d), Some(proj)) => vec![vault_dir.join(d).join(proj)],
+                (Some(d), None) => vec![vault_dir.join(d)],
+                _ => self.scoped_domain_dirs(&vault_dir, None),
+            }
+        } else {
+            match (&p.domain, &p.project) {
+                (Some(d), Some(proj)) => vec![vault_dir.join(d).join(proj)],
+                (Some(d), None) => vec![vault_dir.join(d)],
+                _ => list_subdirs(&vault_dir),
+            }
         };
 
         for dir in &dirs_to_scan {
@@ -438,10 +521,14 @@ impl WardwellServer {
             return json_error(&format!("No {}/ directory found in vault.", self.vault_root.display()));
         }
 
-        let dirs_to_scan = match &p.domain {
-            Some(d) => vec![vault_dir.join(d)],
-            None => list_subdirs(&vault_dir),
-        };
+        // ACL: validate client domain param if scoped
+        if let Some(ref d) = p.domain {
+            if let Err(e) = self.check_domain_access(d, "orchestrate") {
+                return json_error(&e);
+            }
+        }
+
+        let dirs_to_scan = self.scoped_domain_dirs(&vault_dir, p.domain.as_deref());
 
         let mut active = Vec::new();
         let mut blocked = Vec::new();
@@ -542,16 +629,26 @@ struct ParsedHistoryEntry {
 }
 
 /// Walk the vault and collect all history.jsonl entries, filtered by date and domain.
+/// `allowed_domains` overrides `domain_filter` when non-empty (ACL enforcement).
 fn collect_history_entries(
     vault_root: &std::path::Path,
     since: Option<chrono::NaiveDate>,
     domain_filter: Option<&str>,
     skip_archive: bool,
+    allowed_domains: &[String],
 ) -> Vec<ParsedHistoryEntry> {
     let mut entries = Vec::new();
-    let dirs_to_scan = match domain_filter {
-        Some(d) => vec![vault_root.join(d)],
-        None => list_subdirs(vault_root),
+    let dirs_to_scan = if !allowed_domains.is_empty() {
+        // Scoped mode: only scan allowed domains
+        allowed_domains.iter()
+            .map(|d| vault_root.join(d))
+            .filter(|p| p.is_dir())
+            .collect()
+    } else {
+        match domain_filter {
+            Some(d) => vec![vault_root.join(d)],
+            None => list_subdirs(vault_root),
+        }
     };
 
     for domain_dir in &dirs_to_scan {
@@ -625,12 +722,20 @@ impl WardwellServer {
             Err(_) => return json_error(&format!("Invalid date format: '{since_str}'. Use YYYY-MM-DD.")),
         };
 
+        // ACL: validate client domain param if scoped
+        if let Some(ref d) = p.domain {
+            if let Err(e) = self.check_domain_access(d, "retrospective") {
+                return json_error(&e);
+            }
+        }
+
         let skip_archive = !p.include_archived.unwrap_or(false);
         let entries = collect_history_entries(
             &self.vault_root,
             Some(since),
             p.domain.as_deref(),
             skip_archive,
+            &self.allowed_domains,
         );
 
         // Group by domain/project
@@ -694,12 +799,20 @@ impl WardwellServer {
             .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
             .unwrap_or_else(|| chrono::Local::now().date_naive() - chrono::Duration::days(90));
 
+        // ACL: validate client domain param if scoped
+        if let Some(ref d) = p.domain {
+            if let Err(e) = self.check_domain_access(d, "patterns") {
+                return json_error(&e);
+            }
+        }
+
         let skip_archive = !p.include_archived.unwrap_or(false);
         let entries = collect_history_entries(
             &self.vault_root,
             Some(since),
             p.domain.as_deref(),
             skip_archive,
+            &self.allowed_domains,
         );
 
         // -- Recurring blockers --
@@ -2042,7 +2155,7 @@ mod tests {
             ai: Default::default(),
             stop_hook: true,
         };
-        WardwellServer::new(config, index, Arc::new(Mutex::new(None)))
+        WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None)
     }
 
     #[test]
@@ -2378,7 +2491,7 @@ mod tests {
         ]);
 
         let since = chrono::NaiveDate::parse_from_str("2026-02-01", "%Y-%m-%d").unwrap();
-        let entries = collect_history_entries(&tmp, Some(since), None, true);
+        let entries = collect_history_entries(&tmp, Some(since), None, true, &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "Recent entry");
         assert_eq!(entries[0].domain, "work");
@@ -2396,10 +2509,10 @@ mod tests {
             ("work", "archive", &content),
         ]);
 
-        let entries = collect_history_entries(&tmp, None, None, true);
+        let entries = collect_history_entries(&tmp, None, None, true, &[]);
         assert!(entries.is_empty());
 
-        let entries_with_archive = collect_history_entries(&tmp, None, None, false);
+        let entries_with_archive = collect_history_entries(&tmp, None, None, false, &[]);
         assert_eq!(entries_with_archive.len(), 1);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -2414,7 +2527,7 @@ mod tests {
             ("personal", "proj-b", &personal_content),
         ]);
 
-        let entries = collect_history_entries(&tmp, None, Some("work"), true);
+        let entries = collect_history_entries(&tmp, None, Some("work"), true, &[]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "Work");
 
@@ -2431,7 +2544,7 @@ mod tests {
             ("work", "proj-a", &content),
         ]);
 
-        let entries = collect_history_entries(&tmp, Some(chrono::NaiveDate::parse_from_str("2026-02-01", "%Y-%m-%d").unwrap()), None, true);
+        let entries = collect_history_entries(&tmp, Some(chrono::NaiveDate::parse_from_str("2026-02-01", "%Y-%m-%d").unwrap()), None, true, &[]);
         let mut groups: std::collections::HashMap<String, Vec<&ParsedHistoryEntry>> = std::collections::HashMap::new();
         for e in &entries {
             groups.entry(format!("{}/{}", e.domain, e.project)).or_default().push(e);
@@ -2451,7 +2564,7 @@ mod tests {
             ("work", "done-proj", &done_content),
         ]);
 
-        let entries = collect_history_entries(&tmp, None, None, true);
+        let entries = collect_history_entries(&tmp, None, None, true, &[]);
         let mut completed = Vec::new();
         let mut still_active = Vec::new();
         let mut groups: std::collections::HashMap<String, Vec<&ParsedHistoryEntry>> = std::collections::HashMap::new();
@@ -2484,7 +2597,7 @@ mod tests {
             ("work", "fresh-proj", &recent_content),
         ]);
 
-        let entries = collect_history_entries(&tmp, None, None, true);
+        let entries = collect_history_entries(&tmp, None, None, true, &[]);
         let today_date = chrono::Local::now().date_naive();
         let mut latest: std::collections::HashMap<String, (&str, &str)> = std::collections::HashMap::new();
         for e in &entries {
@@ -2524,7 +2637,7 @@ mod tests {
             ("work", "proj-b", &content_b),
         ]);
 
-        let entries = collect_history_entries(&tmp, None, None, true);
+        let entries = collect_history_entries(&tmp, None, None, true, &[]);
         let stopwords: &[&str] = &["the", "a", "an", "is", "for", "and"];
         let mut word_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for e in &entries {
