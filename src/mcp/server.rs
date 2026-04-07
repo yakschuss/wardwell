@@ -133,7 +133,11 @@ impl WardwellServer {
                         (Some(d.clone()), allowed)
                     }
                     None => {
-                        eprintln!("[WARDWELL] FATAL: domain '{}' not found in registry. Available: {:?}", d, raw_registry.names());
+                        let names = raw_registry.names();
+                        eprintln!("[WARDWELL] FATAL: domain '{}' not found in registry. Available: {:?}", d, names);
+                        if names.is_empty() {
+                            eprintln!("[WARDWELL] HINT: registry is empty — check vault_path in ~/.wardwell/config.yml and ensure domains/ directory exists with confirmed .md files");
+                        }
                         std::process::exit(1);
                     }
                 }

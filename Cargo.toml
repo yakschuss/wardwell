@@ -1,6 +1,6 @@
 [package]
 name = "wardwell"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Persistent project memory for Claude Code — MCP server + CLI"
 license = "BSL-1.1"
@@ -33,7 +33,7 @@ tempfile = "3"
 [profile.release]
 overflow-checks = true
 lto = true
-strip = true
+strip = "debuginfo"
 
 [lints.clippy]
 unwrap_used = "deny"

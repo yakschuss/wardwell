@@ -210,8 +210,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config_path.exists() {
-        println!("  \u{2713} Existing config found. Updating vault_path.");
-        update_config_vault_path(&config_path, &vault_path)?;
+        // Only update vault_path if it actually changed
+        let existing_vault = crate::config::loader::load(Some(&config_path))
+            .ok()
+            .map(|c| c.vault_path);
+        if existing_vault.as_ref() == Some(&vault_path) {
+            println!("  \u{2713} Existing config (vault_path unchanged)");
+        } else {
+            println!("  \u{2713} Existing config found. Updating vault_path.");
+            update_config_vault_path(&config_path, &vault_path)?;
+        }
     } else {
         write_minimal_config(&config_path, &vault_path)?;
         println!("  \u{2713} Config written: {}", config_path.display());

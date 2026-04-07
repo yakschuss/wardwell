@@ -112,19 +112,18 @@ pub fn check_mcp_entry(config_path: &Path) -> McpEntryStatus {
         Err(_) => return McpEntryStatus::ConfigMissing,
     };
 
-    let entry = config
-        .get("mcpServers")
-        .and_then(|s| s.get("wardwell"));
-
-    match entry {
+    // Accept any MCP key whose command resolves to wardwell (e.g. wardwell, wardwell-work, wardwell-personal)
+    let servers = config.get("mcpServers").and_then(|s| s.as_object());
+    match servers {
         None => McpEntryStatus::NotConfigured,
-        Some(entry) => {
-            let command = entry
-                .get("command")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            McpEntryStatus::Configured { binary_path: command }
+        Some(map) => {
+            for (_key, entry) in map {
+                if let Some(cmd) = entry.get("command").and_then(|c| c.as_str())
+                    && cmd.contains("wardwell") {
+                    return McpEntryStatus::Configured { binary_path: cmd.to_string() };
+                }
+            }
+            McpEntryStatus::NotConfigured
         }
     }
 }
