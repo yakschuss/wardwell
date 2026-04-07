@@ -120,13 +120,12 @@ pub struct ClipboardParams {
 impl WardwellServer {
     pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>, domain: Option<String>) -> Self {
         let vault_root = config.vault_path.clone();
-        let registry = Arc::new(RwLock::new(DomainRegistry::from_domains(config.registry.all().to_vec())));
+        let raw_registry = DomainRegistry::from_domains(config.registry.all().to_vec());
 
-        // Build domain scope
+        // Build domain scope before wrapping registry in Arc<RwLock>
         let (session_domain, allowed_domains) = match domain {
             Some(ref d) => {
-                let reg = registry.blocking_read();
-                match reg.find(d) {
+                match raw_registry.find(d) {
                     Some(found) => {
                         let mut allowed = vec![d.clone()];
                         allowed.extend(found.can_read.clone());
@@ -134,7 +133,7 @@ impl WardwellServer {
                         (Some(d.clone()), allowed)
                     }
                     None => {
-                        eprintln!("[WARDWELL] FATAL: domain '{}' not found in registry. Available: {:?}", d, reg.names());
+                        eprintln!("[WARDWELL] FATAL: domain '{}' not found in registry. Available: {:?}", d, raw_registry.names());
                         std::process::exit(1);
                     }
                 }
@@ -144,6 +143,8 @@ impl WardwellServer {
                 (None, vec![])
             }
         };
+
+        let registry = Arc::new(RwLock::new(raw_registry));
 
         Self {
             tool_router: Self::tool_router(),
