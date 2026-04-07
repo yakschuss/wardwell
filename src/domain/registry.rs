@@ -11,39 +11,75 @@ pub struct DomainRegistry {
 impl DomainRegistry {
     /// Build a registry by reading domain vault files from `vault_path/domains/`.
     /// Only loads files with `type: domain`, `confidence: confirmed`.
+    /// Falls back to auto-discovering domains from top-level vault subdirectories.
     pub fn from_vault(vault_path: &Path) -> Self {
+        // Try explicit domain files first
         let domains_dir = vault_path.join("domains");
-        if !domains_dir.exists() {
-            return Self { domains: Vec::new() };
+        if domains_dir.exists() {
+            let entries = match std::fs::read_dir(&domains_dir) {
+                Ok(e) => e,
+                Err(_) => return Self::auto_discover(vault_path),
+            };
+
+            let mut domains = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+
+                let vf = match crate::vault::reader::read_file(&path) {
+                    Ok(vf) => vf,
+                    Err(_) => continue,
+                };
+
+                if vf.frontmatter.file_type != VaultType::Domain {
+                    continue;
+                }
+
+                if vf.frontmatter.confidence != Some(Confidence::Confirmed) {
+                    continue;
+                }
+
+                if let Ok(domain) = Domain::from_vault_file(&vf) {
+                    domains.push(domain);
+                }
+            }
+
+            if !domains.is_empty() {
+                return Self { domains };
+            }
         }
 
-        let entries = match std::fs::read_dir(&domains_dir) {
+        // Fallback: auto-discover from top-level vault subdirectories
+        Self::auto_discover(vault_path)
+    }
+
+    /// Auto-discover domains from top-level vault subdirectories.
+    /// Creates minimal Domain entries with just a name (no paths/aliases/can_read).
+    fn auto_discover(vault_path: &Path) -> Self {
+        let entries = match std::fs::read_dir(vault_path) {
             Ok(e) => e,
             Err(_) => return Self { domains: Vec::new() },
         };
 
+        let skip = ["domains", ".obsidian", ".trash", "archive", "templates"];
         let mut domains = Vec::new();
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            if !entry.path().is_dir() {
                 continue;
             }
-
-            let vf = match crate::vault::reader::read_file(&path) {
-                Ok(vf) => vf,
-                Err(_) => continue,
-            };
-
-            if vf.frontmatter.file_type != VaultType::Domain {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || skip.contains(&name.as_str()) {
                 continue;
             }
-
-            if vf.frontmatter.confidence != Some(Confidence::Confirmed) {
-                continue;
-            }
-
-            if let Ok(domain) = Domain::from_vault_file(&vf) {
-                domains.push(domain);
+            if let Ok(domain_name) = crate::config::types::DomainName::new(&name) {
+                domains.push(Domain {
+                    name: domain_name,
+                    paths: Vec::new(),
+                    aliases: std::collections::HashMap::new(),
+                    can_read: Vec::new(),
+                });
             }
         }
 
