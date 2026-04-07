@@ -26,6 +26,10 @@ pub struct WardwellServer {
     last_project: Arc<Mutex<Option<(String, String)>>>,
     /// Embedder for hybrid semantic search. None if model not available.
     pub embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>,
+    /// Which domain this session belongs to (None = domainless/full access).
+    session_domain: Option<String>,
+    /// session_domain + its can_read list. Empty = domainless mode (full access).
+    allowed_domains: Vec<String>,
 }
 
 // -- Tool parameter types --
@@ -114,9 +118,32 @@ pub struct ClipboardParams {
 
 #[tool_router(router = tool_router)]
 impl WardwellServer {
-    pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>) -> Self {
+    pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>, domain: Option<String>) -> Self {
         let vault_root = config.vault_path.clone();
         let registry = Arc::new(RwLock::new(DomainRegistry::from_domains(config.registry.all().to_vec())));
+
+        // Build domain scope
+        let (session_domain, allowed_domains) = match domain {
+            Some(ref d) => {
+                let reg = registry.blocking_read();
+                match reg.find(d) {
+                    Some(found) => {
+                        let mut allowed = vec![d.clone()];
+                        allowed.extend(found.can_read.clone());
+                        eprintln!("[WARDWELL] Starting with domain scope: {:?}, allowed: {:?}", d, allowed);
+                        (Some(d.clone()), allowed)
+                    }
+                    None => {
+                        eprintln!("[WARDWELL] FATAL: domain '{}' not found in registry. Available: {:?}", d, reg.names());
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                eprintln!("[WARDWELL] Starting in DOMAINLESS mode (full access)");
+                (None, vec![])
+            }
+        };
 
         Self {
             tool_router: Self::tool_router(),
@@ -127,6 +154,8 @@ impl WardwellServer {
             accessed_projects: Arc::new(Mutex::new(HashSet::new())),
             last_project: Arc::new(Mutex::new(None)),
             embedder,
+            session_domain,
+            allowed_domains,
         }
     }
 

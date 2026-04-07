@@ -11,7 +11,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the MCP server (stdio transport) with background daemon tasks
-    Serve,
+    Serve {
+        /// Scope this server to a specific vault domain (also reads WARDWELL_DOMAIN env var)
+        #[arg(long)]
+        domain: Option<String>,
+    },
     /// First-run setup — generates config, injects MCP entries, installs hooks
     Init,
     /// Check that everything is wired correctly
@@ -39,7 +43,10 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
     let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
-        Commands::Serve => run_serve().await,
+        Commands::Serve { domain } => {
+            let domain = domain.or_else(|| std::env::var("WARDWELL_DOMAIN").ok());
+            run_serve(domain).await
+        }
         Commands::Init => wardwell::install::init::run(),
         Commands::Doctor => wardwell::install::doctor::run(),
         Commands::Uninstall => wardwell::install::uninstall::run(),
@@ -54,7 +61,7 @@ async fn main() {
     }
 }
 
-async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     use rmcp::ServiceExt;
     use std::sync::Arc;
     use wardwell::config::loader;
@@ -133,7 +140,7 @@ async fn run_serve() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     eprintln!("wardwell: starting MCP server");
-    let server = WardwellServer::new(config, Arc::clone(&index), embedder);
+    let server = WardwellServer::new(config, Arc::clone(&index), embedder, domain);
     let shared_registry = server.registry.clone();
 
     // Spawn vault file watcher for vault + sources
