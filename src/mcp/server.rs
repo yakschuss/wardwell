@@ -405,10 +405,9 @@ impl WardwellServer {
         // ACL: check domain access before reading
         if !self.allowed_domains.is_empty() {
             let clean = path.strip_prefix('/').unwrap_or(&path);
-            if let Some(file_domain) = clean.split('/').next() {
-                if let Err(e) = self.check_domain_access(file_domain, "read") {
-                    return json_error(&e);
-                }
+            if let Some(file_domain) = clean.split('/').next()
+                && let Err(e) = self.check_domain_access(file_domain, "read") {
+                return json_error(&e);
             }
         }
 
@@ -455,10 +454,9 @@ impl WardwellServer {
         }
 
         // ACL: validate client domain param if scoped
-        if let Some(ref d) = p.domain {
-            if let Err(e) = self.check_domain_access(d, "history") {
-                return json_error(&e);
-            }
+        if let Some(ref d) = p.domain
+            && let Err(e) = self.check_domain_access(d, "history") {
+            return json_error(&e);
         }
 
         let since_date = p.since.as_deref()
@@ -523,10 +521,9 @@ impl WardwellServer {
         }
 
         // ACL: validate client domain param if scoped
-        if let Some(ref d) = p.domain {
-            if let Err(e) = self.check_domain_access(d, "orchestrate") {
-                return json_error(&e);
-            }
+        if let Some(ref d) = p.domain
+            && let Err(e) = self.check_domain_access(d, "orchestrate") {
+            return json_error(&e);
         }
 
         let dirs_to_scan = self.scoped_domain_dirs(&vault_dir, p.domain.as_deref());
@@ -724,10 +721,9 @@ impl WardwellServer {
         };
 
         // ACL: validate client domain param if scoped
-        if let Some(ref d) = p.domain {
-            if let Err(e) = self.check_domain_access(d, "retrospective") {
-                return json_error(&e);
-            }
+        if let Some(ref d) = p.domain
+            && let Err(e) = self.check_domain_access(d, "retrospective") {
+            return json_error(&e);
         }
 
         let skip_archive = !p.include_archived.unwrap_or(false);
@@ -801,10 +797,9 @@ impl WardwellServer {
             .unwrap_or_else(|| chrono::Local::now().date_naive() - chrono::Duration::days(90));
 
         // ACL: validate client domain param if scoped
-        if let Some(ref d) = p.domain {
-            if let Err(e) = self.check_domain_access(d, "patterns") {
-                return json_error(&e);
-            }
+        if let Some(ref d) = p.domain
+            && let Err(e) = self.check_domain_access(d, "patterns") {
+            return json_error(&e);
         }
 
         let skip_archive = !p.include_archived.unwrap_or(false);
