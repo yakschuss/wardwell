@@ -122,6 +122,13 @@ impl WardwellServer {
         let vault_root = config.vault_path.clone();
         let raw_registry = DomainRegistry::from_domains(config.registry.all().to_vec());
 
+        // Log registry state for debugging
+        if raw_registry.is_empty() {
+            eprintln!("[WARDWELL] WARNING: domain registry is empty (no confirmed domain files in {}/domains/)", vault_root.display());
+        } else {
+            eprintln!("[WARDWELL] Registry loaded: {:?}", raw_registry.names());
+        }
+
         // Build domain scope before wrapping registry in Arc<RwLock>
         let (session_domain, allowed_domains) = match domain {
             Some(ref d) => {
