@@ -1663,14 +1663,23 @@ fn json_error(msg: &str) -> String {
     serde_json::to_string(&serde_json::json!({"error": msg})).unwrap_or_default()
 }
 
-/// Resolve a vault path: try vault root first, then each source directory.
+/// Resolve a vault path: only allow vault-relative paths.
 fn resolve_path(vault_root: &std::path::Path, path: &str) -> Option<PathBuf> {
     // Strip leading slash from relative paths (common copy-paste error)
     let clean = path.strip_prefix('/').unwrap_or(path);
+
+    // Reject absolute paths and traversal attempts
     let p = std::path::Path::new(clean);
-    if p.is_absolute() && p.exists() {
-        return Some(p.to_path_buf());
+    if p.is_absolute() {
+        return None;
     }
+    // Reject path traversal (e.g. "../../etc/passwd")
+    for component in p.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return None;
+        }
+    }
+
     let vault_candidate = vault_root.join(clean);
     if vault_candidate.exists() {
         return Some(vault_candidate);
