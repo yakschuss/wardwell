@@ -970,4 +970,42 @@ mod tests {
         let result = store.query("nonexistent", &default_kanban_queries());
         assert!(matches!(result, Err(KanbanError::InvalidInput(_))));
     }
+
+    // ---- domain inference tests ----
+
+    #[test]
+    fn ensure_project_stores_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KanbanStore::open(&dir.path().join("k.db")).unwrap();
+        let pf = HashMap::new();
+
+        store.create_item("Task", "shulops", "personal", None, None, None, None, None, None, &pf).unwrap();
+
+        let conn = store.conn().unwrap();
+        let (domain, prefix): (String, String) = conn.query_row(
+            "SELECT domain, prefix FROM kanban_projects WHERE project = 'shulops'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(domain, "personal");
+        assert_eq!(prefix, "SH");
+    }
+
+    #[test]
+    fn create_two_projects_no_prefix_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KanbanStore::open(&dir.path().join("k.db")).unwrap();
+        let pf = HashMap::new();
+
+        store.create_item("A", "shadow", "personal", None, None, None, None, None, None, &pf).unwrap();
+        store.create_item("B", "shipping", "work", None, None, None, None, None, None, &pf).unwrap();
+
+        let conn = store.conn().unwrap();
+        let p1: String = conn.query_row("SELECT prefix FROM kanban_projects WHERE project = 'shadow'", [], |r| r.get(0)).unwrap();
+        let p2: String = conn.query_row("SELECT prefix FROM kanban_projects WHERE project = 'shipping'", [], |r| r.get(0)).unwrap();
+        assert_ne!(p1, p2);
+        assert_eq!(p1, "SH");
+        // "shipping" can't use "SH", tries first+third = "SI"
+        assert_eq!(p2, "SI");
+    }
 }
