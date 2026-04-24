@@ -73,6 +73,26 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
     let config = loader::load(None)?;
 
     let config_dir = loader::config_dir();
+
+    // Open kanban BEFORE index — IndexStore registers sqlite-vec globally
+    // which causes disk I/O errors on connections opened after it.
+    let kanban = if config.kanban_enabled {
+        let kanban_path = config_dir.join("kanban.db");
+        let vault_root = config.vault_path.clone();
+        match wardwell::kanban::store::KanbanStore::open(&kanban_path, vault_root) {
+            Ok(k) => {
+                eprintln!("wardwell: kanban enabled");
+                Some(k)
+            }
+            Err(e) => {
+                eprintln!("wardwell: kanban db error (disabled): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let index_path = config_dir.join("index.db");
     eprintln!("wardwell: opening index");
     let index = IndexStore::open(&index_path)?;
@@ -138,22 +158,6 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
             }
         }
     });
-
-    let kanban = if config.kanban_enabled {
-        let kanban_path = config_dir.join("kanban.db");
-        match wardwell::kanban::store::KanbanStore::open(&kanban_path) {
-            Ok(k) => {
-                eprintln!("wardwell: kanban enabled");
-                Some(k)
-            }
-            Err(e) => {
-                eprintln!("wardwell: kanban db error (disabled): {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     eprintln!("wardwell: starting MCP server");
     let server = WardwellServer::new(config, Arc::clone(&index), embedder, domain, kanban);

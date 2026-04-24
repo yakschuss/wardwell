@@ -5,7 +5,9 @@ use wardwell::kanban::store::{KanbanStore, default_kanban_queries, merge_kanban_
 
 fn make_store() -> (tempfile::TempDir, KanbanStore) {
     let dir = tempfile::tempdir().unwrap();
-    let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(&vault).unwrap();
+    let store = KanbanStore::open(&dir.path().join("kanban.db"), vault).unwrap();
     (dir, store)
 }
 

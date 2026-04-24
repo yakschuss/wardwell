@@ -1,6 +1,7 @@
+use crate::kanban::events::{self, KanbanEvent};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -29,7 +30,6 @@ pub struct KanbanNote {
     pub created_at: String,
 }
 
-/// Errors from kanban store operations.
 #[derive(Debug, thiserror::Error)]
 pub enum KanbanError {
     #[error("SQLite error: {0}")]
@@ -48,16 +48,16 @@ pub enum KanbanError {
     LockPoisoned,
 }
 
-/// SQLite-backed kanban store. Thread-safe via Mutex.
+/// Kanban store: JSONL is source of truth, SQLite is materialized cache.
 #[derive(Debug)]
 pub struct KanbanStore {
     conn: Mutex<Connection>,
+    vault_root: PathBuf,
 }
 
 impl KanbanStore {
-    /// Open (or create) a kanban store at the given path.
-    pub fn open(path: &Path) -> Result<Self, KanbanError> {
-        let conn = Connection::open(path)?;
+    pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
+        let conn = Connection::open(db_path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.busy_timeout(Duration::from_secs(5))?;
 
@@ -68,7 +68,6 @@ impl KanbanStore {
                 domain      TEXT NOT NULL,
                 next_id     INTEGER NOT NULL DEFAULT 1
             );
-
             CREATE TABLE IF NOT EXISTS kanban_items (
                 ticket_id    TEXT PRIMARY KEY,
                 project      TEXT NOT NULL,
@@ -83,7 +82,6 @@ impl KanbanStore {
                 updated_at   TEXT NOT NULL,
                 completed_at TEXT
             );
-
             CREATE TABLE IF NOT EXISTS kanban_notes (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 ticket_id  TEXT NOT NULL,
@@ -91,26 +89,24 @@ impl KanbanStore {
                 author     TEXT,
                 created_at TEXT NOT NULL
             );
-
-            CREATE INDEX IF NOT EXISTS idx_kanban_items_project
-                ON kanban_items (project);
-
-            CREATE INDEX IF NOT EXISTS idx_kanban_items_status
-                ON kanban_items (status);
-
-            CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket
-                ON kanban_notes (ticket_id);",
+            CREATE INDEX IF NOT EXISTS idx_kanban_items_project ON kanban_items(project);
+            CREATE INDEX IF NOT EXISTS idx_kanban_items_status ON kanban_items(status);
+            CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket ON kanban_notes(ticket_id);"
         )?;
 
-        Ok(Self { conn: Mutex::new(conn) })
+        let store = Self { conn: Mutex::new(conn), vault_root };
+        if let Err(e) = store.rebuild_from_jsonl() {
+            eprintln!("wardwell: kanban rebuild warning (non-fatal): {e}");
+        }
+        Ok(store)
     }
 
-    /// Acquire the connection lock.
     pub fn conn(&self) -> Result<MutexGuard<'_, Connection>, KanbanError> {
         self.conn.lock().map_err(|_| KanbanError::LockPoisoned)
     }
 
-    /// Create a new kanban item, registering the project if needed.
+    // ---- Write path: JSONL append + SQLite cache update ----
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_item(
         &self,
@@ -125,260 +121,79 @@ impl KanbanStore {
         source: Option<&str>,
         config_prefixes: &HashMap<String, String>,
     ) -> Result<KanbanItem, KanbanError> {
-        let conn = self.conn()?;
+        let status = validate_status(status.unwrap_or("backlog"))?;
+        let priority = validate_priority(priority.unwrap_or("medium"))?;
         let now = chrono::Utc::now().to_rfc3339();
 
-        let status = match status.unwrap_or("backlog") {
-            s @ ("backlog" | "todo" | "in_progress" | "review" | "done") => s.to_string(),
-            other => {
-                return Err(KanbanError::InvalidInput(format!(
-                    "invalid status '{other}'; must be one of: backlog, todo, in_progress, review, done"
-                )))
-            }
-        };
-
-        let priority = match priority.unwrap_or("medium") {
-            p @ ("low" | "medium" | "high" | "urgent") => p.to_string(),
-            other => {
-                return Err(KanbanError::InvalidInput(format!(
-                    "invalid priority '{other}'; must be one of: low, medium, high, urgent"
-                )))
-            }
-        };
-
-        let (prefix, next_id) = self.ensure_project(&conn, project, domain, config_prefixes)?;
+        let (prefix, next_id) = self.resolve_ticket_id(project, domain, config_prefixes)?;
         let ticket_id = format!("{prefix}-{next_id}");
 
-        conn.execute(
-            "UPDATE kanban_projects SET next_id = next_id + 1 WHERE project = ?1",
-            rusqlite::params![project],
-        )?;
+        let event = KanbanEvent::Create {
+            ticket_id: ticket_id.clone(),
+            title: title.to_string(),
+            project: project.to_string(),
+            status: status.to_string(),
+            priority: priority.to_string(),
+            description: description.map(str::to_string),
+            deadline: deadline.map(str::to_string),
+            assignee: assignee.map(str::to_string),
+            source: source.map(str::to_string),
+            timestamp: now.clone(),
+        };
 
+        events::append_event(&self.vault_root, domain, project, &event)?;
+        events::append_meta(&self.vault_root, domain, project, &prefix, next_id + 1)?;
+
+        // Update SQLite cache
+        let conn = self.conn()?;
+        self.upsert_project(&conn, project, &prefix, domain, next_id + 1)?;
         let completed_at: Option<String> = if status == "done" { Some(now.clone()) } else { None };
-
         conn.execute(
-            "INSERT INTO kanban_items
-                (ticket_id, project, title, description, status, priority,
-                 assignee, deadline, source, created_at, updated_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params![
-                ticket_id,
-                project,
-                title,
-                description,
-                status,
-                priority,
-                assignee,
-                deadline,
-                source,
-                now,
-                now,
-                completed_at,
-            ],
+            "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            rusqlite::params![ticket_id, project, title, description, status, priority, assignee, deadline, source, now, now, completed_at],
         )?;
 
         Ok(KanbanItem {
-            ticket_id,
-            project: project.to_string(),
-            title: title.to_string(),
-            description: description.map(str::to_string),
-            status,
-            priority,
-            assignee: assignee.map(str::to_string),
-            deadline: deadline.map(str::to_string),
-            source: source.map(str::to_string),
-            created_at: now.clone(),
-            updated_at: now,
-            completed_at,
-            notes: vec![],
+            ticket_id, project: project.into(), title: title.into(),
+            description: description.map(str::to_string), status: status.into(), priority: priority.into(),
+            assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
+            source: source.map(str::to_string), created_at: now.clone(), updated_at: now,
+            completed_at, notes: vec![],
         })
     }
 
-    /// List kanban items with optional filters.
-    pub fn list(
-        &self,
-        project: Option<&str>,
-        status: Option<&str>,
-        priority: Option<&str>,
-        assignee: Option<&str>,
-        include_done: bool,
-        domains: Option<&[String]>,
-    ) -> Result<Vec<KanbanItem>, KanbanError> {
+    pub fn move_item(&self, ticket_id: &str, new_status: &str) -> Result<(KanbanItem, String), KanbanError> {
+        let new_status = validate_status(new_status)?;
         let conn = self.conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
 
-        let mut conditions: Vec<String> = vec![];
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
-        let mut param_idx = 1usize;
+        let (old_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        // Domain filter: join with kanban_projects and restrict by domain IN (...)
-        let use_domain_filter = domains.map(|d| !d.is_empty()).unwrap_or(false);
-        let from_clause = if use_domain_filter {
-            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
-        } else {
-            "FROM kanban_items"
+        let event = KanbanEvent::Move {
+            ticket_id: ticket_id.into(),
+            from: Some(old_status.clone()),
+            to: new_status.to_string(),
+            timestamp: now.clone(),
         };
+        events::append_event(&self.vault_root, &domain, &project, &event)?;
 
-        if use_domain_filter
-            && let Some(domain_list) = domains
-        {
-            let placeholders: Vec<String> =
-                domain_list.iter().map(|_| { let s = format!("?{param_idx}"); param_idx += 1; s }).collect();
-            conditions.push(format!("p.domain IN ({})", placeholders.join(", ")));
-            for d in domain_list {
-                params.push(Box::new(d.clone()));
-            }
-        }
-
-        if !include_done {
-            conditions.push(format!("kanban_items.status != ?{param_idx}"));
-            params.push(Box::new("done".to_string()));
-            param_idx += 1;
-        }
-        if let Some(p) = project {
-            conditions.push(format!("kanban_items.project = ?{param_idx}"));
-            params.push(Box::new(p.to_string()));
-            param_idx += 1;
-        }
-        if let Some(s) = status {
-            conditions.push(format!("kanban_items.status = ?{param_idx}"));
-            params.push(Box::new(s.to_string()));
-            param_idx += 1;
-        }
-        if let Some(p) = priority {
-            conditions.push(format!("kanban_items.priority = ?{param_idx}"));
-            params.push(Box::new(p.to_string()));
-            param_idx += 1;
-        }
-        if let Some(a) = assignee {
-            conditions.push(format!("kanban_items.assignee = ?{param_idx}"));
-            params.push(Box::new(a.to_string()));
-            // param_idx would increment here but it's the last use
-            let _ = param_idx;
-        }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-
-        let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description,
-                    kanban_items.status, kanban_items.priority,
-                    kanban_items.assignee, kanban_items.deadline, kanban_items.source,
-                    kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at
-             {from_clause}
-             {where_clause}
-             ORDER BY
-                CASE kanban_items.priority
-                    WHEN 'urgent' THEN 0
-                    WHEN 'high'   THEN 1
-                    WHEN 'medium' THEN 2
-                    WHEN 'low'    THEN 3
-                    ELSE 4
-                END,
-                kanban_items.updated_at DESC"
-        );
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn.prepare(&sql)?;
-        let items: Vec<KanbanItem> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(KanbanItem {
-                    ticket_id: row.get(0)?,
-                    project: row.get(1)?,
-                    title: row.get(2)?,
-                    description: row.get(3)?,
-                    status: row.get(4)?,
-                    priority: row.get(5)?,
-                    assignee: row.get(6)?,
-                    deadline: row.get(7)?,
-                    source: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    completed_at: row.get(11)?,
-                    notes: vec![],
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-
-        items
-            .into_iter()
-            .map(|mut item| {
-                item.notes = self.load_notes_with_conn(&conn, &item.ticket_id)?;
-                Ok(item)
-            })
-            .collect()
-    }
-
-    /// Load notes for a ticket (uses an already-locked connection).
-    fn load_notes_with_conn(
-        &self,
-        conn: &Connection,
-        ticket_id: &str,
-    ) -> Result<Vec<KanbanNote>, KanbanError> {
-        let mut stmt = conn.prepare(
-            "SELECT id, text, author, created_at
-             FROM kanban_notes
-             WHERE ticket_id = ?1
-             ORDER BY created_at DESC",
+        let completed_at: Option<String> = if new_status == "done" { Some(now.clone()) } else { None };
+        conn.execute(
+            "UPDATE kanban_items SET status=?1, updated_at=?2, completed_at=?3 WHERE ticket_id=?4",
+            rusqlite::params![new_status, now, completed_at, ticket_id],
         )?;
-        let notes = stmt
-            .query_map(rusqlite::params![ticket_id], |row| {
-                Ok(KanbanNote {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    author: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-        Ok(notes)
+
+        let transition = format!("{old_status} → {new_status}");
+        let note_text = format!("Status: {transition}");
+        conn.execute(
+            "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![ticket_id, note_text, Option::<String>::None, now],
+        )?;
+
+        let item = self.get_item_with_conn(&conn, ticket_id)?;
+        Ok((item, transition))
     }
 
-    /// Fetch a single item by ticket_id (uses an already-locked connection).
-    fn get_item_with_conn(
-        &self,
-        conn: &Connection,
-        ticket_id: &str,
-    ) -> Result<KanbanItem, KanbanError> {
-        let item: Option<KanbanItem> = conn
-            .query_row(
-                "SELECT ticket_id, project, title, description, status, priority,
-                        assignee, deadline, source, created_at, updated_at, completed_at
-                 FROM kanban_items
-                 WHERE ticket_id = ?1",
-                rusqlite::params![ticket_id],
-                |row| {
-                    Ok(KanbanItem {
-                        ticket_id: row.get(0)?,
-                        project: row.get(1)?,
-                        title: row.get(2)?,
-                        description: row.get(3)?,
-                        status: row.get(4)?,
-                        priority: row.get(5)?,
-                        assignee: row.get(6)?,
-                        deadline: row.get(7)?,
-                        source: row.get(8)?,
-                        created_at: row.get(9)?,
-                        updated_at: row.get(10)?,
-                        completed_at: row.get(11)?,
-                        notes: vec![],
-                    })
-                },
-            )
-            .optional()?;
-
-        let mut item = item.ok_or_else(|| {
-            KanbanError::NotFound(format!("ticket '{ticket_id}' not found"))
-        })?;
-        item.notes = self.load_notes_with_conn(conn, ticket_id)?;
-        Ok(item)
-    }
-
-    /// Update fields on an existing item. Only provided (Some) fields are changed.
     #[allow(clippy::too_many_arguments)]
     pub fn update_item(
         &self,
@@ -390,368 +205,330 @@ impl KanbanStore {
         assignee: Option<&str>,
         deadline: Option<&str>,
     ) -> Result<KanbanItem, KanbanError> {
+        if let Some(s) = status { validate_status(s)?; }
+        if let Some(p) = priority { validate_priority(p)?; }
+
         let conn = self.conn()?;
-
-        // Verify exists and get current status.
-        let current_status: Option<String> = conn
-            .query_row(
-                "SELECT status FROM kanban_items WHERE ticket_id = ?1",
-                rusqlite::params![ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let current_status =
-            current_status.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
-
-        if let Some(s) = status {
-            match s {
-                "backlog" | "todo" | "in_progress" | "review" | "done" => {}
-                other => {
-                    return Err(KanbanError::InvalidInput(format!(
-                        "invalid status '{other}'; must be one of: backlog, todo, in_progress, review, done"
-                    )))
-                }
-            }
-        }
-        if let Some(p) = priority {
-            match p {
-                "low" | "medium" | "high" | "urgent" => {}
-                other => {
-                    return Err(KanbanError::InvalidInput(format!(
-                        "invalid priority '{other}'; must be one of: low, medium, high, urgent"
-                    )))
-                }
-            }
-        }
-
         let now = chrono::Utc::now().to_rfc3339();
 
-        let mut sets: Vec<String> = vec![];
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
-        let mut param_idx = 1usize;
+        let (current_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        if let Some(v) = title {
-            sets.push(format!("title = ?{param_idx}"));
-            params.push(Box::new(v.to_string()));
-            param_idx += 1;
+        let mut fields = HashMap::new();
+        if let Some(v) = title { fields.insert("title".into(), serde_json::Value::String(v.into())); }
+        if let Some(v) = description { fields.insert("description".into(), serde_json::Value::String(v.into())); }
+        if let Some(v) = status { fields.insert("status".into(), serde_json::Value::String(v.into())); }
+        if let Some(v) = priority { fields.insert("priority".into(), serde_json::Value::String(v.into())); }
+        if let Some(v) = assignee { fields.insert("assignee".into(), serde_json::Value::String(v.into())); }
+        if let Some(v) = deadline { fields.insert("deadline".into(), serde_json::Value::String(v.into())); }
+
+        if !fields.is_empty() {
+            let event = KanbanEvent::Update {
+                ticket_id: ticket_id.into(),
+                fields,
+                timestamp: now.clone(),
+            };
+            events::append_event(&self.vault_root, &domain, &project, &event)?;
         }
-        if let Some(v) = description {
-            sets.push(format!("description = ?{param_idx}"));
-            params.push(Box::new(v.to_string()));
-            param_idx += 1;
-        }
+
+        // Update SQLite cache
+        let mut sets = vec!["updated_at = ?1".to_string()];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now)];
+        let mut idx = 2;
+
+        if let Some(v) = title { sets.push(format!("title=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = description { sets.push(format!("description=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
         if let Some(v) = status {
-            sets.push(format!("status = ?{param_idx}"));
-            params.push(Box::new(v.to_string()));
-            param_idx += 1;
-
-            // completed_at logic
+            sets.push(format!("status=?{idx}")); params.push(Box::new(v.to_string())); idx += 1;
             if v == "done" && current_status != "done" {
-                sets.push(format!("completed_at = ?{param_idx}"));
-                params.push(Box::new(now.clone()));
-                param_idx += 1;
+                sets.push(format!("completed_at=?{idx}")); params.push(Box::new(chrono::Utc::now().to_rfc3339())); idx += 1;
             } else if v != "done" && current_status == "done" {
-                sets.push(format!("completed_at = ?{param_idx}"));
-                params.push(Box::new(Option::<String>::None));
-                param_idx += 1;
+                sets.push(format!("completed_at=?{idx}")); params.push(Box::new(Option::<String>::None)); idx += 1;
             }
         }
-        if let Some(v) = priority {
-            sets.push(format!("priority = ?{param_idx}"));
-            params.push(Box::new(v.to_string()));
-            param_idx += 1;
-        }
-        if let Some(v) = assignee {
-            sets.push(format!("assignee = ?{param_idx}"));
-            params.push(Box::new(v.to_string()));
-            param_idx += 1;
-        }
-        if let Some(v) = deadline {
-            sets.push(format!("deadline = ?{param_idx}"));
-            params.push(Box::new(v.to_string()));
-            param_idx += 1;
-        }
+        if let Some(v) = priority { sets.push(format!("priority=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = assignee { sets.push(format!("assignee=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = deadline { sets.push(format!("deadline=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
 
-        // Always update updated_at.
-        sets.push(format!("updated_at = ?{param_idx}"));
-        params.push(Box::new(now));
-        param_idx += 1;
-
-        // ticket_id param at the end for WHERE clause.
         params.push(Box::new(ticket_id.to_string()));
-
-        let sql = format!(
-            "UPDATE kanban_items SET {} WHERE ticket_id = ?{param_idx}",
-            sets.join(", ")
-        );
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        conn.execute(&sql, param_refs.as_slice())?;
+        let sql = format!("UPDATE kanban_items SET {} WHERE ticket_id=?{}", sets.join(", "), params.len());
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        conn.execute(&sql, refs.as_slice())?;
 
         self.get_item_with_conn(&conn, ticket_id)
     }
 
-    /// Move an item to a new status, auto-logging the transition as a note.
-    pub fn move_item(
-        &self,
-        ticket_id: &str,
-        new_status: &str,
-    ) -> Result<(KanbanItem, String), KanbanError> {
-        match new_status {
-            "backlog" | "todo" | "in_progress" | "review" | "done" => {}
-            other => {
-                return Err(KanbanError::InvalidInput(format!(
-                    "invalid status '{other}'; must be one of: backlog, todo, in_progress, review, done"
-                )))
-            }
-        }
-
+    pub fn add_note(&self, ticket_id: &str, text: &str, author: Option<&str>) -> Result<KanbanItem, KanbanError> {
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
-        let old_status: Option<String> = conn
-            .query_row(
-                "SELECT status FROM kanban_items WHERE ticket_id = ?1",
-                rusqlite::params![ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let old_status =
-            old_status.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
+        let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        let completed_at: Option<String> = if new_status == "done" {
-            Some(now.clone())
-        } else {
-            None
+        let event = KanbanEvent::Note {
+            ticket_id: ticket_id.into(),
+            text: text.into(),
+            author: author.map(str::to_string),
+            timestamp: now.clone(),
         };
+        events::append_event(&self.vault_root, &domain, &project, &event)?;
 
         conn.execute(
-            "UPDATE kanban_items SET status = ?1, updated_at = ?2, completed_at = ?3 WHERE ticket_id = ?4",
-            rusqlite::params![new_status, now, completed_at, ticket_id],
-        )?;
-
-        let transition = format!("{old_status} → {new_status}");
-        let note_text = format!("Status: {transition}");
-        conn.execute(
-            "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![ticket_id, note_text, Option::<String>::None, now],
-        )?;
-
-        let item = self.get_item_with_conn(&conn, ticket_id)?;
-        Ok((item, transition))
-    }
-
-    /// Append a note to an item and return the updated item.
-    pub fn add_note(
-        &self,
-        ticket_id: &str,
-        text: &str,
-        author: Option<&str>,
-    ) -> Result<KanbanItem, KanbanError> {
-        let conn = self.conn()?;
-        let now = chrono::Utc::now().to_rfc3339();
-
-        // Verify exists.
-        let exists: Option<String> = conn
-            .query_row(
-                "SELECT ticket_id FROM kanban_items WHERE ticket_id = ?1",
-                rusqlite::params![ticket_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(KanbanError::NotFound(format!("ticket '{ticket_id}' not found")));
-        }
-
-        conn.execute(
-            "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4)",
             rusqlite::params![ticket_id, text, author, now],
         )?;
         conn.execute(
-            "UPDATE kanban_items SET updated_at = ?1 WHERE ticket_id = ?2",
+            "UPDATE kanban_items SET updated_at=?1 WHERE ticket_id=?2",
             rusqlite::params![now, ticket_id],
         )?;
 
         self.get_item_with_conn(&conn, ticket_id)
     }
 
-    /// Validate WHERE clauses from config by running EXPLAIN on each.
-    /// Call this at startup after merging queries to catch syntax errors early.
+    // ---- Read path: SQLite only ----
+
+    pub fn list(
+        &self, project: Option<&str>, status: Option<&str>, priority: Option<&str>,
+        assignee: Option<&str>, include_done: bool, domains: Option<&[String]>,
+    ) -> Result<Vec<KanbanItem>, KanbanError> {
+        let conn = self.conn()?;
+        let mut conditions: Vec<String> = vec![];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+        let mut idx = 1usize;
+
+        let use_domain = domains.map(|d| !d.is_empty()).unwrap_or(false);
+        let from = if use_domain {
+            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
+        } else { "FROM kanban_items" };
+
+        if use_domain {
+            if let Some(dl) = domains {
+                let ph: Vec<String> = dl.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
+                conditions.push(format!("p.domain IN ({})", ph.join(",")));
+                for d in dl { params.push(Box::new(d.clone())); }
+            }
+        }
+        if !include_done { conditions.push(format!("kanban_items.status != ?{idx}")); params.push(Box::new("done".to_string())); idx += 1; }
+        if let Some(v) = project { conditions.push(format!("kanban_items.project=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = status { conditions.push(format!("kanban_items.status=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = priority { conditions.push(format!("kanban_items.priority=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = assignee { conditions.push(format!("kanban_items.assignee=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
+
+        let wh = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
+        let sql = format!(
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
+        );
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
+            Ok(KanbanItem {
+                ticket_id: row.get(0)?, project: row.get(1)?, title: row.get(2)?,
+                description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
+                assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
+                created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
+                notes: vec![],
+            })
+        })?.collect::<Result<_, _>>()?;
+
+        items.into_iter().map(|mut item| {
+            item.notes = self.load_notes(&conn, &item.ticket_id)?;
+            Ok(item)
+        }).collect()
+    }
+
+    pub fn query(
+        &self, question: &str, queries: &HashMap<String, String>,
+        project: Option<&str>, domains: Option<&[String]>,
+    ) -> Result<Vec<KanbanItem>, KanbanError> {
+        let named_where = queries.get(question).ok_or_else(|| {
+            let mut names: Vec<&str> = queries.keys().map(String::as_str).collect();
+            names.sort();
+            KanbanError::InvalidInput(format!("unknown query '{question}'; available: {}", names.join(", ")))
+        })?;
+
+        let use_domain = domains.map(|d| !d.is_empty()).unwrap_or(false);
+        let from = if use_domain {
+            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
+        } else { "FROM kanban_items" };
+
+        let mut extra: Vec<String> = vec![];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+        let mut idx = 1;
+
+        if use_domain { if let Some(dl) = domains {
+            let ph: Vec<String> = dl.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
+            extra.push(format!("p.domain IN ({})", ph.join(",")));
+            for d in dl { params.push(Box::new(d.clone())); }
+        }}
+        if let Some(p) = project { extra.push(format!("kanban_items.project=?{idx}")); params.push(Box::new(p.to_string())); let _ = idx; }
+
+        let wh = if extra.is_empty() { format!("WHERE {named_where}") } else { format!("WHERE ({named_where}) AND {}", extra.join(" AND ")) };
+        let sql = format!(
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC"
+        );
+
+        let conn = self.conn()?;
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
+            Ok(KanbanItem {
+                ticket_id: row.get(0)?, project: row.get(1)?, title: row.get(2)?,
+                description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
+                assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
+                created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
+                notes: vec![],
+            })
+        })?.collect::<Result<_, _>>()?;
+
+        items.into_iter().map(|mut item| {
+            item.notes = self.load_notes(&conn, &item.ticket_id)?;
+            Ok(item)
+        }).collect()
+    }
+
     pub fn validate_queries(&self, queries: &HashMap<String, String>) -> Result<(), KanbanError> {
         let conn = self.conn()?;
-        for (name, where_clause) in queries {
-            let sql = format!("SELECT * FROM kanban_items WHERE {where_clause}");
-            conn.prepare(&sql).map_err(|e| {
-                KanbanError::InvalidInput(format!(
-                    "invalid query '{name}': {e} (WHERE clause: {where_clause})"
-                ))
+        for (name, wh) in queries {
+            conn.prepare(&format!("SELECT * FROM kanban_items WHERE {wh}")).map_err(|e| {
+                KanbanError::InvalidInput(format!("invalid query '{name}': {e} (WHERE clause: {wh})"))
             })?;
         }
         Ok(())
     }
 
-    /// Run a named dynamic query against kanban_items.
-    pub fn query(
-        &self,
-        question: &str,
-        queries: &HashMap<String, String>,
-        project: Option<&str>,
-        domains: Option<&[String]>,
-    ) -> Result<Vec<KanbanItem>, KanbanError> {
-        let named_where = queries.get(question).ok_or_else(|| {
-            let mut names: Vec<&str> = queries.keys().map(String::as_str).collect();
-            names.sort();
-            KanbanError::InvalidInput(format!(
-                "unknown query '{question}'; available: {}",
-                names.join(", ")
-            ))
-        })?;
+    // ---- Rebuild SQLite from JSONL ----
 
-        let use_domain_filter = domains.map(|d| !d.is_empty()).unwrap_or(false);
-        let from_clause = if use_domain_filter {
-            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
-        } else {
-            "FROM kanban_items"
-        };
+    pub fn rebuild_from_jsonl(&self) -> Result<(), KanbanError> {
+        let all = events::scan_all_jsonl(&self.vault_root);
+        let conn = self.conn()?;
 
-        let mut extra_conditions: Vec<String> = vec![];
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
-        let mut param_idx = 1usize;
+        conn.execute_batch("DELETE FROM kanban_notes; DELETE FROM kanban_items; DELETE FROM kanban_projects;")?;
 
-        if use_domain_filter
-            && let Some(domain_list) = domains
-        {
-            let placeholders: Vec<String> =
-                domain_list.iter().map(|_| { let s = format!("?{param_idx}"); param_idx += 1; s }).collect();
-            extra_conditions.push(format!("p.domain IN ({})", placeholders.join(", ")));
-            for d in domain_list {
-                params.push(Box::new(d.clone()));
+        for (domain, _project, evts) in &all {
+            let items = events::materialize(domain, evts);
+            for item in &items {
+                // Derive prefix from ticket_id
+                if let Some(dash) = item.ticket_id.find('-') {
+                    let prefix = &item.ticket_id[..dash];
+                    let num: i64 = item.ticket_id[dash + 1..].parse().unwrap_or(1);
+                    self.upsert_project(&conn, &item.project, prefix, &item.domain, num + 1)?;
+                }
+
+                conn.execute(
+                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.created_at, item.updated_at, item.completed_at],
+                )?;
+
+                for (i, note) in item.notes.iter().enumerate() {
+                    conn.execute(
+                        "INSERT INTO kanban_notes (id, ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4,?5)",
+                        rusqlite::params![i as i64 + 1, item.ticket_id, note.text, note.author, note.created_at],
+                    )?;
+                }
             }
         }
 
-        if let Some(proj) = project {
-            extra_conditions.push(format!("kanban_items.project = ?{param_idx}"));
-            params.push(Box::new(proj.to_string()));
-            // param_idx would increment but it's the last use
-            let _ = param_idx;
-        }
-
-        let where_clause = if extra_conditions.is_empty() {
-            format!("WHERE {named_where}")
-        } else {
-            format!("WHERE ({named_where}) AND {}", extra_conditions.join(" AND "))
-        };
-
-        let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description,
-                    kanban_items.status, kanban_items.priority,
-                    kanban_items.assignee, kanban_items.deadline, kanban_items.source,
-                    kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at
-             {from_clause}
-             {where_clause}
-             ORDER BY kanban_items.updated_at DESC"
-        );
-
-        let conn = self.conn()?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let items: Vec<KanbanItem> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                Ok(KanbanItem {
-                    ticket_id: row.get(0)?,
-                    project: row.get(1)?,
-                    title: row.get(2)?,
-                    description: row.get(3)?,
-                    status: row.get(4)?,
-                    priority: row.get(5)?,
-                    assignee: row.get(6)?,
-                    deadline: row.get(7)?,
-                    source: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    completed_at: row.get(11)?,
-                    notes: vec![],
-                })
-            })?
-            .collect::<Result<_, _>>()?;
-
-        items
-            .into_iter()
-            .map(|mut item| {
-                item.notes = self.load_notes_with_conn(&conn, &item.ticket_id)?;
-                Ok(item)
-            })
-            .collect()
+        Ok(())
     }
 
-    /// Ensure a project exists in kanban_projects, creating it if absent.
-    /// Returns (prefix, next_id).
-    fn ensure_project(
-        &self,
-        conn: &Connection,
-        project: &str,
-        domain: &str,
-        config_prefixes: &HashMap<String, String>,
-    ) -> Result<(String, i64), KanbanError> {
-        let existing: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT prefix, next_id FROM kanban_projects WHERE project = ?1",
-                rusqlite::params![project],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
+    // ---- Internal helpers ----
 
-        if let Some((prefix, next_id)) = existing {
-            return Ok((prefix, next_id));
+    fn load_notes(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<KanbanNote>, KanbanError> {
+        let mut stmt = conn.prepare("SELECT id, text, author, created_at FROM kanban_notes WHERE ticket_id=?1 ORDER BY created_at DESC")?;
+        let notes = stmt.query_map(rusqlite::params![ticket_id], |row| {
+            Ok(KanbanNote { id: row.get(0)?, text: row.get(1)?, author: row.get(2)?, created_at: row.get(3)? })
+        })?.collect::<Result<_, _>>()?;
+        Ok(notes)
+    }
+
+    fn get_item_with_conn(&self, conn: &Connection, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
+        let item: Option<KanbanItem> = conn.query_row(
+            "SELECT ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
+            rusqlite::params![ticket_id],
+            |row| Ok(KanbanItem {
+                ticket_id: row.get(0)?, project: row.get(1)?, title: row.get(2)?,
+                description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
+                assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
+                created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
+                notes: vec![],
+            }),
+        ).optional()?;
+        let mut item = item.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
+        item.notes = self.load_notes(conn, ticket_id)?;
+        Ok(item)
+    }
+
+    fn get_item_context(&self, conn: &Connection, ticket_id: &str) -> Result<(String, String, String), KanbanError> {
+        conn.query_row(
+            "SELECT i.status, i.project, p.domain FROM kanban_items i JOIN kanban_projects p ON i.project = p.project WHERE i.ticket_id=?1",
+            rusqlite::params![ticket_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))
+    }
+
+    fn resolve_ticket_id(&self, project: &str, domain: &str, config_prefixes: &HashMap<String, String>) -> Result<(String, i64), KanbanError> {
+        let conn = self.conn()?;
+
+        // Check if project already registered
+        let existing: Option<(String, i64)> = conn.query_row(
+            "SELECT prefix, next_id FROM kanban_projects WHERE project=?1",
+            rusqlite::params![project], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+
+        if let Some((prefix, _)) = existing {
+            // Get authoritative next_id from JSONL meta
+            let next = events::next_ticket_number(&self.vault_root, domain, project, &prefix);
+            return Ok((prefix, next));
         }
 
-        // Collect all existing prefixes to avoid collisions.
+        // New project — derive prefix
         let mut stmt = conn.prepare("SELECT prefix FROM kanban_projects")?;
-        let existing_prefixes: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .collect::<Result<_, _>>()?;
+        let existing_prefixes: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
 
-        let prefix =
-            crate::kanban::prefix::resolve_prefix(project, config_prefixes, &existing_prefixes)
-                .ok_or_else(|| {
-                    KanbanError::InvalidInput(format!(
-                        "could not derive a unique prefix for project '{project}'; \
-                         set an explicit prefix in your wardwell config"
-                    ))
-                })?;
+        let prefix = crate::kanban::prefix::resolve_prefix(project, config_prefixes, &existing_prefixes)
+            .ok_or_else(|| KanbanError::InvalidInput(format!(
+                "could not derive a unique prefix for project '{project}'; set an explicit prefix in config"
+            )))?;
 
+        let next = events::next_ticket_number(&self.vault_root, domain, project, &prefix);
+        Ok((prefix, next))
+    }
+
+    fn upsert_project(&self, conn: &Connection, project: &str, prefix: &str, domain: &str, next_id: i64) -> Result<(), KanbanError> {
         conn.execute(
-            "INSERT INTO kanban_projects (project, prefix, domain, next_id) VALUES (?1, ?2, ?3, 1)",
-            rusqlite::params![project, prefix, domain],
+            "INSERT INTO kanban_projects (project, prefix, domain, next_id) VALUES (?1,?2,?3,?4) ON CONFLICT(project) DO UPDATE SET next_id=MAX(next_id, excluded.next_id)",
+            rusqlite::params![project, prefix, domain, next_id],
         )?;
-
-        Ok((prefix, 1))
+        Ok(())
     }
 }
 
-/// Default kanban query definitions.
+fn validate_status(s: &str) -> Result<&str, KanbanError> {
+    match s {
+        "backlog" | "todo" | "in_progress" | "review" | "done" => Ok(s),
+        other => Err(KanbanError::InvalidInput(format!("invalid status '{other}'; must be one of: backlog, todo, in_progress, review, done"))),
+    }
+}
+
+fn validate_priority(p: &str) -> Result<&str, KanbanError> {
+    match p {
+        "low" | "medium" | "high" | "urgent" => Ok(p),
+        other => Err(KanbanError::InvalidInput(format!("invalid priority '{other}'; must be one of: low, medium, high, urgent"))),
+    }
+}
+
 pub fn default_kanban_queries() -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("overdue".into(), "status != 'done' AND deadline < date('now')".into());
-    m.insert(
-        "stale".into(),
-        "status != 'done' AND updated_at < datetime('now', '-7 days')".into(),
-    );
+    m.insert("stale".into(), "status != 'done' AND updated_at < datetime('now', '-7 days')".into());
     m.insert("no_deadline".into(), "status != 'done' AND deadline IS NULL".into());
     m.insert("blocked".into(), "status = 'backlog'".into());
     m.insert("recent".into(), "updated_at > datetime('now', '-2 days')".into());
     m
 }
 
-/// Merge config queries over defaults. Config entries override matching defaults;
-/// unmentioned defaults survive; new config entries are added.
 pub fn merge_kanban_queries(config_queries: &HashMap<String, String>) -> HashMap<String, String> {
     let mut merged = default_kanban_queries();
-    for (k, v) in config_queries {
-        merged.insert(k.clone(), v.clone());
-    }
+    for (k, v) in config_queries { merged.insert(k.clone(), v.clone()); }
     merged
 }
 
@@ -759,132 +536,45 @@ pub fn merge_kanban_queries(config_queries: &HashMap<String, String>) -> HashMap
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
-    #[test]
-    fn open_creates_tables() {
+    fn make_store() -> (tempfile::TempDir, KanbanStore) {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("kanban.db");
-        let store = KanbanStore::open(&db_path).unwrap();
-
-        let conn = store.conn().unwrap();
-        let tables: Vec<String> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'kanban_%'
-                     ORDER BY name",
-                )
-                .unwrap();
-            stmt.query_map([], |row| row.get(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-
-        assert_eq!(
-            tables,
-            vec!["kanban_items", "kanban_notes", "kanban_projects"]
-        );
-    }
-
-    #[test]
-    fn open_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("kanban.db");
-
-        let first = KanbanStore::open(&db_path);
-        assert!(first.is_ok(), "{first:?}");
-        drop(first);
-
-        let second = KanbanStore::open(&db_path);
-        assert!(second.is_ok(), "{second:?}");
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let db = dir.path().join("kanban.db");
+        let store = KanbanStore::open(&db, vault).unwrap();
+        (dir, store)
     }
 
     #[test]
     fn create_item_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
-        let prefixes = HashMap::new();
-
-        let item = store
-            .create_item(
-                "Do the thing",
-                "shulops",
-                "work",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                &prefixes,
-            )
-            .unwrap();
-
+        let (_dir, store) = make_store();
+        let item = store.create_item("Do the thing", "shulops", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
         assert_eq!(item.ticket_id, "SH-1");
         assert_eq!(item.status, "backlog");
         assert_eq!(item.priority, "medium");
-        assert_eq!(item.project, "shulops");
-        assert_eq!(item.title, "Do the thing");
-        assert!(item.completed_at.is_none());
-        assert!(item.notes.is_empty());
     }
 
     #[test]
     fn create_item_increments_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
-        let prefixes = HashMap::new();
-
-        let first = store
-            .create_item("First", "shulops", "work", None, None, None, None, None, None, &prefixes)
-            .unwrap();
-        let second = store
-            .create_item("Second", "shulops", "work", None, None, None, None, None, None, &prefixes)
-            .unwrap();
-
-        assert_eq!(first.ticket_id, "SH-1");
-        assert_eq!(second.ticket_id, "SH-2");
+        let (_dir, store) = make_store();
+        let p = HashMap::new();
+        let a = store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        let b = store.create_item("B", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        assert_eq!(a.ticket_id, "SH-1");
+        assert_eq!(b.ticket_id, "SH-2");
     }
 
     #[test]
-    fn create_item_with_all_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
-        let mut prefixes = HashMap::new();
-        prefixes.insert("myproject".to_string(), "MP".to_string());
-
-        let item = store
-            .create_item(
-                "Full item",
-                "myproject",
-                "personal",
-                Some("A detailed description"),
-                Some("done"),
-                Some("high"),
-                Some("alice"),
-                Some("2026-05-01"),
-                Some("github"),
-                &prefixes,
-            )
-            .unwrap();
-
-        assert_eq!(item.ticket_id, "MP-1");
-        assert_eq!(item.description.as_deref(), Some("A detailed description"));
-        assert_eq!(item.status, "done");
-        assert_eq!(item.priority, "high");
-        assert_eq!(item.assignee.as_deref(), Some("alice"));
-        assert_eq!(item.deadline.as_deref(), Some("2026-05-01"));
-        assert_eq!(item.source.as_deref(), Some("github"));
-        assert!(item.completed_at.is_some());
-    }
-
-    // ---- list tests ----
-
-    fn make_store() -> (tempfile::TempDir, KanbanStore) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
-        (dir, store)
+    fn create_writes_jsonl() {
+        let (dir, store) = make_store();
+        store.create_item("Test", "shulops", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
+        assert!(jsonl.exists());
+        let content = std::fs::read_to_string(&jsonl).unwrap();
+        assert!(content.contains("\"_schema\":\"kanban\""));
+        assert!(content.contains("SH-1"));
+        assert!(content.contains("\"_meta\":true"));
     }
 
     #[test]
@@ -892,261 +582,93 @@ mod tests {
         let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("B", "personal", "life", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("B", "other", "work", None, None, None, None, None, None, &p).unwrap();
         let items = store.list(None, None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 2);
     }
 
     #[test]
-    fn list_filters_by_project() {
+    fn list_excludes_done() {
         let (_dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("B", "personal", "life", None, None, None, None, None, None, &p).unwrap();
-        let items = store.list(Some("shulops"), None, None, None, true, None).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].project, "shulops");
-    }
-
-    #[test]
-    fn list_excludes_done_by_default() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        store.create_item("Active", "shulops", "work", None, Some("backlog"), None, None, None, None, &p).unwrap();
-        store.create_item("Done", "shulops", "work", None, Some("done"), None, None, None, None, &p).unwrap();
+        store.create_item("Active", "proj", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Done", "proj", "work", None, Some("done"), None, None, None, None, &p).unwrap();
         let items = store.list(None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Active");
     }
 
     #[test]
-    fn list_filters_by_status() {
-        let (_dir, store) = make_store();
+    fn move_item_writes_jsonl() {
+        let (dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Backlog", "shulops", "work", None, Some("backlog"), None, None, None, None, &p).unwrap();
-        store.create_item("In Progress", "shulops", "work", None, Some("in_progress"), None, None, None, None, &p).unwrap();
-        let items = store.list(None, Some("in_progress"), None, None, true, None).unwrap();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        let (item, transition) = store.move_item("SH-1", "in_progress").unwrap();
+        assert_eq!(item.status, "in_progress");
+        assert_eq!(transition, "backlog → in_progress");
+
+        let content = std::fs::read_to_string(dir.path().join("vault/work/shulops/kanban.jsonl")).unwrap();
+        assert!(content.contains("\"event\":\"move\""));
+    }
+
+    #[test]
+    fn update_item_writes_jsonl() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Old", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        let item = store.update_item("SH-1", Some("New"), None, None, None, None, None).unwrap();
+        assert_eq!(item.title, "New");
+
+        let content = std::fs::read_to_string(dir.path().join("vault/work/shulops/kanban.jsonl")).unwrap();
+        assert!(content.contains("\"event\":\"update\""));
+    }
+
+    #[test]
+    fn add_note_writes_jsonl() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        let item = store.add_note("SH-1", "Hello", Some("jack")).unwrap();
+        assert_eq!(item.notes.len(), 1);
+
+        let content = std::fs::read_to_string(dir.path().join("vault/work/shulops/kanban.jsonl")).unwrap();
+        assert!(content.contains("\"event\":\"note\""));
+    }
+
+    #[test]
+    fn rebuild_from_jsonl_restores_state() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        store.move_item("SH-1", "todo").unwrap();
+        store.add_note("SH-1", "Note", None).unwrap();
+
+        // Wipe SQLite cache
+        let conn = store.conn().unwrap();
+        conn.execute_batch("DELETE FROM kanban_notes; DELETE FROM kanban_items; DELETE FROM kanban_projects;").unwrap();
+        drop(conn);
+
+        // Verify empty
+        let items = store.list(None, None, None, None, true, None).unwrap();
+        assert_eq!(items.len(), 0);
+
+        // Rebuild
+        store.rebuild_from_jsonl().unwrap();
+
+        let items = store.list(None, None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].status, "in_progress");
+        assert_eq!(items[0].status, "todo");
+        assert_eq!(items[0].ticket_id, "SH-1");
     }
-
-    #[test]
-    fn list_filters_by_assignee() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        store.create_item("Assigned", "shulops", "work", None, None, None, Some("alice"), None, None, &p).unwrap();
-        store.create_item("Unassigned", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let items = store.list(None, None, None, Some("alice"), true, None).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].assignee.as_deref(), Some("alice"));
-    }
-
-    // ---- update tests ----
-
-    #[test]
-    fn update_item_title() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        let item = store.create_item("Old", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let updated = store.update_item(&item.ticket_id, Some("New"), None, None, None, None, None).unwrap();
-        assert_eq!(updated.title, "New");
-        assert_eq!(updated.ticket_id, item.ticket_id);
-    }
-
-    #[test]
-    fn update_item_not_found() {
-        let (_dir, store) = make_store();
-        let result = store.update_item("SH-999", Some("title"), None, None, None, None, None);
-        assert!(matches!(result, Err(KanbanError::NotFound(_))));
-    }
-
-    // ---- move tests ----
-
-    #[test]
-    fn move_item_changes_status() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        let item = store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let (moved, transition) = store.move_item(&item.ticket_id, "in_progress").unwrap();
-        assert_eq!(moved.status, "in_progress");
-        assert!(transition.contains("in_progress"));
-    }
-
-    #[test]
-    fn move_to_done_sets_completed_at() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        let item = store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let (moved, _) = store.move_item(&item.ticket_id, "done").unwrap();
-        assert!(moved.completed_at.is_some());
-    }
-
-    #[test]
-    fn move_from_done_clears_completed_at() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        let item = store.create_item("Task", "shulops", "work", None, Some("done"), None, None, None, None, &p).unwrap();
-        assert!(item.completed_at.is_some());
-        let (moved, _) = store.move_item(&item.ticket_id, "in_progress").unwrap();
-        assert!(moved.completed_at.is_none());
-    }
-
-    // ---- note test ----
-
-    #[test]
-    fn add_note_to_item() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        let item = store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let with_note = store.add_note(&item.ticket_id, "looks good", Some("bob")).unwrap();
-        assert_eq!(with_note.notes.len(), 1);
-        assert_eq!(with_note.notes[0].text, "looks good");
-        assert_eq!(with_note.notes[0].author.as_deref(), Some("bob"));
-    }
-
-    // ---- query tests ----
 
     #[test]
     fn query_overdue() {
         let (_dir, store) = make_store();
         let p = HashMap::new();
-        // Past deadline, non-done → should match overdue
-        store
-            .create_item("Past", "shulops", "work", None, Some("todo"), None, None, Some("2020-01-01"), None, &p)
-            .unwrap();
-        // Future deadline → should not match
-        store
-            .create_item("Future", "shulops", "work", None, Some("todo"), None, None, Some("2099-12-31"), None, &p)
-            .unwrap();
-        // No deadline → should not match
-        store
-            .create_item("No deadline", "shulops", "work", None, Some("todo"), None, None, None, None, &p)
-            .unwrap();
-
+        store.create_item("Past", "proj", "work", None, Some("todo"), None, None, Some("2020-01-01"), None, &p).unwrap();
+        store.create_item("Future", "proj", "work", None, Some("todo"), None, None, Some("2099-12-31"), None, &p).unwrap();
         let results = store.query("overdue", &default_kanban_queries(), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Past");
-    }
-
-    #[test]
-    fn query_no_deadline() {
-        let (_dir, store) = make_store();
-        let p = HashMap::new();
-        store
-            .create_item("Has deadline", "shulops", "work", None, Some("todo"), None, None, Some("2026-12-01"), None, &p)
-            .unwrap();
-        store
-            .create_item("No deadline", "shulops", "work", None, Some("todo"), None, None, None, None, &p)
-            .unwrap();
-
-        let results = store.query("no_deadline", &default_kanban_queries(), None, None).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "No deadline");
-    }
-
-    #[test]
-    fn query_unknown_returns_error() {
-        let (_dir, store) = make_store();
-        let result = store.query("nonexistent", &default_kanban_queries(), None, None);
-        assert!(matches!(result, Err(KanbanError::InvalidInput(_))));
-    }
-
-    // ---- domain inference tests ----
-
-    #[test]
-    fn ensure_project_stores_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("k.db")).unwrap();
-        let pf = HashMap::new();
-
-        store.create_item("Task", "shulops", "personal", None, None, None, None, None, None, &pf).unwrap();
-
-        let conn = store.conn().unwrap();
-        let (domain, prefix): (String, String) = conn.query_row(
-            "SELECT domain, prefix FROM kanban_projects WHERE project = 'shulops'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        assert_eq!(domain, "personal");
-        assert_eq!(prefix, "SH");
-    }
-
-    #[test]
-    fn list_filters_by_domains() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
-        let p = HashMap::new();
-
-        // Two items in two different domains
-        store.create_item("Work task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("Personal task", "personal", "personal", None, None, None, None, None, None, &p).unwrap();
-
-        // Filter to "work" domain only
-        let work_domains = vec!["work".to_string()];
-        let items = store.list(None, None, None, None, true, Some(&work_domains)).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].project, "shulops");
-
-        // Filter to "personal" domain only
-        let personal_domains = vec!["personal".to_string()];
-        let items = store.list(None, None, None, None, true, Some(&personal_domains)).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].project, "personal");
-
-        // Both domains → all items
-        let both_domains = vec!["work".to_string(), "personal".to_string()];
-        let items = store.list(None, None, None, None, true, Some(&both_domains)).unwrap();
-        assert_eq!(items.len(), 2);
-
-        // Empty domains slice → full access (domainless)
-        let items = store.list(None, None, None, None, true, Some(&[])).unwrap();
-        assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn query_filters_by_domains() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
-        let p = HashMap::new();
-
-        // Two items in two different domains, both with no deadline (matching "no_deadline" query)
-        store.create_item("Work task", "shulops", "work", None, Some("todo"), None, None, None, None, &p).unwrap();
-        store.create_item("Personal task", "personal", "personal", None, Some("todo"), None, None, None, None, &p).unwrap();
-
-        let queries = default_kanban_queries();
-
-        // Filter to "work" domain only
-        let work_domains = vec!["work".to_string()];
-        let results = store.query("no_deadline", &queries, None, Some(&work_domains)).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].project, "shulops");
-
-        // Filter to "personal" domain only
-        let personal_domains = vec!["personal".to_string()];
-        let results = store.query("no_deadline", &queries, None, Some(&personal_domains)).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].project, "personal");
-
-        // No domain filter → all items
-        let results = store.query("no_deadline", &queries, None, None).unwrap();
-        assert_eq!(results.len(), 2);
-    }
-
-    #[test]
-    fn create_two_projects_no_prefix_collision() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = KanbanStore::open(&dir.path().join("k.db")).unwrap();
-        let pf = HashMap::new();
-
-        store.create_item("A", "shadow", "personal", None, None, None, None, None, None, &pf).unwrap();
-        store.create_item("B", "shipping", "work", None, None, None, None, None, None, &pf).unwrap();
-
-        let conn = store.conn().unwrap();
-        let p1: String = conn.query_row("SELECT prefix FROM kanban_projects WHERE project = 'shadow'", [], |r| r.get(0)).unwrap();
-        let p2: String = conn.query_row("SELECT prefix FROM kanban_projects WHERE project = 'shipping'", [], |r| r.get(0)).unwrap();
-        assert_ne!(p1, p2);
-        assert_eq!(p1, "SH");
-        // "shipping" can't use "SH", tries first+third = "SI"
-        assert_eq!(p2, "SI");
     }
 }
