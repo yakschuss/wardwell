@@ -15,6 +15,12 @@ pub struct WardwellConfig {
     pub ai: AiConfig,
     /// Whether the stop hook prompts for session logging. Defaults to true.
     pub stop_hook: bool,
+    /// Whether the kanban MCP tool is enabled. Defaults to false.
+    pub kanban_enabled: bool,
+    /// Named FTS queries for kanban columns (column name → query string).
+    pub kanban_queries: HashMap<String, String>,
+    /// Prefix mappings for kanban item display (prefix → label).
+    pub kanban_prefixes: HashMap<String, String>,
 }
 
 /// AI configuration for session summarization.
@@ -58,6 +64,8 @@ struct RawConfig {
     ai: Option<RawAiConfig>,
     #[serde(default = "default_true")]
     stop_hook: bool,
+    #[serde(default)]
+    kanban: Option<RawKanbanConfig>,
 }
 
 fn default_true() -> bool {
@@ -71,6 +79,16 @@ struct RawDomainEntry {
     aliases: HashMap<String, String>,
     #[serde(default)]
     can_read: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawKanbanConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    queries: HashMap<String, String>,
+    #[serde(default)]
+    prefixes: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +158,11 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         None => AiConfig::default(),
     };
 
+    let (kanban_enabled, kanban_queries, kanban_prefixes) = match raw.kanban {
+        Some(k) => (k.enabled, k.queries, k.prefixes),
+        None => (false, HashMap::new(), HashMap::new()),
+    };
+
     Ok(WardwellConfig {
         vault_path,
         registry,
@@ -147,6 +170,9 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         exclude,
         ai,
         stop_hook: raw.stop_hook,
+        kanban_enabled,
+        kanban_queries,
+        kanban_prefixes,
     })
 }
 
@@ -277,5 +303,56 @@ another_unknown:
         let f = write_config(yaml).unwrap();
         let config = load(Some(f.path()));
         assert!(config.is_ok(), "{config:?}");
+    }
+
+    #[test]
+    fn kanban_absent_defaults_to_disabled() {
+        let yaml = r#"
+vault_path: /tmp/test-vault
+session_sources: []
+"#;
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert!(!config.kanban_enabled);
+        assert!(config.kanban_queries.is_empty());
+        assert!(config.kanban_prefixes.is_empty());
+    }
+
+    #[test]
+    fn kanban_minimal_section() {
+        let yaml = r#"
+vault_path: /tmp/test-vault
+session_sources: []
+kanban:
+  enabled: true
+"#;
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert!(config.kanban_enabled);
+        assert!(config.kanban_queries.is_empty());
+        assert!(config.kanban_prefixes.is_empty());
+    }
+
+    #[test]
+    fn kanban_full_section() {
+        let yaml = r#"
+vault_path: /tmp/test-vault
+session_sources: []
+kanban:
+  enabled: true
+  queries:
+    backlog: "status:backlog"
+    active: "status:active type:project"
+  prefixes:
+    "P-": project
+    "T-": task
+"#;
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert!(config.kanban_enabled);
+        assert_eq!(config.kanban_queries.get("backlog").unwrap(), "status:backlog");
+        assert_eq!(config.kanban_queries.get("active").unwrap(), "status:active type:project");
+        assert_eq!(config.kanban_prefixes.get("P-").unwrap(), "project");
+        assert_eq!(config.kanban_prefixes.get("T-").unwrap(), "task");
     }
 }

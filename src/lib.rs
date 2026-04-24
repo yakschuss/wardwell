@@ -7,3 +7,4 @@ pub mod mcp;
 pub mod inject;
 pub mod install;
 pub mod daemon;
+pub mod kanban;

@@ -139,8 +139,24 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
         }
     });
 
+    let kanban = if config.kanban_enabled {
+        let kanban_path = config_dir.join("kanban.db");
+        match wardwell::kanban::store::KanbanStore::open(&kanban_path) {
+            Ok(k) => {
+                eprintln!("wardwell: kanban enabled");
+                Some(k)
+            }
+            Err(e) => {
+                eprintln!("wardwell: kanban db error (disabled): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     eprintln!("wardwell: starting MCP server");
-    let server = WardwellServer::new(config, Arc::clone(&index), embedder, domain);
+    let server = WardwellServer::new(config, Arc::clone(&index), embedder, domain, kanban);
     let shared_registry = server.registry.clone();
 
     // Spawn vault file watcher for vault + sources

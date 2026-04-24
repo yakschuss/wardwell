@@ -30,6 +30,8 @@ pub struct WardwellServer {
     session_domain: Option<String>,
     /// session_domain + its can_read list. Empty = domainless mode (full access).
     allowed_domains: Vec<String>,
+    kanban: Option<Arc<crate::kanban::store::KanbanStore>>,
+    kanban_queries: std::collections::HashMap<String, String>,
 }
 
 // -- Tool parameter types --
@@ -116,9 +118,41 @@ pub struct ClipboardParams {
     pub content: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KanbanParams {
+    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required).")]
+    pub action: String,
+    #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note.")]
+    pub ticket_id: Option<String>,
+    #[schemars(description = "Project slug (e.g., 'shulops'). Required for create. Optional filter for list, query.")]
+    pub project: Option<String>,
+    #[schemars(description = "Vault domain (e.g., 'personal'). Optional for create — inferred from project directory if omitted.")]
+    pub domain: Option<String>,
+    #[schemars(description = "Item title. Required for create. Optional for update.")]
+    pub title: Option<String>,
+    #[schemars(description = "Item description/details.")]
+    pub description: Option<String>,
+    #[schemars(description = "Status: backlog, todo, in_progress, review, done. For move: target status. For list: filter.")]
+    pub status: Option<String>,
+    #[schemars(description = "Priority: low, medium, high, urgent.")]
+    pub priority: Option<String>,
+    #[schemars(description = "Who is responsible for this item.")]
+    pub assignee: Option<String>,
+    #[schemars(description = "ISO date deadline (e.g., '2026-05-01').")]
+    pub deadline: Option<String>,
+    #[schemars(description = "Who created this item (e.g., 'hank', 'manual', 'cmo').")]
+    pub source: Option<String>,
+    #[schemars(description = "Note text. Required for note action.")]
+    pub text: Option<String>,
+    #[schemars(description = "Include completed items in list results. Default false.")]
+    pub include_done: Option<bool>,
+    #[schemars(description = "Named query to run (e.g., 'overdue', 'stale', 'no_deadline', 'blocked', 'recent').")]
+    pub question: Option<String>,
+}
+
 #[tool_router(router = tool_router)]
 impl WardwellServer {
-    pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>, domain: Option<String>) -> Self {
+    pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>, domain: Option<String>, kanban: Option<crate::kanban::store::KanbanStore>) -> Self {
         let vault_root = config.vault_path.clone();
         let raw_registry = DomainRegistry::from_domains(config.registry.all().to_vec());
 
@@ -157,8 +191,24 @@ impl WardwellServer {
 
         let registry = Arc::new(RwLock::new(raw_registry));
 
+        let kanban_queries = crate::kanban::store::merge_kanban_queries(&config.kanban_queries);
+
+        // Validate query WHERE clauses at startup so bad config fails fast.
+        if let Some(ref k) = kanban
+            && let Err(e) = k.validate_queries(&kanban_queries)
+        {
+            eprintln!("wardwell: kanban query validation failed — {e}");
+            std::process::exit(1);
+        }
+
+        let mut tool_router = Self::tool_router();
+        if kanban.is_none() {
+            tool_router.remove_route("wardwell_kanban");
+        }
+        let kanban = kanban.map(Arc::new);
+
         Self {
-            tool_router: Self::tool_router(),
+            tool_router,
             config: Arc::new(config),
             index,
             vault_root,
@@ -168,6 +218,8 @@ impl WardwellServer {
             embedder,
             session_domain,
             allowed_domains,
+            kanban,
+            kanban_queries,
         }
     }
 
@@ -237,6 +289,23 @@ impl WardwellServer {
                 "bytes": bytes,
             })).unwrap_or_default(),
             Err(e) => json_error(&format!("Clipboard failed: {e}")),
+        }
+    }
+
+    #[tool(description = "Project kanban board. Create, update, move, and query work items across projects. Items have ticket IDs (e.g., SH-3), status (backlog->todo->in_progress->review->done), priority, assignee, deadline, and notes.")]
+    async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
+        let Some(ref kanban) = self.kanban else {
+            return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
+        };
+        let p = params.0;
+        match p.action.as_str() {
+            "list" => self.kanban_list(kanban, &p),
+            "create" => self.kanban_create(kanban, &p),
+            "update" => self.kanban_update(kanban, &p),
+            "move" => self.kanban_move(kanban, &p),
+            "note" => self.kanban_note(kanban, &p),
+            "query" => self.kanban_query(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: list, create, update, move, note, query")),
         }
     }
 }
@@ -1786,16 +1855,235 @@ impl WardwellServer {
     }
 }
 
+// Kanban action handlers
+impl WardwellServer {
+    fn check_kanban_domain_access(&self, domain: &str) -> Result<(), String> {
+        if self.allowed_domains.is_empty() {
+            return Ok(()); // domainless mode — full access
+        }
+        if self.allowed_domains.contains(&domain.to_string()) {
+            Ok(())
+        } else {
+            Err(format!("domain '{}' not in allowed domains for this session", domain))
+        }
+    }
+
+    fn kanban_list(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let domains = if self.allowed_domains.is_empty() {
+            None
+        } else {
+            Some(self.allowed_domains.as_slice())
+        };
+        match kanban.list(
+            p.project.as_deref(),
+            p.status.as_deref(),
+            p.priority.as_deref(),
+            p.assignee.as_deref(),
+            p.include_done.unwrap_or(false),
+            domains,
+        ) {
+            Ok(items) => {
+                let total = items.len();
+                serde_json::to_string(&serde_json::json!({
+                    "items": items, "total": total, "returned": total,
+                })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_create(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref title) = p.title else {
+            return json_error("'title' is required for create");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for create");
+        };
+
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!(
+                    "cannot infer domain for project '{}'. Pass 'domain' explicitly.", project
+                )),
+            },
+        };
+
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
+        match kanban.create_item(
+            title, project, &domain,
+            p.description.as_deref(), p.status.as_deref(), p.priority.as_deref(),
+            p.assignee.as_deref(), p.deadline.as_deref(), p.source.as_deref(),
+            &self.config.kanban_prefixes,
+        ) {
+            Ok(item) => {
+                let mut audit_line = format!("{} created: {} [{}]", item.ticket_id, item.title, item.status);
+                if item.priority != "medium" {
+                    audit_line.push_str(&format!(" ⚡{}", item.priority));
+                }
+                if let Some(ref dl) = item.deadline {
+                    // Format deadline as MM/DD from ISO date (YYYY-MM-DD or RFC3339)
+                    let short_dl = dl.get(5..10)
+                        .map(|s| s.replace('-', "/"))
+                        .unwrap_or_else(|| dl.clone());
+                    audit_line.push_str(&format!(" 📅{short_dl}"));
+                }
+                let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
+                serde_json::to_string(&serde_json::json!({ "created": true, "item": item })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_update(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for update");
+        };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom)
+        {
+            return json_error(&e);
+        }
+        match kanban.update_item(
+            ticket_id, p.title.as_deref(), p.description.as_deref(),
+            p.status.as_deref(), p.priority.as_deref(), p.assignee.as_deref(), p.deadline.as_deref(),
+        ) {
+            Ok(item) => {
+                let mut changes = Vec::new();
+                if p.title.is_some() { changes.push("title".to_string()); }
+                if p.description.is_some() { changes.push("description".to_string()); }
+                if p.status.is_some() { changes.push("status".to_string()); }
+                if p.priority.is_some() { changes.push("priority".to_string()); }
+                if p.assignee.is_some() { changes.push("assignee".to_string()); }
+                if let Some(ref dl) = p.deadline {
+                    let short_dl = dl.get(5..10)
+                        .map(|s| s.replace('-', "/"))
+                        .unwrap_or_else(|| dl.clone());
+                    changes.push(format!("📅{short_dl}"));
+                }
+                let audit_line = format!("{ticket_id} updated: {}", changes.join(", "));
+                if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
+                    let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
+                }
+                serde_json::to_string(&serde_json::json!({ "updated": true, "item": item })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_move(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for move");
+        };
+        let Some(ref status) = p.status else {
+            return json_error("'status' is required for move");
+        };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom)
+        {
+            return json_error(&e);
+        }
+        match kanban.move_item(ticket_id, status) {
+            Ok((item, transition)) => {
+                let audit_line = format!("{ticket_id} → {status}");
+                if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
+                    let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
+                }
+                serde_json::to_string(&serde_json::json!({ "moved": true, "item": item, "transition": transition })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_note(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for note");
+        };
+        let Some(ref text) = p.text else {
+            return json_error("'text' is required for note");
+        };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom)
+        {
+            return json_error(&e);
+        }
+        match kanban.add_note(ticket_id, text, p.source.as_deref()) {
+            Ok(item) => {
+                let audit_line = format!("{ticket_id} note: \"{text}\"");
+                if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
+                    let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
+                }
+                serde_json::to_string(&serde_json::json!({ "noted": true, "item": item })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_query(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref question) = p.question else {
+            return json_error("'question' is required for query");
+        };
+        let domains = if self.allowed_domains.is_empty() {
+            None
+        } else {
+            Some(self.allowed_domains.as_slice())
+        };
+        match kanban.query(question, &self.kanban_queries, p.project.as_deref(), domains) {
+            Ok(items) => {
+                let total = items.len();
+                serde_json::to_string(&serde_json::json!({
+                    "items": items, "total": total, "returned": total,
+                })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn infer_domain_for_project(&self, project: &str) -> Option<String> {
+        let registry = self.registry.blocking_read();
+        for domain in registry.all() {
+            let domain_name = domain.name.as_str();
+            let project_dir = self.vault_root.join(domain_name).join(project);
+            if project_dir.exists() {
+                return Some(domain_name.to_string());
+            }
+        }
+        None
+    }
+
+    fn lookup_item_domain(&self, kanban: &crate::kanban::store::KanbanStore, ticket_id: &str) -> Option<(String, String)> {
+        let conn = kanban.conn().ok()?;
+        conn.query_row(
+            "SELECT p.domain, i.project FROM kanban_items i JOIN kanban_projects p ON i.project = p.project WHERE i.ticket_id = ?1",
+            rusqlite::params![ticket_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).ok()
+    }
+}
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for WardwellServer {
     fn get_info(&self) -> ServerInfo {
-        let instructions =
+        let instructions = if self.kanban.is_some() {
+            "Wardwell: Personal AI knowledge vault. Four tools: \
+             wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
+             search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
+             wardwell_write (action: sync|decide|append_history|lesson|append), \
+             wardwell_clipboard (copy to clipboard, ask first), \
+             wardwell_kanban (action: list|create|update|move|note|query — project kanban board with tickets, statuses, priorities, deadlines)."
+                .to_string()
+        } else {
             "Wardwell: Personal AI knowledge vault. Three tools: \
              wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append), \
              wardwell_clipboard (copy to clipboard, ask first)."
-                .to_string();
+                .to_string()
+        };
 
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
@@ -2161,8 +2449,11 @@ mod tests {
             exclude: vec![],
             ai: Default::default(),
             stop_hook: true,
+            kanban_enabled: false,
+            kanban_queries: std::collections::HashMap::new(),
+            kanban_prefixes: std::collections::HashMap::new(),
         };
-        WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None)
+        WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None, None)
     }
 
     #[test]
