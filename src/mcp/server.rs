@@ -1849,13 +1849,30 @@ impl WardwellServer {
 
 // Kanban action handlers
 impl WardwellServer {
+    fn check_kanban_domain_access(&self, domain: &str) -> Result<(), String> {
+        if self.allowed_domains.is_empty() {
+            return Ok(()); // domainless mode — full access
+        }
+        if self.allowed_domains.contains(&domain.to_string()) {
+            Ok(())
+        } else {
+            Err(format!("domain '{}' not in allowed domains for this session", domain))
+        }
+    }
+
     fn kanban_list(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let domains = if self.allowed_domains.is_empty() {
+            None
+        } else {
+            Some(self.allowed_domains.as_slice())
+        };
         match kanban.list(
             p.project.as_deref(),
             p.status.as_deref(),
             p.priority.as_deref(),
             p.assignee.as_deref(),
             p.include_done.unwrap_or(false),
+            domains,
         ) {
             Ok(items) => {
                 let total = items.len();
@@ -1885,6 +1902,10 @@ impl WardwellServer {
             },
         };
 
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
         match kanban.create_item(
             title, project, &domain,
             p.description.as_deref(), p.status.as_deref(), p.priority.as_deref(),
@@ -1910,6 +1931,11 @@ impl WardwellServer {
         let Some(ref ticket_id) = p.ticket_id else {
             return json_error("'ticket_id' is required for update");
         };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom)
+        {
+            return json_error(&e);
+        }
         match kanban.update_item(
             ticket_id, p.title.as_deref(), p.description.as_deref(),
             p.status.as_deref(), p.priority.as_deref(), p.assignee.as_deref(), p.deadline.as_deref(),
@@ -1939,6 +1965,11 @@ impl WardwellServer {
         let Some(ref status) = p.status else {
             return json_error("'status' is required for move");
         };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom)
+        {
+            return json_error(&e);
+        }
         match kanban.move_item(ticket_id, status) {
             Ok((item, transition)) => {
                 let audit_line = format!("{ticket_id} -> {status}");
@@ -1958,6 +1989,11 @@ impl WardwellServer {
         let Some(ref text) = p.text else {
             return json_error("'text' is required for note");
         };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom)
+        {
+            return json_error(&e);
+        }
         match kanban.add_note(ticket_id, text, p.source.as_deref()) {
             Ok(item) => {
                 let audit_line = format!("{ticket_id} note: \"{text}\"");
@@ -1974,7 +2010,12 @@ impl WardwellServer {
         let Some(ref question) = p.question else {
             return json_error("'question' is required for query");
         };
-        match kanban.query(question, &self.kanban_queries) {
+        let domains = if self.allowed_domains.is_empty() {
+            None
+        } else {
+            Some(self.allowed_domains.as_slice())
+        };
+        match kanban.query(question, &self.kanban_queries, p.project.as_deref(), domains) {
             Ok(items) => {
                 let total = items.len();
                 serde_json::to_string(&serde_json::json!({

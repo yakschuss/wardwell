@@ -202,6 +202,7 @@ impl KanbanStore {
         priority: Option<&str>,
         assignee: Option<&str>,
         include_done: bool,
+        domains: Option<&[String]>,
     ) -> Result<Vec<KanbanItem>, KanbanError> {
         let conn = self.conn()?;
 
@@ -209,28 +210,47 @@ impl KanbanStore {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
         let mut param_idx = 1usize;
 
+        // Domain filter: join with kanban_projects and restrict by domain IN (...)
+        let use_domain_filter = domains.map(|d| !d.is_empty()).unwrap_or(false);
+        let from_clause = if use_domain_filter {
+            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
+        } else {
+            "FROM kanban_items"
+        };
+
+        if use_domain_filter
+            && let Some(domain_list) = domains
+        {
+            let placeholders: Vec<String> =
+                domain_list.iter().map(|_| { let s = format!("?{param_idx}"); param_idx += 1; s }).collect();
+            conditions.push(format!("p.domain IN ({})", placeholders.join(", ")));
+            for d in domain_list {
+                params.push(Box::new(d.clone()));
+            }
+        }
+
         if !include_done {
-            conditions.push(format!("status != ?{param_idx}"));
+            conditions.push(format!("kanban_items.status != ?{param_idx}"));
             params.push(Box::new("done".to_string()));
             param_idx += 1;
         }
         if let Some(p) = project {
-            conditions.push(format!("project = ?{param_idx}"));
+            conditions.push(format!("kanban_items.project = ?{param_idx}"));
             params.push(Box::new(p.to_string()));
             param_idx += 1;
         }
         if let Some(s) = status {
-            conditions.push(format!("status = ?{param_idx}"));
+            conditions.push(format!("kanban_items.status = ?{param_idx}"));
             params.push(Box::new(s.to_string()));
             param_idx += 1;
         }
         if let Some(p) = priority {
-            conditions.push(format!("priority = ?{param_idx}"));
+            conditions.push(format!("kanban_items.priority = ?{param_idx}"));
             params.push(Box::new(p.to_string()));
             param_idx += 1;
         }
         if let Some(a) = assignee {
-            conditions.push(format!("assignee = ?{param_idx}"));
+            conditions.push(format!("kanban_items.assignee = ?{param_idx}"));
             params.push(Box::new(a.to_string()));
             // param_idx would increment here but it's the last use
             let _ = param_idx;
@@ -243,19 +263,21 @@ impl KanbanStore {
         };
 
         let sql = format!(
-            "SELECT ticket_id, project, title, description, status, priority,
-                    assignee, deadline, source, created_at, updated_at, completed_at
-             FROM kanban_items
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description,
+                    kanban_items.status, kanban_items.priority,
+                    kanban_items.assignee, kanban_items.deadline, kanban_items.source,
+                    kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at
+             {from_clause}
              {where_clause}
              ORDER BY
-                CASE priority
+                CASE kanban_items.priority
                     WHEN 'urgent' THEN 0
                     WHEN 'high'   THEN 1
                     WHEN 'medium' THEN 2
                     WHEN 'low'    THEN 3
                     ELSE 4
                 END,
-                updated_at DESC"
+                kanban_items.updated_at DESC"
         );
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -558,8 +580,10 @@ impl KanbanStore {
         &self,
         question: &str,
         queries: &HashMap<String, String>,
+        project: Option<&str>,
+        domains: Option<&[String]>,
     ) -> Result<Vec<KanbanItem>, KanbanError> {
-        let where_clause = queries.get(question).ok_or_else(|| {
+        let named_where = queries.get(question).ok_or_else(|| {
             let mut names: Vec<&str> = queries.keys().map(String::as_str).collect();
             names.sort();
             KanbanError::InvalidInput(format!(
@@ -568,18 +592,57 @@ impl KanbanStore {
             ))
         })?;
 
+        let use_domain_filter = domains.map(|d| !d.is_empty()).unwrap_or(false);
+        let from_clause = if use_domain_filter {
+            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
+        } else {
+            "FROM kanban_items"
+        };
+
+        let mut extra_conditions: Vec<String> = vec![];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+        let mut param_idx = 1usize;
+
+        if use_domain_filter
+            && let Some(domain_list) = domains
+        {
+            let placeholders: Vec<String> =
+                domain_list.iter().map(|_| { let s = format!("?{param_idx}"); param_idx += 1; s }).collect();
+            extra_conditions.push(format!("p.domain IN ({})", placeholders.join(", ")));
+            for d in domain_list {
+                params.push(Box::new(d.clone()));
+            }
+        }
+
+        if let Some(proj) = project {
+            extra_conditions.push(format!("kanban_items.project = ?{param_idx}"));
+            params.push(Box::new(proj.to_string()));
+            // param_idx would increment but it's the last use
+            let _ = param_idx;
+        }
+
+        let where_clause = if extra_conditions.is_empty() {
+            format!("WHERE {named_where}")
+        } else {
+            format!("WHERE ({named_where}) AND {}", extra_conditions.join(" AND "))
+        };
+
         let sql = format!(
-            "SELECT ticket_id, project, title, description, status, priority,
-                    assignee, deadline, source, created_at, updated_at, completed_at
-             FROM kanban_items
-             WHERE {where_clause}
-             ORDER BY updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description,
+                    kanban_items.status, kanban_items.priority,
+                    kanban_items.assignee, kanban_items.deadline, kanban_items.source,
+                    kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at
+             {from_clause}
+             {where_clause}
+             ORDER BY kanban_items.updated_at DESC"
         );
 
         let conn = self.conn()?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let items: Vec<KanbanItem> = stmt
-            .query_map([], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok(KanbanItem {
                     ticket_id: row.get(0)?,
                     project: row.get(1)?,
@@ -813,7 +876,7 @@ mod tests {
         let p = HashMap::new();
         store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         store.create_item("B", "personal", "life", None, None, None, None, None, None, &p).unwrap();
-        let items = store.list(None, None, None, None, true).unwrap();
+        let items = store.list(None, None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -823,7 +886,7 @@ mod tests {
         let p = HashMap::new();
         store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         store.create_item("B", "personal", "life", None, None, None, None, None, None, &p).unwrap();
-        let items = store.list(Some("shulops"), None, None, None, true).unwrap();
+        let items = store.list(Some("shulops"), None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].project, "shulops");
     }
@@ -834,7 +897,7 @@ mod tests {
         let p = HashMap::new();
         store.create_item("Active", "shulops", "work", None, Some("backlog"), None, None, None, None, &p).unwrap();
         store.create_item("Done", "shulops", "work", None, Some("done"), None, None, None, None, &p).unwrap();
-        let items = store.list(None, None, None, None, false).unwrap();
+        let items = store.list(None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Active");
     }
@@ -845,7 +908,7 @@ mod tests {
         let p = HashMap::new();
         store.create_item("Backlog", "shulops", "work", None, Some("backlog"), None, None, None, None, &p).unwrap();
         store.create_item("In Progress", "shulops", "work", None, Some("in_progress"), None, None, None, None, &p).unwrap();
-        let items = store.list(None, Some("in_progress"), None, None, true).unwrap();
+        let items = store.list(None, Some("in_progress"), None, None, true, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "in_progress");
     }
@@ -856,7 +919,7 @@ mod tests {
         let p = HashMap::new();
         store.create_item("Assigned", "shulops", "work", None, None, None, Some("alice"), None, None, &p).unwrap();
         store.create_item("Unassigned", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let items = store.list(None, None, None, Some("alice"), true).unwrap();
+        let items = store.list(None, None, None, Some("alice"), true, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].assignee.as_deref(), Some("alice"));
     }
@@ -943,7 +1006,7 @@ mod tests {
             .create_item("No deadline", "shulops", "work", None, Some("todo"), None, None, None, None, &p)
             .unwrap();
 
-        let results = store.query("overdue", &default_kanban_queries()).unwrap();
+        let results = store.query("overdue", &default_kanban_queries(), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Past");
     }
@@ -959,7 +1022,7 @@ mod tests {
             .create_item("No deadline", "shulops", "work", None, Some("todo"), None, None, None, None, &p)
             .unwrap();
 
-        let results = store.query("no_deadline", &default_kanban_queries()).unwrap();
+        let results = store.query("no_deadline", &default_kanban_queries(), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "No deadline");
     }
@@ -967,7 +1030,7 @@ mod tests {
     #[test]
     fn query_unknown_returns_error() {
         let store = make_store();
-        let result = store.query("nonexistent", &default_kanban_queries());
+        let result = store.query("nonexistent", &default_kanban_queries(), None, None);
         assert!(matches!(result, Err(KanbanError::InvalidInput(_))));
     }
 
@@ -989,6 +1052,67 @@ mod tests {
         ).unwrap();
         assert_eq!(domain, "personal");
         assert_eq!(prefix, "SH");
+    }
+
+    #[test]
+    fn list_filters_by_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
+        let p = HashMap::new();
+
+        // Two items in two different domains
+        store.create_item("Work task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Personal task", "personal", "personal", None, None, None, None, None, None, &p).unwrap();
+
+        // Filter to "work" domain only
+        let work_domains = vec!["work".to_string()];
+        let items = store.list(None, None, None, None, true, Some(&work_domains)).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].project, "shulops");
+
+        // Filter to "personal" domain only
+        let personal_domains = vec!["personal".to_string()];
+        let items = store.list(None, None, None, None, true, Some(&personal_domains)).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].project, "personal");
+
+        // Both domains → all items
+        let both_domains = vec!["work".to_string(), "personal".to_string()];
+        let items = store.list(None, None, None, None, true, Some(&both_domains)).unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Empty domains slice → full access (domainless)
+        let items = store.list(None, None, None, None, true, Some(&[])).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn query_filters_by_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
+        let p = HashMap::new();
+
+        // Two items in two different domains, both with no deadline (matching "no_deadline" query)
+        store.create_item("Work task", "shulops", "work", None, Some("todo"), None, None, None, None, &p).unwrap();
+        store.create_item("Personal task", "personal", "personal", None, Some("todo"), None, None, None, None, &p).unwrap();
+
+        let queries = default_kanban_queries();
+
+        // Filter to "work" domain only
+        let work_domains = vec!["work".to_string()];
+        let results = store.query("no_deadline", &queries, None, Some(&work_domains)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project, "shulops");
+
+        // Filter to "personal" domain only
+        let personal_domains = vec!["personal".to_string()];
+        let results = store.query("no_deadline", &queries, None, Some(&personal_domains)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project, "personal");
+
+        // No domain filter → all items
+        let results = store.query("no_deadline", &queries, None, None).unwrap();
+        assert_eq!(results.len(), 2);
     }
 
     #[test]
