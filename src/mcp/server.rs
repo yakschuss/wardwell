@@ -2450,6 +2450,7 @@ mod tests {
             ai: Default::default(),
             stop_hook: true,
             kanban_enabled: false,
+            kanban_groups: std::collections::HashMap::new(),
             kanban_queries: std::collections::HashMap::new(),
             kanban_prefixes: std::collections::HashMap::new(),
         };

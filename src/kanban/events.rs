@@ -11,6 +11,8 @@ pub enum KanbanEvent {
         ticket_id: String,
         title: String,
         project: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        group: Option<String>,
         #[serde(default = "default_backlog")]
         status: String,
         #[serde(default = "default_medium")]
@@ -139,7 +141,8 @@ pub fn next_ticket_number(vault_root: &Path, domain: &str, project: &str, prefix
         let mut max = 0i64;
         for line in content.lines() {
             if let Ok(event) = serde_json::from_str::<KanbanEvent>(line) {
-                if let KanbanEvent::Create { ticket_id, .. } = &event {
+                if let KanbanEvent::Create { group: None,
+            ticket_id, .. } = &event {
                     if let Some(num_str) = ticket_id.strip_prefix(&prefix_dash) {
                         if let Ok(n) = num_str.parse::<i64>() {
                             if n > max { max = n; }
@@ -197,6 +200,7 @@ pub fn scan_all_jsonl(vault_root: &Path) -> Vec<(String, String, Vec<KanbanEvent
 pub struct MaterializedItem {
     pub ticket_id: String,
     pub project: String,
+    pub group: Option<String>,
     pub domain: String,
     pub title: String,
     pub description: Option<String>,
@@ -225,13 +229,14 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
     for event in events {
         match event {
             KanbanEvent::Create {
-                ticket_id, title, project, status, priority,
+                ticket_id, title, project, group, status, priority,
                 description, deadline, assignee, source, timestamp,
             } => {
                 let completed_at = if status == "done" { Some(timestamp.clone()) } else { None };
                 items.insert(ticket_id.clone(), MaterializedItem {
                     ticket_id: ticket_id.clone(),
                     project: project.clone(),
+                    group: group.clone(),
                     domain: domain.to_string(),
                     title: title.clone(),
                     description: description.clone(),
@@ -309,6 +314,7 @@ mod tests {
     #[test]
     fn roundtrip_create_event() {
         let event = KanbanEvent::Create {
+            group: None,
             ticket_id: "SH-1".into(),
             title: "Fix billing".into(),
             project: "shulops".into(),
@@ -357,6 +363,7 @@ mod tests {
     fn append_and_read_events() {
         let dir = tempfile::tempdir().unwrap();
         let event = KanbanEvent::Create {
+            group: None,
             ticket_id: "SH-1".into(),
             title: "Test".into(),
             project: "shulops".into(),
@@ -381,6 +388,7 @@ mod tests {
         let vault = dir.path();
         // Write events + meta
         let event = KanbanEvent::Create {
+            group: None,
             ticket_id: "SH-1".into(), title: "A".into(), project: "shulops".into(),
             status: "backlog".into(), priority: "medium".into(),
             description: None, deadline: None, assignee: None, source: None,
@@ -398,6 +406,7 @@ mod tests {
         let vault = dir.path();
         // Write events without meta
         let event = KanbanEvent::Create {
+            group: None,
             ticket_id: "SH-3".into(), title: "B".into(), project: "shulops".into(),
             status: "backlog".into(), priority: "medium".into(),
             description: None, deadline: None, assignee: None, source: None,
@@ -418,7 +427,8 @@ mod tests {
     fn materialize_full_lifecycle() {
         let events = vec![
             KanbanEvent::Create {
-                ticket_id: "SH-1".into(), title: "Fix billing".into(), project: "shulops".into(),
+                group: None,
+            ticket_id: "SH-1".into(), title: "Fix billing".into(), project: "shulops".into(),
                 status: "backlog".into(), priority: "high".into(),
                 description: Some("Details".into()), deadline: Some("2026-05-01".into()),
                 assignee: None, source: Some("hank".into()),

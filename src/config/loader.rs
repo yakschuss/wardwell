@@ -17,6 +17,8 @@ pub struct WardwellConfig {
     pub stop_hook: bool,
     /// Whether the kanban MCP tool is enabled. Defaults to false.
     pub kanban_enabled: bool,
+    /// Group name → list of vault project slugs that roll up under it.
+    pub kanban_groups: HashMap<String, Vec<String>>,
     /// Named FTS queries for kanban columns (column name → query string).
     pub kanban_queries: HashMap<String, String>,
     /// Prefix mappings for kanban item display (prefix → label).
@@ -85,6 +87,8 @@ struct RawDomainEntry {
 struct RawKanbanConfig {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    groups: HashMap<String, Vec<String>>,
     #[serde(default)]
     queries: HashMap<String, String>,
     #[serde(default)]
@@ -158,9 +162,9 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         None => AiConfig::default(),
     };
 
-    let (kanban_enabled, kanban_queries, kanban_prefixes) = match raw.kanban {
-        Some(k) => (k.enabled, k.queries, k.prefixes),
-        None => (false, HashMap::new(), HashMap::new()),
+    let (kanban_enabled, kanban_groups, kanban_queries, kanban_prefixes) = match raw.kanban {
+        Some(k) => (k.enabled, k.groups, k.queries, k.prefixes),
+        None => (false, HashMap::new(), HashMap::new(), HashMap::new()),
     };
 
     Ok(WardwellConfig {
@@ -171,6 +175,7 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         ai,
         stop_hook: raw.stop_hook,
         kanban_enabled,
+        kanban_groups,
         kanban_queries,
         kanban_prefixes,
     })

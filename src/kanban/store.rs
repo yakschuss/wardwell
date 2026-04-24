@@ -9,6 +9,8 @@ use std::time::Duration;
 pub struct KanbanItem {
     pub ticket_id: String,
     pub project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub status: String,
@@ -53,10 +55,12 @@ pub enum KanbanError {
 pub struct KanbanStore {
     conn: Mutex<Connection>,
     vault_root: PathBuf,
+    /// Reverse lookup: project slug → group name (from config kanban.groups).
+    project_to_group: HashMap<String, String>,
 }
 
 impl KanbanStore {
-    pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
+    pub fn open(db_path: &Path, vault_root: PathBuf, groups: &HashMap<String, Vec<String>>) -> Result<Self, KanbanError> {
         let conn = Connection::open(db_path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -94,7 +98,13 @@ impl KanbanStore {
             CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket ON kanban_notes(ticket_id);"
         )?;
 
-        let store = Self { conn: Mutex::new(conn), vault_root };
+        let mut project_to_group = HashMap::new();
+        for (group_name, projects) in groups {
+            for proj in projects {
+                project_to_group.insert(proj.clone(), group_name.clone());
+            }
+        }
+        let store = Self { conn: Mutex::new(conn), vault_root, project_to_group };
         if let Err(e) = store.rebuild_from_jsonl() {
             eprintln!("wardwell: kanban rebuild warning (non-fatal): {e}");
         }
@@ -128,10 +138,13 @@ impl KanbanStore {
         let (prefix, next_id) = self.resolve_ticket_id(project, domain, config_prefixes)?;
         let ticket_id = format!("{prefix}-{next_id}");
 
+        let group = self.project_to_group.get(project).cloned();
+
         let event = KanbanEvent::Create {
             ticket_id: ticket_id.clone(),
             title: title.to_string(),
             project: project.to_string(),
+            group: group.clone(),
             status: status.to_string(),
             priority: priority.to_string(),
             description: description.map(str::to_string),
@@ -154,7 +167,7 @@ impl KanbanStore {
         )?;
 
         Ok(KanbanItem {
-            ticket_id, project: project.into(), title: title.into(),
+            ticket_id, project: project.into(), group, title: title.into(),
             description: description.map(str::to_string), status: status.into(), priority: priority.into(),
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), created_at: now.clone(), updated_at: now,
@@ -307,7 +320,18 @@ impl KanbanStore {
             }
         }
         if !include_done { conditions.push(format!("kanban_items.status != ?{idx}")); params.push(Box::new("done".to_string())); idx += 1; }
-        if let Some(v) = project { conditions.push(format!("kanban_items.project=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = project {
+            let group_members = self.resolve_group_members(v);
+            if group_members.is_empty() {
+                conditions.push(format!("kanban_items.project=?{idx}"));
+                params.push(Box::new(v.to_string()));
+                idx += 1;
+            } else {
+                let ph: Vec<String> = group_members.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
+                conditions.push(format!("kanban_items.project IN ({})", ph.join(",")));
+                for m in &group_members { params.push(Box::new(m.clone())); }
+            }
+        }
         if let Some(v) = status { conditions.push(format!("kanban_items.status=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
         if let Some(v) = priority { conditions.push(format!("kanban_items.priority=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
         if let Some(v) = assignee { conditions.push(format!("kanban_items.assignee=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
@@ -321,7 +345,7 @@ impl KanbanStore {
         let mut stmt = conn.prepare(&sql)?;
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
-                ticket_id: row.get(0)?, project: row.get(1)?, title: row.get(2)?,
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, title: row.get(2)?,
                 description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
                 assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
                 created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
@@ -330,6 +354,7 @@ impl KanbanStore {
         })?.collect::<Result<_, _>>()?;
 
         items.into_iter().map(|mut item| {
+            item.group = self.project_to_group.get(&item.project).cloned();
             item.notes = self.load_notes(&conn, &item.ticket_id)?;
             Ok(item)
         }).collect()
@@ -371,7 +396,7 @@ impl KanbanStore {
         let mut stmt = conn.prepare(&sql)?;
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
-                ticket_id: row.get(0)?, project: row.get(1)?, title: row.get(2)?,
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, title: row.get(2)?,
                 description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
                 assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
                 created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
@@ -380,6 +405,7 @@ impl KanbanStore {
         })?.collect::<Result<_, _>>()?;
 
         items.into_iter().map(|mut item| {
+            item.group = self.project_to_group.get(&item.project).cloned();
             item.notes = self.load_notes(&conn, &item.ticket_id)?;
             Ok(item)
         }).collect()
@@ -445,7 +471,7 @@ impl KanbanStore {
             "SELECT ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
             rusqlite::params![ticket_id],
             |row| Ok(KanbanItem {
-                ticket_id: row.get(0)?, project: row.get(1)?, title: row.get(2)?,
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, title: row.get(2)?,
                 description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
                 assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
                 created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
@@ -491,6 +517,14 @@ impl KanbanStore {
 
         let next = events::next_ticket_number(&self.vault_root, domain, project, &prefix);
         Ok((prefix, next))
+    }
+
+    /// If `name` is a group name, return all member projects. Otherwise empty vec.
+    fn resolve_group_members(&self, name: &str) -> Vec<String> {
+        self.project_to_group.iter()
+            .filter(|(_, g)| g.as_str() == name)
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     fn upsert_project(&self, conn: &Connection, project: &str, prefix: &str, domain: &str, next_id: i64) -> Result<(), KanbanError> {
@@ -542,7 +576,7 @@ mod tests {
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
         let db = dir.path().join("kanban.db");
-        let store = KanbanStore::open(&db, vault).unwrap();
+        let store = KanbanStore::open(&db, vault, &HashMap::new()).unwrap();
         (dir, store)
     }
 
@@ -670,5 +704,56 @@ mod tests {
         let results = store.query("overdue", &default_kanban_queries(), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Past");
+    }
+
+    #[test]
+    fn group_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut groups = HashMap::new();
+        groups.insert("agent-system".to_string(), vec!["vault-sync".to_string(), "ai-arch".to_string()]);
+        let store = KanbanStore::open(&dir.path().join("k.db"), vault, &groups).unwrap();
+        let p = HashMap::new();
+
+        store.create_item("Sync fix", "vault-sync", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Arch doc", "ai-arch", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Unrelated", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+
+        // Filter by group name → returns both member projects
+        let items = store.list(Some("agent-system"), None, None, None, false, None).unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Filter by specific project still works
+        let items = store.list(Some("vault-sync"), None, None, None, false, None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].project, "vault-sync");
+        assert_eq!(items[0].group.as_deref(), Some("agent-system"));
+
+        // Ungrouped item has no group
+        let items = store.list(Some("shulops"), None, None, None, false, None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].group.is_none());
+
+        // All items
+        let items = store.list(None, None, None, None, false, None).unwrap();
+        assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn create_item_includes_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut groups = HashMap::new();
+        groups.insert("mygroup".to_string(), vec!["myproj".to_string()]);
+        let store = KanbanStore::open(&dir.path().join("k.db"), vault, &groups).unwrap();
+
+        let item = store.create_item("Test", "myproj", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        assert_eq!(item.group.as_deref(), Some("mygroup"));
+
+        // Check JSONL has group
+        let content = std::fs::read_to_string(dir.path().join("vault/work/myproj/kanban.jsonl")).unwrap();
+        assert!(content.contains("\"group\":\"mygroup\""));
     }
 }
