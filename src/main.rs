@@ -79,7 +79,7 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
     let kanban = if config.kanban_enabled {
         let kanban_path = config_dir.join("kanban.db");
         let vault_root = config.vault_path.clone();
-        match wardwell::kanban::store::KanbanStore::open(&kanban_path, vault_root, &config.kanban_groups) {
+        match wardwell::kanban::store::KanbanStore::open(&kanban_path, vault_root) {
             Ok(k) => {
                 eprintln!("wardwell: kanban enabled");
                 Some(k)

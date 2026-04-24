@@ -7,7 +7,7 @@ fn make_store() -> (tempfile::TempDir, KanbanStore) {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("vault");
     std::fs::create_dir_all(&vault).unwrap();
-    let store = KanbanStore::open(&dir.path().join("kanban.db"), vault, &HashMap::new()).unwrap();
+    let store = KanbanStore::open(&dir.path().join("kanban.db"), vault).unwrap();
     (dir, store)
 }
 

@@ -60,7 +60,8 @@ pub struct KanbanStore {
 }
 
 impl KanbanStore {
-    pub fn open(db_path: &Path, vault_root: PathBuf, groups: &HashMap<String, Vec<String>>) -> Result<Self, KanbanError> {
+    pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
+        let groups = load_kanban_yml(&vault_root);
         let conn = Connection::open(db_path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -99,7 +100,7 @@ impl KanbanStore {
         )?;
 
         let mut project_to_group = HashMap::new();
-        for (group_name, projects) in groups {
+        for (group_name, projects) in &groups {
             for proj in projects {
                 project_to_group.insert(proj.clone(), group_name.clone());
             }
@@ -536,6 +537,25 @@ impl KanbanStore {
     }
 }
 
+/// Load groups from {vault}/kanban.yml. Returns empty map if file missing or malformed.
+fn load_kanban_yml(vault_root: &Path) -> HashMap<String, Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct KanbanYml {
+        #[serde(default)]
+        groups: HashMap<String, Vec<String>>,
+    }
+
+    let path = vault_root.join("kanban.yml");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    match serde_yaml::from_str::<KanbanYml>(&content) {
+        Ok(yml) => yml.groups,
+        Err(_) => HashMap::new(),
+    }
+}
+
 fn validate_status(s: &str) -> Result<&str, KanbanError> {
     match s {
         "backlog" | "todo" | "in_progress" | "review" | "done" => Ok(s),
@@ -576,7 +596,7 @@ mod tests {
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
         let db = dir.path().join("kanban.db");
-        let store = KanbanStore::open(&db, vault, &HashMap::new()).unwrap();
+        let store = KanbanStore::open(&db, vault).unwrap();
         (dir, store)
     }
 
@@ -706,14 +726,17 @@ mod tests {
         assert_eq!(results[0].title, "Past");
     }
 
+    fn write_kanban_yml(vault: &Path, content: &str) {
+        std::fs::write(vault.join("kanban.yml"), content).unwrap();
+    }
+
     #[test]
     fn group_filtering() {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
-        let mut groups = HashMap::new();
-        groups.insert("agent-system".to_string(), vec!["vault-sync".to_string(), "ai-arch".to_string()]);
-        let store = KanbanStore::open(&dir.path().join("k.db"), vault, &groups).unwrap();
+        write_kanban_yml(&vault, "groups:\n  agent-system:\n    - vault-sync\n    - ai-arch\n");
+        let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
         let p = HashMap::new();
 
         store.create_item("Sync fix", "vault-sync", "work", None, None, None, None, None, None, &p).unwrap();
@@ -745,9 +768,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = dir.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
-        let mut groups = HashMap::new();
-        groups.insert("mygroup".to_string(), vec!["myproj".to_string()]);
-        let store = KanbanStore::open(&dir.path().join("k.db"), vault, &groups).unwrap();
+        write_kanban_yml(&vault, "groups:\n  mygroup:\n    - myproj\n");
+        let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
 
         let item = store.create_item("Test", "myproj", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
         assert_eq!(item.group.as_deref(), Some("mygroup"));
@@ -755,5 +777,16 @@ mod tests {
         // Check JSONL has group
         let content = std::fs::read_to_string(dir.path().join("vault/work/myproj/kanban.jsonl")).unwrap();
         assert!(content.contains("\"group\":\"mygroup\""));
+    }
+
+    #[test]
+    fn no_kanban_yml_works_fine() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        // No kanban.yml — should not error
+        let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
+        let item = store.create_item("Test", "proj", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        assert!(item.group.is_none());
     }
 }
