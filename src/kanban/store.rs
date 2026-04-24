@@ -553,6 +553,60 @@ impl KanbanStore {
         self.get_item_with_conn(&conn, ticket_id)
     }
 
+    /// Run a named dynamic query against kanban_items.
+    pub fn query(
+        &self,
+        question: &str,
+        queries: &HashMap<String, String>,
+    ) -> Result<Vec<KanbanItem>, KanbanError> {
+        let where_clause = queries.get(question).ok_or_else(|| {
+            let mut names: Vec<&str> = queries.keys().map(String::as_str).collect();
+            names.sort();
+            KanbanError::InvalidInput(format!(
+                "unknown query '{question}'; available: {}",
+                names.join(", ")
+            ))
+        })?;
+
+        let sql = format!(
+            "SELECT ticket_id, project, title, description, status, priority,
+                    assignee, deadline, source, created_at, updated_at, completed_at
+             FROM kanban_items
+             WHERE {where_clause}
+             ORDER BY updated_at DESC"
+        );
+
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let items: Vec<KanbanItem> = stmt
+            .query_map([], |row| {
+                Ok(KanbanItem {
+                    ticket_id: row.get(0)?,
+                    project: row.get(1)?,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    status: row.get(4)?,
+                    priority: row.get(5)?,
+                    assignee: row.get(6)?,
+                    deadline: row.get(7)?,
+                    source: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    completed_at: row.get(11)?,
+                    notes: vec![],
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        items
+            .into_iter()
+            .map(|mut item| {
+                item.notes = self.load_notes_with_conn(&conn, &item.ticket_id)?;
+                Ok(item)
+            })
+            .collect()
+    }
+
     /// Ensure a project exists in kanban_projects, creating it if absent.
     /// Returns (prefix, next_id).
     fn ensure_project(
@@ -596,6 +650,30 @@ impl KanbanStore {
 
         Ok((prefix, 1))
     }
+}
+
+/// Default kanban query definitions.
+pub fn default_kanban_queries() -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert("overdue".into(), "status != 'done' AND deadline < date('now')".into());
+    m.insert(
+        "stale".into(),
+        "status != 'done' AND updated_at < datetime('now', '-7 days')".into(),
+    );
+    m.insert("no_deadline".into(), "status != 'done' AND deadline IS NULL".into());
+    m.insert("blocked".into(), "status = 'backlog'".into());
+    m.insert("recent".into(), "updated_at > datetime('now', '-2 days')".into());
+    m
+}
+
+/// Merge config queries over defaults. Config entries override matching defaults;
+/// unmentioned defaults survive; new config entries are added.
+pub fn merge_kanban_queries(config_queries: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut merged = default_kanban_queries();
+    for (k, v) in config_queries {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -844,5 +922,52 @@ mod tests {
         assert_eq!(with_note.notes.len(), 1);
         assert_eq!(with_note.notes[0].text, "looks good");
         assert_eq!(with_note.notes[0].author.as_deref(), Some("bob"));
+    }
+
+    // ---- query tests ----
+
+    #[test]
+    fn query_overdue() {
+        let store = make_store();
+        let p = HashMap::new();
+        // Past deadline, non-done → should match overdue
+        store
+            .create_item("Past", "shulops", "work", None, Some("todo"), None, None, Some("2020-01-01"), None, &p)
+            .unwrap();
+        // Future deadline → should not match
+        store
+            .create_item("Future", "shulops", "work", None, Some("todo"), None, None, Some("2099-12-31"), None, &p)
+            .unwrap();
+        // No deadline → should not match
+        store
+            .create_item("No deadline", "shulops", "work", None, Some("todo"), None, None, None, None, &p)
+            .unwrap();
+
+        let results = store.query("overdue", &default_kanban_queries()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Past");
+    }
+
+    #[test]
+    fn query_no_deadline() {
+        let store = make_store();
+        let p = HashMap::new();
+        store
+            .create_item("Has deadline", "shulops", "work", None, Some("todo"), None, None, Some("2026-12-01"), None, &p)
+            .unwrap();
+        store
+            .create_item("No deadline", "shulops", "work", None, Some("todo"), None, None, None, None, &p)
+            .unwrap();
+
+        let results = store.query("no_deadline", &default_kanban_queries()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "No deadline");
+    }
+
+    #[test]
+    fn query_unknown_returns_error() {
+        let store = make_store();
+        let result = store.query("nonexistent", &default_kanban_queries());
+        assert!(matches!(result, Err(KanbanError::InvalidInput(_))));
     }
 }
