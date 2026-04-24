@@ -42,12 +42,16 @@ pub fn derive_prefix(slug: &str, existing: &[String]) -> Option<String> {
 }
 
 /// Resolves a prefix for `slug`, preferring an explicit config entry over derivation.
+/// Config overrides are still checked against `existing_prefixes` to catch collisions.
 pub fn resolve_prefix(
     slug: &str,
     config_prefixes: &HashMap<String, String>,
     existing_prefixes: &[String],
 ) -> Option<String> {
     if let Some(p) = config_prefixes.get(slug) {
+        if existing_prefixes.contains(p) {
+            return None;
+        }
         return Some(p.clone());
     }
     derive_prefix(slug, existing_prefixes)
@@ -108,5 +112,15 @@ mod tests {
         let config = HashMap::new();
         let result = resolve_prefix("shulops", &config, &[]);
         assert_eq!(result, Some("SH".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_collision() {
+        // config says "XY" for project, but "XY" already exists → None
+        let mut config = HashMap::new();
+        config.insert("shulops".to_string(), "XY".to_string());
+        let existing = vec!["XY".to_string()];
+        let result = resolve_prefix("shulops", &config, &existing);
+        assert_eq!(result, None);
     }
 }

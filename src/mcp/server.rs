@@ -193,6 +193,14 @@ impl WardwellServer {
 
         let kanban_queries = crate::kanban::store::merge_kanban_queries(&config.kanban_queries);
 
+        // Validate query WHERE clauses at startup so bad config fails fast.
+        if let Some(ref k) = kanban
+            && let Err(e) = k.validate_queries(&kanban_queries)
+        {
+            eprintln!("wardwell: kanban query validation failed — {e}");
+            std::process::exit(1);
+        }
+
         let mut tool_router = Self::tool_router();
         if kanban.is_none() {
             tool_router.remove_route("wardwell_kanban");
@@ -1915,10 +1923,14 @@ impl WardwellServer {
             Ok(item) => {
                 let mut audit_line = format!("{} created: {} [{}]", item.ticket_id, item.title, item.status);
                 if item.priority != "medium" {
-                    audit_line.push_str(&format!(" priority:{}", item.priority));
+                    audit_line.push_str(&format!(" ⚡{}", item.priority));
                 }
                 if let Some(ref dl) = item.deadline {
-                    audit_line.push_str(&format!(" deadline:{dl}"));
+                    // Format deadline as MM/DD from ISO date (YYYY-MM-DD or RFC3339)
+                    let short_dl = dl.get(5..10)
+                        .map(|s| s.replace('-', "/"))
+                        .unwrap_or_else(|| dl.clone());
+                    audit_line.push_str(&format!(" 📅{short_dl}"));
                 }
                 let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
                 serde_json::to_string(&serde_json::json!({ "created": true, "item": item })).unwrap_or_default()
@@ -1947,7 +1959,12 @@ impl WardwellServer {
                 if p.status.is_some() { changes.push("status".to_string()); }
                 if p.priority.is_some() { changes.push("priority".to_string()); }
                 if p.assignee.is_some() { changes.push("assignee".to_string()); }
-                if p.deadline.is_some() { changes.push("deadline".to_string()); }
+                if let Some(ref dl) = p.deadline {
+                    let short_dl = dl.get(5..10)
+                        .map(|s| s.replace('-', "/"))
+                        .unwrap_or_else(|| dl.clone());
+                    changes.push(format!("📅{short_dl}"));
+                }
                 let audit_line = format!("{ticket_id} updated: {}", changes.join(", "));
                 if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
                     let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
@@ -1972,7 +1989,7 @@ impl WardwellServer {
         }
         match kanban.move_item(ticket_id, status) {
             Ok((item, transition)) => {
-                let audit_line = format!("{ticket_id} -> {status}");
+                let audit_line = format!("{ticket_id} → {status}");
                 if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
                     let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
                 }

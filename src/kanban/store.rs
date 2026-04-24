@@ -575,6 +575,21 @@ impl KanbanStore {
         self.get_item_with_conn(&conn, ticket_id)
     }
 
+    /// Validate WHERE clauses from config by running EXPLAIN on each.
+    /// Call this at startup after merging queries to catch syntax errors early.
+    pub fn validate_queries(&self, queries: &HashMap<String, String>) -> Result<(), KanbanError> {
+        let conn = self.conn()?;
+        for (name, where_clause) in queries {
+            let sql = format!("EXPLAIN SELECT * FROM kanban_items WHERE {where_clause}");
+            conn.execute_batch(&sql).map_err(|e| {
+                KanbanError::InvalidInput(format!(
+                    "invalid query '{name}': {e} (WHERE clause: {where_clause})"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     /// Run a named dynamic query against kanban_items.
     pub fn query(
         &self,
@@ -865,14 +880,15 @@ mod tests {
 
     // ---- list tests ----
 
-    fn make_store() -> KanbanStore {
+    fn make_store() -> (tempfile::TempDir, KanbanStore) {
         let dir = tempfile::tempdir().unwrap();
-        KanbanStore::open(&dir.path().join("kanban.db")).unwrap()
+        let store = KanbanStore::open(&dir.path().join("kanban.db")).unwrap();
+        (dir, store)
     }
 
     #[test]
     fn list_all_items() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         store.create_item("B", "personal", "life", None, None, None, None, None, None, &p).unwrap();
@@ -882,7 +898,7 @@ mod tests {
 
     #[test]
     fn list_filters_by_project() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         store.create_item("B", "personal", "life", None, None, None, None, None, None, &p).unwrap();
@@ -893,7 +909,7 @@ mod tests {
 
     #[test]
     fn list_excludes_done_by_default() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("Active", "shulops", "work", None, Some("backlog"), None, None, None, None, &p).unwrap();
         store.create_item("Done", "shulops", "work", None, Some("done"), None, None, None, None, &p).unwrap();
@@ -904,7 +920,7 @@ mod tests {
 
     #[test]
     fn list_filters_by_status() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("Backlog", "shulops", "work", None, Some("backlog"), None, None, None, None, &p).unwrap();
         store.create_item("In Progress", "shulops", "work", None, Some("in_progress"), None, None, None, None, &p).unwrap();
@@ -915,7 +931,7 @@ mod tests {
 
     #[test]
     fn list_filters_by_assignee() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("Assigned", "shulops", "work", None, None, None, Some("alice"), None, None, &p).unwrap();
         store.create_item("Unassigned", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
@@ -928,7 +944,7 @@ mod tests {
 
     #[test]
     fn update_item_title() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         let item = store.create_item("Old", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         let updated = store.update_item(&item.ticket_id, Some("New"), None, None, None, None, None).unwrap();
@@ -938,7 +954,7 @@ mod tests {
 
     #[test]
     fn update_item_not_found() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let result = store.update_item("SH-999", Some("title"), None, None, None, None, None);
         assert!(matches!(result, Err(KanbanError::NotFound(_))));
     }
@@ -947,7 +963,7 @@ mod tests {
 
     #[test]
     fn move_item_changes_status() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         let item = store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         let (moved, transition) = store.move_item(&item.ticket_id, "in_progress").unwrap();
@@ -957,7 +973,7 @@ mod tests {
 
     #[test]
     fn move_to_done_sets_completed_at() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         let item = store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         let (moved, _) = store.move_item(&item.ticket_id, "done").unwrap();
@@ -966,7 +982,7 @@ mod tests {
 
     #[test]
     fn move_from_done_clears_completed_at() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         let item = store.create_item("Task", "shulops", "work", None, Some("done"), None, None, None, None, &p).unwrap();
         assert!(item.completed_at.is_some());
@@ -978,7 +994,7 @@ mod tests {
 
     #[test]
     fn add_note_to_item() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         let item = store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
         let with_note = store.add_note(&item.ticket_id, "looks good", Some("bob")).unwrap();
@@ -991,7 +1007,7 @@ mod tests {
 
     #[test]
     fn query_overdue() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         // Past deadline, non-done → should match overdue
         store
@@ -1013,7 +1029,7 @@ mod tests {
 
     #[test]
     fn query_no_deadline() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store
             .create_item("Has deadline", "shulops", "work", None, Some("todo"), None, None, Some("2026-12-01"), None, &p)
@@ -1029,7 +1045,7 @@ mod tests {
 
     #[test]
     fn query_unknown_returns_error() {
-        let store = make_store();
+        let (_dir, store) = make_store();
         let result = store.query("nonexistent", &default_kanban_queries(), None, None);
         assert!(matches!(result, Err(KanbanError::InvalidInput(_))));
     }
