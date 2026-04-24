@@ -2161,6 +2161,9 @@ mod tests {
             exclude: vec![],
             ai: Default::default(),
             stop_hook: true,
+            kanban_enabled: false,
+            kanban_queries: std::collections::HashMap::new(),
+            kanban_prefixes: std::collections::HashMap::new(),
         };
         WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None)
     }
