@@ -2044,7 +2044,7 @@ impl WardwellServer {
     }
 
     fn infer_domain_for_project(&self, project: &str) -> Option<String> {
-        let registry = self.registry.blocking_read();
+        let registry = self.registry.try_read().ok()?;
         for domain in registry.all() {
             let domain_name = domain.name.as_str();
             let project_dir = self.vault_root.join(domain_name).join(project);
