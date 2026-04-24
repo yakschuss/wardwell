@@ -531,10 +531,11 @@ impl KanbanStore {
             rusqlite::params![new_status, now, completed_at, ticket_id],
         )?;
 
-        let transition = format!("Status: {old_status} → {new_status}");
+        let transition = format!("{old_status} → {new_status}");
+        let note_text = format!("Status: {transition}");
         conn.execute(
             "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![ticket_id, transition, Option::<String>::None, now],
+            rusqlite::params![ticket_id, note_text, Option::<String>::None, now],
         )?;
 
         let item = self.get_item_with_conn(&conn, ticket_id)?;
@@ -580,8 +581,8 @@ impl KanbanStore {
     pub fn validate_queries(&self, queries: &HashMap<String, String>) -> Result<(), KanbanError> {
         let conn = self.conn()?;
         for (name, where_clause) in queries {
-            let sql = format!("EXPLAIN SELECT * FROM kanban_items WHERE {where_clause}");
-            conn.execute_batch(&sql).map_err(|e| {
+            let sql = format!("SELECT * FROM kanban_items WHERE {where_clause}");
+            conn.prepare(&sql).map_err(|e| {
                 KanbanError::InvalidInput(format!(
                     "invalid query '{name}': {e} (WHERE clause: {where_clause})"
                 ))
