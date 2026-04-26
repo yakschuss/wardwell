@@ -74,11 +74,43 @@ pub struct KanbanStore {
 }
 
 impl KanbanStore {
+    const SCHEMA_VERSION: i64 = 3;
+
     pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
         let groups = load_kanban_yml(&vault_root);
+
+        // Check schema version — wipe if stale (SQLite is just a cache)
+        if db_path.exists() {
+            if let Ok(c) = Connection::open(db_path) {
+                let version: i64 = c.query_row(
+                    "SELECT COALESCE((SELECT version FROM kanban_schema_version), 0)", [], |r| r.get(0),
+                ).unwrap_or(0);
+                if version != Self::SCHEMA_VERSION {
+                    drop(c);
+                    let _ = std::fs::remove_file(db_path);
+                    let shm = db_path.with_extension("db-shm");
+                    let wal = db_path.with_extension("db-wal");
+                    let _ = std::fs::remove_file(shm);
+                    let _ = std::fs::remove_file(wal);
+                    eprintln!("wardwell: kanban schema v{version} → v{}, rebuilding from JSONL", Self::SCHEMA_VERSION);
+                }
+            }
+        }
+
         let conn = Connection::open(db_path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.busy_timeout(Duration::from_secs(5))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS kanban_schema_version (version INTEGER NOT NULL);"
+        )?;
+        let current: i64 = conn.query_row(
+            "SELECT COALESCE((SELECT version FROM kanban_schema_version), 0)", [], |r| r.get(0),
+        ).unwrap_or(0);
+        if current != Self::SCHEMA_VERSION {
+            conn.execute_batch("DELETE FROM kanban_schema_version;")?;
+            conn.execute("INSERT INTO kanban_schema_version (version) VALUES (?1)", rusqlite::params![Self::SCHEMA_VERSION])?;
+        }
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS kanban_projects (
