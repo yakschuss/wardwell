@@ -199,12 +199,10 @@ impl WardwellServer {
 
         let kanban_queries = crate::kanban::store::merge_kanban_queries(&config.kanban_queries);
 
-        // Validate query WHERE clauses at startup so bad config fails fast.
         if let Some(ref k) = kanban
             && let Err(e) = k.validate_queries(&kanban_queries)
         {
-            eprintln!("wardwell: kanban query validation failed — {e}");
-            std::process::exit(1);
+            eprintln!("wardwell: kanban query validation warning (non-fatal): {e}");
         }
 
         let mut tool_router = Self::tool_router();

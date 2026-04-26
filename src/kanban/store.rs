@@ -461,7 +461,39 @@ impl KanbanStore {
         let all = events::scan_all_jsonl(&self.vault_root);
         let conn = self.conn()?;
 
-        conn.execute_batch("DELETE FROM kanban_attachments; DELETE FROM kanban_notes; DELETE FROM kanban_items; DELETE FROM kanban_projects;")?;
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS kanban_attachments;
+             DROP TABLE IF EXISTS kanban_notes;
+             DROP TABLE IF EXISTS kanban_items;
+             DROP TABLE IF EXISTS kanban_projects;"
+        )?;
+        // Recreate with current schema
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS kanban_projects (
+                project TEXT PRIMARY KEY, prefix TEXT UNIQUE NOT NULL,
+                domain TEXT NOT NULL, next_id INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS kanban_items (
+                ticket_id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL,
+                description TEXT, status TEXT NOT NULL DEFAULT 'backlog',
+                priority TEXT NOT NULL DEFAULT 'medium', assignee TEXT, deadline TEXT,
+                source TEXT, epic TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, completed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS kanban_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT NOT NULL,
+                text TEXT NOT NULL, author TEXT, created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kanban_attachments (
+                attachment_id TEXT PRIMARY KEY, ticket_id TEXT NOT NULL,
+                filename TEXT NOT NULL, mime_type TEXT NOT NULL, size INTEGER NOT NULL,
+                storage_path TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kanban_items_project ON kanban_items(project);
+            CREATE INDEX IF NOT EXISTS idx_kanban_items_status ON kanban_items(status);
+            CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket ON kanban_notes(ticket_id);
+            CREATE INDEX IF NOT EXISTS idx_kanban_attachments_ticket ON kanban_attachments(ticket_id);"
+        )?;
 
         for (domain, _project, evts) in &all {
             let items = events::materialize(domain, evts);
