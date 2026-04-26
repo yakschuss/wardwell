@@ -11,6 +11,8 @@ pub struct KanbanItem {
     pub project: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub status: String,
@@ -83,6 +85,7 @@ impl KanbanStore {
                 assignee     TEXT,
                 deadline     TEXT,
                 source       TEXT,
+                epic         TEXT,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL,
                 completed_at TEXT
@@ -130,6 +133,7 @@ impl KanbanStore {
         assignee: Option<&str>,
         deadline: Option<&str>,
         source: Option<&str>,
+        epic: Option<&str>,
         config_prefixes: &HashMap<String, String>,
     ) -> Result<KanbanItem, KanbanError> {
         let status = validate_status(status.unwrap_or("backlog"))?;
@@ -146,6 +150,7 @@ impl KanbanStore {
             title: title.to_string(),
             project: project.to_string(),
             group: group.clone(),
+            epic: epic.map(str::to_string),
             status: status.to_string(),
             priority: priority.to_string(),
             description: description.map(str::to_string),
@@ -163,12 +168,12 @@ impl KanbanStore {
         self.upsert_project(&conn, project, &prefix, domain, next_id + 1)?;
         let completed_at: Option<String> = if status == "done" { Some(now.clone()) } else { None };
         conn.execute(
-            "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            rusqlite::params![ticket_id, project, title, description, status, priority, assignee, deadline, source, now, now, completed_at],
+            "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, now, now, completed_at],
         )?;
 
         Ok(KanbanItem {
-            ticket_id, project: project.into(), group, title: title.into(),
+            ticket_id, project: project.into(), group, epic: epic.map(str::to_string), title: title.into(),
             description: description.map(str::to_string), status: status.into(), priority: priority.into(),
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), created_at: now.clone(), updated_at: now,
@@ -218,6 +223,7 @@ impl KanbanStore {
         priority: Option<&str>,
         assignee: Option<&str>,
         deadline: Option<&str>,
+        epic: Option<&str>,
     ) -> Result<KanbanItem, KanbanError> {
         if let Some(s) = status { validate_status(s)?; }
         if let Some(p) = priority { validate_priority(p)?; }
@@ -234,6 +240,7 @@ impl KanbanStore {
         if let Some(v) = priority { fields.insert("priority".into(), serde_json::Value::String(v.into())); }
         if let Some(v) = assignee { fields.insert("assignee".into(), serde_json::Value::String(v.into())); }
         if let Some(v) = deadline { fields.insert("deadline".into(), serde_json::Value::String(v.into())); }
+        if let Some(v) = epic { fields.insert("epic".into(), serde_json::Value::String(v.into())); }
 
         if !fields.is_empty() {
             let event = KanbanEvent::Update {
@@ -261,7 +268,8 @@ impl KanbanStore {
         }
         if let Some(v) = priority { sets.push(format!("priority=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
         if let Some(v) = assignee { sets.push(format!("assignee=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = deadline { sets.push(format!("deadline=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
+        if let Some(v) = deadline { sets.push(format!("deadline=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = epic { sets.push(format!("epic=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
 
         params.push(Box::new(ticket_id.to_string()));
         let sql = format!("UPDATE kanban_items SET {} WHERE ticket_id=?{}", sets.join(", "), params.len());
@@ -301,7 +309,7 @@ impl KanbanStore {
 
     pub fn list(
         &self, project: Option<&str>, status: Option<&str>, priority: Option<&str>,
-        assignee: Option<&str>, include_done: bool, domains: Option<&[String]>,
+        assignee: Option<&str>, epic: Option<&str>, include_done: bool, domains: Option<&[String]>,
     ) -> Result<Vec<KanbanItem>, KanbanError> {
         let conn = self.conn()?;
         let mut conditions: Vec<String> = vec![];
@@ -335,21 +343,22 @@ impl KanbanStore {
         }
         if let Some(v) = status { conditions.push(format!("kanban_items.status=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
         if let Some(v) = priority { conditions.push(format!("kanban_items.priority=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = assignee { conditions.push(format!("kanban_items.assignee=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
+        if let Some(v) = assignee { conditions.push(format!("kanban_items.assignee=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
+        if let Some(v) = epic { conditions.push(format!("kanban_items.epic=?{idx}")); params.push(Box::new(v.to_string())); let _ = idx; }
 
         let wh = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
         );
 
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
-                ticket_id: row.get(0)?, project: row.get(1)?, group: None, title: row.get(2)?,
-                description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
-                assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
-                created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
+                title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, priority: row.get(6)?,
+                assignee: row.get(7)?, deadline: row.get(8)?, source: row.get(9)?,
+                created_at: row.get(10)?, updated_at: row.get(11)?, completed_at: row.get(12)?,
                 notes: vec![],
             })
         })?.collect::<Result<_, _>>()?;
@@ -389,7 +398,7 @@ impl KanbanStore {
 
         let wh = if extra.is_empty() { format!("WHERE {named_where}") } else { format!("WHERE ({named_where}) AND {}", extra.join(" AND ")) };
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC"
         );
 
         let conn = self.conn()?;
@@ -397,10 +406,10 @@ impl KanbanStore {
         let mut stmt = conn.prepare(&sql)?;
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
-                ticket_id: row.get(0)?, project: row.get(1)?, group: None, title: row.get(2)?,
-                description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
-                assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
-                created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
+                title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, priority: row.get(6)?,
+                assignee: row.get(7)?, deadline: row.get(8)?, source: row.get(9)?,
+                created_at: row.get(10)?, updated_at: row.get(11)?, completed_at: row.get(12)?,
                 notes: vec![],
             })
         })?.collect::<Result<_, _>>()?;
@@ -441,8 +450,8 @@ impl KanbanStore {
                 }
 
                 conn.execute(
-                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.created_at, item.updated_at, item.completed_at],
+                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.created_at, item.updated_at, item.completed_at],
                 )?;
 
                 for note in &item.notes {
@@ -469,13 +478,13 @@ impl KanbanStore {
 
     fn get_item_with_conn(&self, conn: &Connection, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
         let item: Option<KanbanItem> = conn.query_row(
-            "SELECT ticket_id, project, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
+            "SELECT ticket_id, project, epic, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
             rusqlite::params![ticket_id],
             |row| Ok(KanbanItem {
-                ticket_id: row.get(0)?, project: row.get(1)?, group: None, title: row.get(2)?,
-                description: row.get(3)?, status: row.get(4)?, priority: row.get(5)?,
-                assignee: row.get(6)?, deadline: row.get(7)?, source: row.get(8)?,
-                created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?,
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
+                title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, priority: row.get(6)?,
+                assignee: row.get(7)?, deadline: row.get(8)?, source: row.get(9)?,
+                created_at: row.get(10)?, updated_at: row.get(11)?, completed_at: row.get(12)?,
                 notes: vec![],
             }),
         ).optional()?;
@@ -577,6 +586,7 @@ pub fn default_kanban_queries() -> HashMap<String, String> {
     m.insert("no_deadline".into(), "status != 'done' AND deadline IS NULL".into());
     m.insert("blocked".into(), "status = 'backlog'".into());
     m.insert("recent".into(), "updated_at > datetime('now', '-2 days')".into());
+    m.insert("by_epic".into(), "epic IS NOT NULL AND status != 'done'".into());
     m
 }
 
@@ -603,7 +613,7 @@ mod tests {
     #[test]
     fn create_item_basic() {
         let (_dir, store) = make_store();
-        let item = store.create_item("Do the thing", "shulops", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        let item = store.create_item("Do the thing", "shulops", "work", None, None, None, None, None, None, None, &HashMap::new()).unwrap();
         assert_eq!(item.ticket_id, "SH-1");
         assert_eq!(item.status, "backlog");
         assert_eq!(item.priority, "medium");
@@ -613,8 +623,8 @@ mod tests {
     fn create_item_increments_id() {
         let (_dir, store) = make_store();
         let p = HashMap::new();
-        let a = store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let b = store.create_item("B", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        let a = store.create_item("A", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
+        let b = store.create_item("B", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
         assert_eq!(a.ticket_id, "SH-1");
         assert_eq!(b.ticket_id, "SH-2");
     }
@@ -622,7 +632,7 @@ mod tests {
     #[test]
     fn create_writes_jsonl() {
         let (dir, store) = make_store();
-        store.create_item("Test", "shulops", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        store.create_item("Test", "shulops", "work", None, None, None, None, None, None, None, &HashMap::new()).unwrap();
         let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
         assert!(jsonl.exists());
         let content = std::fs::read_to_string(&jsonl).unwrap();
@@ -635,9 +645,9 @@ mod tests {
     fn list_all_items() {
         let (_dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("A", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("B", "other", "work", None, None, None, None, None, None, &p).unwrap();
-        let items = store.list(None, None, None, None, true, None).unwrap();
+        store.create_item("A", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
+        store.create_item("B", "other", "work", None, None, None, None, None, None, None, &p).unwrap();
+        let items = store.list(None, None, None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -645,9 +655,9 @@ mod tests {
     fn list_excludes_done() {
         let (_dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Active", "proj", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("Done", "proj", "work", None, Some("done"), None, None, None, None, &p).unwrap();
-        let items = store.list(None, None, None, None, false, None).unwrap();
+        store.create_item("Active", "proj", "work", None, None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Done", "proj", "work", None, Some("done"), None, None, None, None, None, &p).unwrap();
+        let items = store.list(None, None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Active");
     }
@@ -656,7 +666,7 @@ mod tests {
     fn move_item_writes_jsonl() {
         let (dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
         let (item, transition) = store.move_item("SH-1", "in_progress").unwrap();
         assert_eq!(item.status, "in_progress");
         assert_eq!(transition, "backlog → in_progress");
@@ -669,8 +679,8 @@ mod tests {
     fn update_item_writes_jsonl() {
         let (dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Old", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
-        let item = store.update_item("SH-1", Some("New"), None, None, None, None, None).unwrap();
+        store.create_item("Old", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
+        let item = store.update_item("SH-1", Some("New"), None, None, None, None, None, None).unwrap();
         assert_eq!(item.title, "New");
 
         let content = std::fs::read_to_string(dir.path().join("vault/work/shulops/kanban.jsonl")).unwrap();
@@ -681,7 +691,7 @@ mod tests {
     fn add_note_writes_jsonl() {
         let (dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
         let item = store.add_note("SH-1", "Hello", Some("jack")).unwrap();
         assert_eq!(item.notes.len(), 1);
 
@@ -693,7 +703,7 @@ mod tests {
     fn rebuild_from_jsonl_restores_state() {
         let (dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
         store.move_item("SH-1", "todo").unwrap();
         store.add_note("SH-1", "Note", None).unwrap();
 
@@ -703,13 +713,13 @@ mod tests {
         drop(conn);
 
         // Verify empty
-        let items = store.list(None, None, None, None, true, None).unwrap();
+        let items = store.list(None, None, None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 0);
 
         // Rebuild
         store.rebuild_from_jsonl().unwrap();
 
-        let items = store.list(None, None, None, None, true, None).unwrap();
+        let items = store.list(None, None, None, None, None, true, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, "todo");
         assert_eq!(items[0].ticket_id, "SH-1");
@@ -719,8 +729,8 @@ mod tests {
     fn query_overdue() {
         let (_dir, store) = make_store();
         let p = HashMap::new();
-        store.create_item("Past", "proj", "work", None, Some("todo"), None, None, Some("2020-01-01"), None, &p).unwrap();
-        store.create_item("Future", "proj", "work", None, Some("todo"), None, None, Some("2099-12-31"), None, &p).unwrap();
+        store.create_item("Past", "proj", "work", None, Some("todo"), None, None, Some("2020-01-01"), None, None, &p).unwrap();
+        store.create_item("Future", "proj", "work", None, Some("todo"), None, None, Some("2099-12-31"), None, None, &p).unwrap();
         let results = store.query("overdue", &default_kanban_queries(), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Past");
@@ -739,27 +749,27 @@ mod tests {
         let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
         let p = HashMap::new();
 
-        store.create_item("Sync fix", "vault-sync", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("Arch doc", "ai-arch", "work", None, None, None, None, None, None, &p).unwrap();
-        store.create_item("Unrelated", "shulops", "work", None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Sync fix", "vault-sync", "work", None, None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Arch doc", "ai-arch", "work", None, None, None, None, None, None, None, &p).unwrap();
+        store.create_item("Unrelated", "shulops", "work", None, None, None, None, None, None, None, &p).unwrap();
 
         // Filter by group name → returns both member projects
-        let items = store.list(Some("agent-system"), None, None, None, false, None).unwrap();
+        let items = store.list(Some("agent-system"), None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 2);
 
         // Filter by specific project still works
-        let items = store.list(Some("vault-sync"), None, None, None, false, None).unwrap();
+        let items = store.list(Some("vault-sync"), None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].project, "vault-sync");
         assert_eq!(items[0].group.as_deref(), Some("agent-system"));
 
         // Ungrouped item has no group
-        let items = store.list(Some("shulops"), None, None, None, false, None).unwrap();
+        let items = store.list(Some("shulops"), None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0].group.is_none());
 
         // All items
-        let items = store.list(None, None, None, None, false, None).unwrap();
+        let items = store.list(None, None, None, None, None, false, None).unwrap();
         assert_eq!(items.len(), 3);
     }
 
@@ -771,7 +781,7 @@ mod tests {
         write_kanban_yml(&vault, "groups:\n  mygroup:\n    - myproj\n");
         let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
 
-        let item = store.create_item("Test", "myproj", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        let item = store.create_item("Test", "myproj", "work", None, None, None, None, None, None, None, &HashMap::new()).unwrap();
         assert_eq!(item.group.as_deref(), Some("mygroup"));
 
         // Check JSONL has group
@@ -786,7 +796,7 @@ mod tests {
         std::fs::create_dir_all(&vault).unwrap();
         // No kanban.yml — should not error
         let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
-        let item = store.create_item("Test", "proj", "work", None, None, None, None, None, None, &HashMap::new()).unwrap();
+        let item = store.create_item("Test", "proj", "work", None, None, None, None, None, None, None, &HashMap::new()).unwrap();
         assert!(item.group.is_none());
     }
 }

@@ -142,6 +142,8 @@ pub struct KanbanParams {
     pub deadline: Option<String>,
     #[schemars(description = "Who created this item (e.g., 'hank', 'manual', 'cmo').")]
     pub source: Option<String>,
+    #[schemars(description = "Epic label for grouping related items (e.g., 'whatsapp-flows', 'admin-redesign'). Optional on create/update, filter on list.")]
+    pub epic: Option<String>,
     #[schemars(description = "Note text. Required for note action.")]
     pub text: Option<String>,
     #[schemars(description = "Include completed items in list results. Default false.")]
@@ -1879,6 +1881,7 @@ impl WardwellServer {
             p.status.as_deref(),
             p.priority.as_deref(),
             p.assignee.as_deref(),
+            p.epic.as_deref(),
             p.include_done.unwrap_or(false),
             domains,
         ) {
@@ -1918,7 +1921,7 @@ impl WardwellServer {
             title, project, &domain,
             p.description.as_deref(), p.status.as_deref(), p.priority.as_deref(),
             p.assignee.as_deref(), p.deadline.as_deref(), p.source.as_deref(),
-            &self.config.kanban_prefixes,
+            p.epic.as_deref(), &self.config.kanban_prefixes,
         ) {
             Ok(item) => {
                 let mut audit_line = format!("{} created: {} [{}]", item.ticket_id, item.title, item.status);
@@ -1951,6 +1954,7 @@ impl WardwellServer {
         match kanban.update_item(
             ticket_id, p.title.as_deref(), p.description.as_deref(),
             p.status.as_deref(), p.priority.as_deref(), p.assignee.as_deref(), p.deadline.as_deref(),
+            p.epic.as_deref(),
         ) {
             Ok(item) => {
                 let mut changes = Vec::new();

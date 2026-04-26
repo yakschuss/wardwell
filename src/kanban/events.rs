@@ -13,6 +13,8 @@ pub enum KanbanEvent {
         project: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        epic: Option<String>,
         #[serde(default = "default_backlog")]
         status: String,
         #[serde(default = "default_medium")]
@@ -141,8 +143,7 @@ pub fn next_ticket_number(vault_root: &Path, domain: &str, project: &str, prefix
         let mut max = 0i64;
         for line in content.lines() {
             if let Ok(event) = serde_json::from_str::<KanbanEvent>(line) {
-                if let KanbanEvent::Create { group: None,
-            ticket_id, .. } = &event {
+                if let KanbanEvent::Create { ticket_id, .. } = &event {
                     if let Some(num_str) = ticket_id.strip_prefix(&prefix_dash) {
                         if let Ok(n) = num_str.parse::<i64>() {
                             if n > max { max = n; }
@@ -201,6 +202,7 @@ pub struct MaterializedItem {
     pub ticket_id: String,
     pub project: String,
     pub group: Option<String>,
+    pub epic: Option<String>,
     pub domain: String,
     pub title: String,
     pub description: Option<String>,
@@ -229,7 +231,7 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
     for event in events {
         match event {
             KanbanEvent::Create {
-                ticket_id, title, project, group, status, priority,
+                ticket_id, title, project, group, epic, status, priority,
                 description, deadline, assignee, source, timestamp,
             } => {
                 let completed_at = if status == "done" { Some(timestamp.clone()) } else { None };
@@ -237,6 +239,7 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     ticket_id: ticket_id.clone(),
                     project: project.clone(),
                     group: group.clone(),
+                    epic: epic.clone(),
                     domain: domain.to_string(),
                     title: title.clone(),
                     description: description.clone(),
@@ -281,6 +284,7 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     if let Some(serde_json::Value::String(v)) = fields.get("priority") { item.priority = v.clone(); }
                     if let Some(serde_json::Value::String(v)) = fields.get("assignee") { item.assignee = Some(v.clone()); }
                     if let Some(serde_json::Value::String(v)) = fields.get("deadline") { item.deadline = Some(v.clone()); }
+                    if let Some(serde_json::Value::String(v)) = fields.get("epic") { item.epic = Some(v.clone()); }
                     item.updated_at = timestamp.clone();
                 }
             }
@@ -315,6 +319,7 @@ mod tests {
     fn roundtrip_create_event() {
         let event = KanbanEvent::Create {
             group: None,
+            epic: None,
             ticket_id: "SH-1".into(),
             title: "Fix billing".into(),
             project: "shulops".into(),
@@ -364,6 +369,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let event = KanbanEvent::Create {
             group: None,
+            epic: None,
             ticket_id: "SH-1".into(),
             title: "Test".into(),
             project: "shulops".into(),
@@ -389,6 +395,7 @@ mod tests {
         // Write events + meta
         let event = KanbanEvent::Create {
             group: None,
+            epic: None,
             ticket_id: "SH-1".into(), title: "A".into(), project: "shulops".into(),
             status: "backlog".into(), priority: "medium".into(),
             description: None, deadline: None, assignee: None, source: None,
@@ -407,6 +414,7 @@ mod tests {
         // Write events without meta
         let event = KanbanEvent::Create {
             group: None,
+            epic: None,
             ticket_id: "SH-3".into(), title: "B".into(), project: "shulops".into(),
             status: "backlog".into(), priority: "medium".into(),
             description: None, deadline: None, assignee: None, source: None,
@@ -428,6 +436,7 @@ mod tests {
         let events = vec![
             KanbanEvent::Create {
                 group: None,
+            epic: None,
             ticket_id: "SH-1".into(), title: "Fix billing".into(), project: "shulops".into(),
                 status: "backlog".into(), priority: "high".into(),
                 description: Some("Details".into()), deadline: Some("2026-05-01".into()),

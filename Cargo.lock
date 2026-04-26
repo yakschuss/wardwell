@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "wardwell"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "chrono",
  "clap",
