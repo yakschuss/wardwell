@@ -445,10 +445,10 @@ impl KanbanStore {
                     rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.created_at, item.updated_at, item.completed_at],
                 )?;
 
-                for (i, note) in item.notes.iter().enumerate() {
+                for note in &item.notes {
                     conn.execute(
-                        "INSERT INTO kanban_notes (id, ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4,?5)",
-                        rusqlite::params![i as i64 + 1, item.ticket_id, note.text, note.author, note.created_at],
+                        "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4)",
+                        rusqlite::params![item.ticket_id, note.text, note.author, note.created_at],
                     )?;
                 }
             }
