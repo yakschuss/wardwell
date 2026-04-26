@@ -24,6 +24,18 @@ pub struct KanbanItem {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub notes: Vec<KanbanNote>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<KanbanAttachment>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KanbanAttachment {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub storage_path: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -97,9 +109,19 @@ impl KanbanStore {
                 author     TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS kanban_attachments (
+                attachment_id TEXT PRIMARY KEY,
+                ticket_id    TEXT NOT NULL,
+                filename     TEXT NOT NULL,
+                mime_type    TEXT NOT NULL,
+                size         INTEGER NOT NULL,
+                storage_path TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_kanban_items_project ON kanban_items(project);
             CREATE INDEX IF NOT EXISTS idx_kanban_items_status ON kanban_items(status);
-            CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket ON kanban_notes(ticket_id);"
+            CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket ON kanban_notes(ticket_id);
+            CREATE INDEX IF NOT EXISTS idx_kanban_attachments_ticket ON kanban_attachments(ticket_id);"
         )?;
 
         let mut project_to_group = HashMap::new();
@@ -177,7 +199,7 @@ impl KanbanStore {
             description: description.map(str::to_string), status: status.into(), priority: priority.into(),
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), created_at: now.clone(), updated_at: now,
-            completed_at, notes: vec![],
+            completed_at, notes: vec![], attachments: vec![],
         })
     }
 
@@ -359,13 +381,14 @@ impl KanbanStore {
                 title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, priority: row.get(6)?,
                 assignee: row.get(7)?, deadline: row.get(8)?, source: row.get(9)?,
                 created_at: row.get(10)?, updated_at: row.get(11)?, completed_at: row.get(12)?,
-                notes: vec![],
+                notes: vec![], attachments: vec![],
             })
         })?.collect::<Result<_, _>>()?;
 
         items.into_iter().map(|mut item| {
             item.group = self.project_to_group.get(&item.project).cloned();
             item.notes = self.load_notes(&conn, &item.ticket_id)?;
+            item.attachments = self.load_attachments(&conn, &item.ticket_id)?;
             Ok(item)
         }).collect()
     }
@@ -410,13 +433,14 @@ impl KanbanStore {
                 title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, priority: row.get(6)?,
                 assignee: row.get(7)?, deadline: row.get(8)?, source: row.get(9)?,
                 created_at: row.get(10)?, updated_at: row.get(11)?, completed_at: row.get(12)?,
-                notes: vec![],
+                notes: vec![], attachments: vec![],
             })
         })?.collect::<Result<_, _>>()?;
 
         items.into_iter().map(|mut item| {
             item.group = self.project_to_group.get(&item.project).cloned();
             item.notes = self.load_notes(&conn, &item.ticket_id)?;
+            item.attachments = self.load_attachments(&conn, &item.ticket_id)?;
             Ok(item)
         }).collect()
     }
@@ -437,7 +461,7 @@ impl KanbanStore {
         let all = events::scan_all_jsonl(&self.vault_root);
         let conn = self.conn()?;
 
-        conn.execute_batch("DELETE FROM kanban_notes; DELETE FROM kanban_items; DELETE FROM kanban_projects;")?;
+        conn.execute_batch("DELETE FROM kanban_attachments; DELETE FROM kanban_notes; DELETE FROM kanban_items; DELETE FROM kanban_projects;")?;
 
         for (domain, _project, evts) in &all {
             let items = events::materialize(domain, evts);
@@ -460,6 +484,12 @@ impl KanbanStore {
                         rusqlite::params![item.ticket_id, note.text, note.author, note.created_at],
                     )?;
                 }
+                for att in &item.attachments {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO kanban_attachments (attachment_id, ticket_id, filename, mime_type, size, storage_path, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        rusqlite::params![att.attachment_id, item.ticket_id, att.filename, att.mime_type, att.size, att.storage_path, att.created_at],
+                    )?;
+                }
             }
         }
 
@@ -476,6 +506,81 @@ impl KanbanStore {
         Ok(notes)
     }
 
+    fn load_attachments(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<KanbanAttachment>, KanbanError> {
+        let mut stmt = conn.prepare("SELECT attachment_id, filename, mime_type, size, storage_path, created_at FROM kanban_attachments WHERE ticket_id=?1 ORDER BY created_at")?;
+        let atts = stmt.query_map(rusqlite::params![ticket_id], |row| {
+            Ok(KanbanAttachment {
+                attachment_id: row.get(0)?, filename: row.get(1)?, mime_type: row.get(2)?,
+                size: row.get(3)?, storage_path: row.get(4)?, created_at: row.get(5)?,
+            })
+        })?.collect::<Result<_, _>>()?;
+        Ok(atts)
+    }
+
+    pub fn attach_file(&self, ticket_id: &str, file_path: &Path) -> Result<KanbanAttachment, KanbanError> {
+        let conn = self.conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
+
+        let filename = file_path.file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed".into());
+        let mime_type = mime_from_ext(&filename);
+        let file_size = std::fs::metadata(file_path)?.len();
+        let attachment_id = uuid::Uuid::new_v4().to_string();
+        let storage_rel = format!("{ticket_id}/{attachment_id}-{filename}");
+
+        let config_dir = crate::config::loader::config_dir();
+        let storage_dir = config_dir.join("attachments").join(ticket_id);
+        std::fs::create_dir_all(&storage_dir)?;
+        let dest = config_dir.join("attachments").join(&storage_rel);
+        std::fs::copy(file_path, &dest)?;
+
+        let event = KanbanEvent::Attach {
+            ticket_id: ticket_id.into(), attachment_id: attachment_id.clone(),
+            filename: filename.clone(), mime_type: mime_type.clone(),
+            size: file_size, storage_path: storage_rel.clone(), timestamp: now.clone(),
+        };
+        events::append_event(&self.vault_root, &domain, &project, &event)?;
+
+        conn.execute(
+            "INSERT INTO kanban_attachments (attachment_id, ticket_id, filename, mime_type, size, storage_path, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![attachment_id, ticket_id, filename, mime_type, file_size as i64, storage_rel, now],
+        )?;
+        conn.execute("UPDATE kanban_items SET updated_at=?1 WHERE ticket_id=?2", rusqlite::params![now, ticket_id])?;
+
+        Ok(KanbanAttachment {
+            attachment_id, filename, mime_type, size: file_size, storage_path: storage_rel, created_at: now,
+        })
+    }
+
+    pub fn detach_file(&self, ticket_id: &str, attachment_id: &str) -> Result<(), KanbanError> {
+        let conn = self.conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
+
+        let storage_path: String = conn.query_row(
+            "SELECT storage_path FROM kanban_attachments WHERE attachment_id=?1 AND ticket_id=?2",
+            rusqlite::params![attachment_id, ticket_id], |row| row.get(0),
+        ).optional()?.ok_or_else(|| KanbanError::NotFound(format!("attachment '{attachment_id}' not found on ticket '{ticket_id}'")))?;
+
+        let config_dir = crate::config::loader::config_dir();
+        let full_path = config_dir.join("attachments").join(&storage_path);
+        let _ = std::fs::remove_file(full_path);
+
+        let event = KanbanEvent::Detach {
+            ticket_id: ticket_id.into(), attachment_id: attachment_id.into(), timestamp: now.clone(),
+        };
+        events::append_event(&self.vault_root, &domain, &project, &event)?;
+
+        conn.execute("DELETE FROM kanban_attachments WHERE attachment_id=?1", rusqlite::params![attachment_id])?;
+        conn.execute("UPDATE kanban_items SET updated_at=?1 WHERE ticket_id=?2", rusqlite::params![now, ticket_id])?;
+
+        Ok(())
+    }
+
     fn get_item_with_conn(&self, conn: &Connection, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
         let item: Option<KanbanItem> = conn.query_row(
             "SELECT ticket_id, project, epic, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
@@ -485,11 +590,13 @@ impl KanbanStore {
                 title: row.get(3)?, description: row.get(4)?, status: row.get(5)?, priority: row.get(6)?,
                 assignee: row.get(7)?, deadline: row.get(8)?, source: row.get(9)?,
                 created_at: row.get(10)?, updated_at: row.get(11)?, completed_at: row.get(12)?,
-                notes: vec![],
+                notes: vec![], attachments: vec![],
             }),
         ).optional()?;
         let mut item = item.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
+        item.group = self.project_to_group.get(&item.project).cloned();
         item.notes = self.load_notes(conn, ticket_id)?;
+        item.attachments = self.load_attachments(conn, ticket_id)?;
         Ok(item)
     }
 
@@ -563,6 +670,22 @@ fn load_kanban_yml(vault_root: &Path) -> HashMap<String, Vec<String>> {
         Ok(yml) => yml.groups,
         Err(_) => HashMap::new(),
     }
+}
+
+fn mime_from_ext(filename: &str) -> String {
+    match filename.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("json") => "application/json",
+        Some("txt") => "text/plain",
+        Some("md") => "text/markdown",
+        Some("csv") => "text/csv",
+        _ => "application/octet-stream",
+    }.into()
 }
 
 fn validate_status(s: &str) -> Result<&str, KanbanError> {

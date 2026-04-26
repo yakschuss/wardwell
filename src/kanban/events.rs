@@ -56,6 +56,22 @@ pub enum KanbanEvent {
         ticket_id: String,
         timestamp: String,
     },
+    #[serde(rename = "attach")]
+    Attach {
+        ticket_id: String,
+        attachment_id: String,
+        filename: String,
+        mime_type: String,
+        size: u64,
+        storage_path: String,
+        timestamp: String,
+    },
+    #[serde(rename = "detach")]
+    Detach {
+        ticket_id: String,
+        attachment_id: String,
+        timestamp: String,
+    },
 }
 
 fn default_backlog() -> String { "backlog".into() }
@@ -68,7 +84,9 @@ impl KanbanEvent {
             | Self::Move { ticket_id, .. }
             | Self::Update { ticket_id, .. }
             | Self::Note { ticket_id, .. }
-            | Self::Archive { ticket_id, .. } => ticket_id,
+            | Self::Archive { ticket_id, .. }
+            | Self::Attach { ticket_id, .. }
+            | Self::Detach { ticket_id, .. } => ticket_id,
         }
     }
 
@@ -78,7 +96,9 @@ impl KanbanEvent {
             | Self::Move { timestamp, .. }
             | Self::Update { timestamp, .. }
             | Self::Note { timestamp, .. }
-            | Self::Archive { timestamp, .. } => timestamp,
+            | Self::Archive { timestamp, .. }
+            | Self::Attach { timestamp, .. }
+            | Self::Detach { timestamp, .. } => timestamp,
         }
     }
 }
@@ -216,6 +236,17 @@ pub struct MaterializedItem {
     pub completed_at: Option<String>,
     pub archived: bool,
     pub notes: Vec<MaterializedNote>,
+    pub attachments: Vec<MaterializedAttachment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MaterializedAttachment {
+    pub attachment_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+    pub storage_path: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +284,7 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     completed_at,
                     archived: false,
                     notes: vec![],
+                    attachments: vec![],
                 });
             }
             KanbanEvent::Move { ticket_id, to, timestamp, .. } => {
@@ -301,6 +333,25 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
             KanbanEvent::Archive { ticket_id, timestamp } => {
                 if let Some(item) = items.get_mut(ticket_id) {
                     item.archived = true;
+                    item.updated_at = timestamp.clone();
+                }
+            }
+            KanbanEvent::Attach { ticket_id, attachment_id, filename, mime_type, size, storage_path, timestamp } => {
+                if let Some(item) = items.get_mut(ticket_id) {
+                    item.attachments.push(MaterializedAttachment {
+                        attachment_id: attachment_id.clone(),
+                        filename: filename.clone(),
+                        mime_type: mime_type.clone(),
+                        size: *size,
+                        storage_path: storage_path.clone(),
+                        created_at: timestamp.clone(),
+                    });
+                    item.updated_at = timestamp.clone();
+                }
+            }
+            KanbanEvent::Detach { ticket_id, attachment_id, timestamp } => {
+                if let Some(item) = items.get_mut(ticket_id) {
+                    item.attachments.retain(|a| a.attachment_id != *attachment_id);
                     item.updated_at = timestamp.clone();
                 }
             }

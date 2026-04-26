@@ -120,9 +120,9 @@ pub struct ClipboardParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KanbanParams {
-    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required).")]
+    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: attach file (ticket_id+file_path required). detach: remove attachment (ticket_id+attachment_id required).")]
     pub action: String,
-    #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note.")]
+    #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note, attach, detach.")]
     pub ticket_id: Option<String>,
     #[schemars(description = "Project slug (e.g., 'shulops'). Required for create. Optional filter for list, query.")]
     pub project: Option<String>,
@@ -150,6 +150,10 @@ pub struct KanbanParams {
     pub include_done: Option<bool>,
     #[schemars(description = "Named query to run (e.g., 'overdue', 'stale', 'no_deadline', 'blocked', 'recent').")]
     pub question: Option<String>,
+    #[schemars(description = "Local filesystem path to a file to attach. Required for attach action.")]
+    pub file_path: Option<String>,
+    #[schemars(description = "Attachment ID to detach. Required for detach action.")]
+    pub attachment_id: Option<String>,
 }
 
 #[tool_router(router = tool_router)]
@@ -294,7 +298,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board. Create, update, move, and query work items across projects. Items have ticket IDs (e.g., SH-3), status (backlog->todo->in_progress->review->done), priority, assignee, deadline, and notes.")]
+    #[tool(description = "Project kanban board. Create, update, move, and query work items across projects. Items have ticket IDs (e.g., SH-3), status (backlog->todo->in_progress->review->done), priority, assignee, deadline, notes, and file attachments.")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -307,7 +311,9 @@ impl WardwellServer {
             "move" => self.kanban_move(kanban, &p),
             "note" => self.kanban_note(kanban, &p),
             "query" => self.kanban_query(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: list, create, update, move, note, query")),
+            "attach" => self.kanban_attach(kanban, &p),
+            "detach" => self.kanban_detach(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: list, create, update, move, note, query, attach, detach")),
         }
     }
 }
@@ -2042,6 +2048,64 @@ impl WardwellServer {
                 serde_json::to_string(&serde_json::json!({
                     "items": items, "total": total, "returned": total,
                 })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_attach(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for attach");
+        };
+        let Some(ref file_path) = p.file_path else {
+            return json_error("'file_path' is required for attach");
+        };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
+            if let Err(e) = self.check_kanban_domain_access(dom) {
+                return json_error(&e);
+            }
+        }
+        let path = std::path::Path::new(file_path);
+        if !path.exists() {
+            return json_error(&format!("file not found: {file_path}"));
+        }
+        match kanban.attach_file(ticket_id, path) {
+            Ok(att) => {
+                let audit_line = format!("{ticket_id} attach: \"{}\" ({})", att.filename, att.attachment_id);
+                if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
+                    let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
+                }
+                serde_json::to_string(&serde_json::json!({
+                    "attached": true, "attachment": {
+                        "attachment_id": att.attachment_id, "filename": att.filename,
+                        "mime_type": att.mime_type, "size": att.size,
+                        "storage_path": att.storage_path,
+                    }
+                })).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_detach(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for detach");
+        };
+        let Some(ref attachment_id) = p.attachment_id else {
+            return json_error("'attachment_id' is required for detach");
+        };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
+            if let Err(e) = self.check_kanban_domain_access(dom) {
+                return json_error(&e);
+            }
+        }
+        match kanban.detach_file(ticket_id, attachment_id) {
+            Ok(()) => {
+                let audit_line = format!("{ticket_id} detach: {attachment_id}");
+                if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
+                    let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, dom, proj, &audit_line);
+                }
+                serde_json::to_string(&serde_json::json!({"detached": true})).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
