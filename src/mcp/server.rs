@@ -2078,7 +2078,9 @@ impl WardwellServer {
                         "attachment_id": att.attachment_id, "filename": att.filename,
                         "mime_type": att.mime_type, "size": att.size,
                         "storage_path": att.storage_path,
-                    }
+                        "read_path": att.read_path,
+                    },
+                    "hint": "To read this file, use wardwell_search action:read path:<read_path>"
                 })).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),

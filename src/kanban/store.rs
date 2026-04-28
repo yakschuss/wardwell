@@ -35,6 +35,7 @@ pub struct KanbanAttachment {
     pub mime_type: String,
     pub size: u64,
     pub storage_path: String,
+    pub read_path: String,
     pub created_at: String,
 }
 
@@ -573,9 +574,10 @@ impl KanbanStore {
     fn load_attachments(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<KanbanAttachment>, KanbanError> {
         let mut stmt = conn.prepare("SELECT attachment_id, filename, mime_type, size, storage_path, created_at FROM kanban_attachments WHERE ticket_id=?1 ORDER BY created_at")?;
         let atts = stmt.query_map(rusqlite::params![ticket_id], |row| {
+            let sp: String = row.get(4)?;
             Ok(KanbanAttachment {
                 attachment_id: row.get(0)?, filename: row.get(1)?, mime_type: row.get(2)?,
-                size: row.get(3)?, storage_path: row.get(4)?, created_at: row.get(5)?,
+                size: row.get(3)?, read_path: sp.clone(), storage_path: sp, created_at: row.get(5)?,
             })
         })?.collect::<Result<_, _>>()?;
         Ok(atts)
@@ -633,7 +635,8 @@ impl KanbanStore {
         conn.execute("UPDATE kanban_items SET updated_at=?1 WHERE ticket_id=?2", rusqlite::params![now, ticket_id])?;
 
         Ok(KanbanAttachment {
-            attachment_id, filename, mime_type, size: file_size, storage_path: storage_rel, created_at: now,
+            attachment_id, filename, mime_type, size: file_size,
+            read_path: storage_rel.clone(), storage_path: storage_rel, created_at: now,
         })
     }
 
