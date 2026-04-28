@@ -597,7 +597,11 @@ impl KanbanStore {
         // Store in vault docs directory: {domain}/{project}/docs/{ticket_id}-{filename}
         let docs_dir = self.vault_root.join(&domain).join(&project).join("docs");
         std::fs::create_dir_all(&docs_dir)?;
-        let dest_filename = format!("{ticket_id}-{filename}");
+        let dest_filename = if filename.starts_with(ticket_id) {
+            filename.clone()
+        } else {
+            format!("{ticket_id}-{filename}")
+        };
         let dest = docs_dir.join(&dest_filename);
         std::fs::copy(file_path, &dest)?;
 
