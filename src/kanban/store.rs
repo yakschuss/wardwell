@@ -592,6 +592,9 @@ impl KanbanStore {
             .unwrap_or_else(|| "unnamed".into());
         let mime_type = mime_from_ext(&filename);
         let file_size = std::fs::metadata(file_path)?.len();
+        if file_size == 0 {
+            return Err(KanbanError::InvalidInput("cannot attach empty file (0 bytes)".into()));
+        }
         let attachment_id = uuid::Uuid::new_v4().to_string();
 
         // Store in vault docs directory: {domain}/{project}/docs/{ticket_id}-{filename}
@@ -604,6 +607,14 @@ impl KanbanStore {
         };
         let dest = docs_dir.join(&dest_filename);
         std::fs::copy(file_path, &dest)?;
+
+        let copied_size = std::fs::metadata(&dest)?.len();
+        if copied_size != file_size {
+            let _ = std::fs::remove_file(&dest);
+            return Err(KanbanError::InvalidInput(format!(
+                "copy failed: source {file_size} bytes, destination {copied_size} bytes"
+            )));
+        }
 
         // Vault-relative path for JSONL and SQLite
         let storage_rel = format!("{domain}/{project}/docs/{dest_filename}");
