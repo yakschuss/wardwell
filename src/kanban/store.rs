@@ -74,7 +74,7 @@ pub struct KanbanStore {
 }
 
 impl KanbanStore {
-    const SCHEMA_VERSION: i64 = 3;
+    const SCHEMA_VERSION: i64 = 4;
 
     pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
         let groups = load_kanban_yml(&vault_root);
@@ -593,13 +593,16 @@ impl KanbanStore {
         let mime_type = mime_from_ext(&filename);
         let file_size = std::fs::metadata(file_path)?.len();
         let attachment_id = uuid::Uuid::new_v4().to_string();
-        let storage_rel = format!("{ticket_id}/{attachment_id}-{filename}");
 
-        let config_dir = crate::config::loader::config_dir();
-        let storage_dir = config_dir.join("attachments").join(ticket_id);
-        std::fs::create_dir_all(&storage_dir)?;
-        let dest = config_dir.join("attachments").join(&storage_rel);
+        // Store in vault docs directory: {domain}/{project}/docs/{ticket_id}-{filename}
+        let docs_dir = self.vault_root.join(&domain).join(&project).join("docs");
+        std::fs::create_dir_all(&docs_dir)?;
+        let dest_filename = format!("{ticket_id}-{filename}");
+        let dest = docs_dir.join(&dest_filename);
         std::fs::copy(file_path, &dest)?;
+
+        // Vault-relative path for JSONL and SQLite
+        let storage_rel = format!("{domain}/{project}/docs/{dest_filename}");
 
         let event = KanbanEvent::Attach {
             ticket_id: ticket_id.into(), attachment_id: attachment_id.clone(),
@@ -630,8 +633,8 @@ impl KanbanStore {
             rusqlite::params![attachment_id, ticket_id], |row| row.get(0),
         ).optional()?.ok_or_else(|| KanbanError::NotFound(format!("attachment '{attachment_id}' not found on ticket '{ticket_id}'")))?;
 
-        let config_dir = crate::config::loader::config_dir();
-        let full_path = config_dir.join("attachments").join(&storage_path);
+        // Delete from vault docs directory
+        let full_path = self.vault_root.join(&storage_path);
         let _ = std::fs::remove_file(full_path);
 
         let event = KanbanEvent::Detach {

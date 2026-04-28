@@ -37,6 +37,8 @@ enum Commands {
         /// Domain or domain/project path (e.g., "work", "work/my-project")
         target: String,
     },
+    /// Migrate kanban attachments from ~/.wardwell/attachments/ to vault docs/
+    MigrateAttachments,
 }
 
 #[tokio::main]
@@ -54,6 +56,7 @@ async fn main() {
         Commands::Resolve => run_resolve(),
         Commands::Reindex => run_reindex(),
         Commands::Seed { ref target } => run_seed(target),
+        Commands::MigrateAttachments => run_migrate_attachments(),
     };
     if let Err(e) = result {
         eprintln!("wardwell: {e}");
@@ -484,5 +487,68 @@ fn slug_to_title(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn run_migrate_attachments() -> Result<(), Box<dyn std::error::Error>> {
+    use wardwell::config::loader;
+    use wardwell::kanban::events;
+
+    let config = loader::load(None)?;
+    let vault_root = &config.vault_path;
+    let config_dir = loader::config_dir();
+    let old_dir = config_dir.join("attachments");
+
+    if !old_dir.exists() {
+        println!("No ~/.wardwell/attachments/ directory found — nothing to migrate.");
+        return Ok(());
+    }
+
+    let all = events::scan_all_jsonl(vault_root);
+    let mut migrated = 0u32;
+    let mut skipped = 0u32;
+
+    for (domain, project, evts) in &all {
+        let items = events::materialize(domain, evts);
+        for item in &items {
+            for att in &item.attachments {
+                // Check if storage_path points to old internal location
+                let old_path = config_dir.join("attachments").join(&att.storage_path);
+                if !old_path.exists() {
+                    // Try the old format: {ticket_id}/{uuid}-{filename}
+                    let alt_path = old_dir.join(&att.storage_path);
+                    if !alt_path.exists() {
+                        skipped += 1;
+                        continue;
+                    }
+                }
+
+                let source = if old_path.exists() { &old_path } else {
+                    skipped += 1;
+                    continue;
+                };
+
+                // New destination in vault docs
+                let docs_dir = vault_root.join(domain).join(project).join("docs");
+                std::fs::create_dir_all(&docs_dir)?;
+                let dest_filename = format!("{}-{}", item.ticket_id, att.filename);
+                let dest = docs_dir.join(&dest_filename);
+
+                if dest.exists() {
+                    skipped += 1;
+                    continue;
+                }
+
+                std::fs::copy(source, &dest)?;
+                println!("  {} → {domain}/{project}/docs/{dest_filename}", att.storage_path);
+                migrated += 1;
+            }
+        }
+    }
+
+    println!("\nMigrated: {migrated}, Skipped: {skipped}");
+    if migrated > 0 {
+        println!("Note: Old files left in ~/.wardwell/attachments/ — delete manually after verifying.");
+    }
+    Ok(())
 }
 
