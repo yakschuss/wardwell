@@ -604,6 +604,11 @@ impl KanbanStore {
         let mime_type = mime_from_ext(&filename);
 
         let full_path = self.vault_root.join(vault_path);
+        if !full_path.exists() {
+            return Err(KanbanError::InvalidInput(format!(
+                "file not found at {vault_path}. Write the file to the vault first, then attach."
+            )));
+        }
         let file_size = std::fs::metadata(&full_path)
             .map(|m| m.len())
             .unwrap_or(0);
