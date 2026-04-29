@@ -150,6 +150,10 @@ pub struct KanbanParams {
     pub include_done: Option<bool>,
     #[schemars(description = "Named query to run (e.g., 'overdue', 'stale', 'no_deadline', 'blocked', 'recent').")]
     pub question: Option<String>,
+    #[schemars(description = "Tags: array of free-form string labels. For create/update: set tags. For list: filter by tag.")]
+    pub tags: Option<Vec<String>>,
+    #[schemars(description = "Single tag to filter by on list. Returns items containing this tag.")]
+    pub tag: Option<String>,
     #[schemars(description = "For attach with existing file: vault-relative path (e.g., 'personal/shulops/docs/SH-6-build-prompt.md'). Not needed when using text+title to write content directly.")]
     pub file_path: Option<String>,
     #[schemars(description = "Attachment ID to detach. Required for detach action.")]
@@ -1886,6 +1890,7 @@ impl WardwellServer {
             p.priority.as_deref(),
             p.assignee.as_deref(),
             p.epic.as_deref(),
+            p.tag.as_deref(),
             p.include_done.unwrap_or(false),
             domains,
         ) {
@@ -1925,7 +1930,7 @@ impl WardwellServer {
             title, project, &domain,
             p.description.as_deref(), p.status.as_deref(), p.priority.as_deref(),
             p.assignee.as_deref(), p.deadline.as_deref(), p.source.as_deref(),
-            p.epic.as_deref(), &self.config.kanban_prefixes,
+            p.epic.as_deref(), p.tags.as_deref(), &self.config.kanban_prefixes,
         ) {
             Ok(item) => {
                 let mut audit_line = format!("{} created: {} [{}]", item.ticket_id, item.title, item.status);
@@ -1958,7 +1963,7 @@ impl WardwellServer {
         match kanban.update_item(
             ticket_id, p.title.as_deref(), p.description.as_deref(),
             p.status.as_deref(), p.priority.as_deref(), p.assignee.as_deref(), p.deadline.as_deref(),
-            p.epic.as_deref(),
+            p.epic.as_deref(), p.tags.as_deref(),
         ) {
             Ok(item) => {
                 let mut changes = Vec::new();
