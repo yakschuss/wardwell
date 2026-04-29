@@ -613,10 +613,15 @@ impl KanbanStore {
             let full_path = self.vault_root.join(vp);
             if !full_path.exists() {
                 return Err(KanbanError::InvalidInput(format!(
-                    "file not found at {vp}. Pass content instead, or write the file to the vault first."
+                    "file not found at {vp}. Use content mode instead (pass text+title), or write the file to the vault first."
                 )));
             }
             let size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                return Err(KanbanError::InvalidInput(format!(
+                    "file at {vp} is 0 bytes (likely an iCloud placeholder). Use content mode instead: pass text+title to write and attach in one call."
+                )));
+            }
             let fname = Path::new(vp).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "unnamed".into());
             (fname, vp.to_string(), size)
         } else {
