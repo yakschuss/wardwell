@@ -120,7 +120,7 @@ pub struct ClipboardParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KanbanParams {
-    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: link an existing vault file to a ticket (ticket_id+file_path required). Write the file to the vault FIRST (e.g., {domain}/{project}/docs/{ticket_id}-{name}.md), then call attach with the vault-relative path. detach: unlink attachment (ticket_id+attachment_id required).")]
+    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: write content to a ticket as a doc (ticket_id+title+text) — or link an existing vault file (ticket_id+file_path). detach: unlink attachment (ticket_id+attachment_id required).")]
     pub action: String,
     #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note, attach, detach.")]
     pub ticket_id: Option<String>,
@@ -128,7 +128,7 @@ pub struct KanbanParams {
     pub project: Option<String>,
     #[schemars(description = "Vault domain (e.g., 'personal'). Optional for create — inferred from project directory if omitted.")]
     pub domain: Option<String>,
-    #[schemars(description = "Item title. Required for create. Optional for update.")]
+    #[schemars(description = "Item title. Required for create. Optional for update. For attach: filename (e.g., 'build-prompt.md').")]
     pub title: Option<String>,
     #[schemars(description = "Item description/details.")]
     pub description: Option<String>,
@@ -144,13 +144,13 @@ pub struct KanbanParams {
     pub source: Option<String>,
     #[schemars(description = "Epic label for grouping related items (e.g., 'whatsapp-flows', 'admin-redesign'). Optional on create/update, filter on list.")]
     pub epic: Option<String>,
-    #[schemars(description = "Note text. Required for note action.")]
+    #[schemars(description = "For note: note text. For attach: file content to write (used with title as filename).")]
     pub text: Option<String>,
     #[schemars(description = "Include completed items in list results. Default false.")]
     pub include_done: Option<bool>,
     #[schemars(description = "Named query to run (e.g., 'overdue', 'stale', 'no_deadline', 'blocked', 'recent').")]
     pub question: Option<String>,
-    #[schemars(description = "Vault-relative path to an existing file (e.g., 'personal/shulops/docs/SH-6-build-prompt.md'). The file must already exist in the vault. Required for attach action.")]
+    #[schemars(description = "For attach with existing file: vault-relative path (e.g., 'personal/shulops/docs/SH-6-build-prompt.md'). Not needed when using text+title to write content directly.")]
     pub file_path: Option<String>,
     #[schemars(description = "Attachment ID to detach. Required for detach action.")]
     pub attachment_id: Option<String>,
@@ -2055,15 +2055,16 @@ impl WardwellServer {
         let Some(ref ticket_id) = p.ticket_id else {
             return json_error("'ticket_id' is required for attach");
         };
-        let Some(ref file_path) = p.file_path else {
-            return json_error("'file_path' is required for attach — vault-relative path to an existing file (e.g., 'personal/shulops/docs/SH-6-build-prompt.md')");
-        };
+        if p.text.is_none() && p.file_path.is_none() {
+            return json_error("provide 'text' (content to write and attach) with 'title' (filename), or 'file_path' (vault-relative path to existing file)");
+        }
+        let filename = p.title.as_deref().or(p.file_path.as_deref()).unwrap_or("attachment.md");
         if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
             if let Err(e) = self.check_kanban_domain_access(dom) {
                 return json_error(&e);
             }
         }
-        match kanban.attach_file(ticket_id, file_path) {
+        match kanban.attach_file(ticket_id, filename, p.text.as_deref(), p.file_path.as_deref()) {
             Ok(att) => {
                 let audit_line = format!("{ticket_id} attach: \"{}\" ({})", att.filename, att.attachment_id);
                 if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {

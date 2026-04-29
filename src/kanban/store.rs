@@ -583,54 +583,65 @@ impl KanbanStore {
         Ok(atts)
     }
 
-    /// Register a vault-relative file path as an attachment on a ticket.
-    /// The file must already exist in the vault at {domain}/{project}/docs/.
-    pub fn attach_file(&self, ticket_id: &str, vault_path: &str) -> Result<KanbanAttachment, KanbanError> {
+    /// Attach content or an existing file to a ticket.
+    /// If content is provided: writes to {domain}/{project}/docs/{filename}, then records pointer.
+    /// If content is None: registers an existing vault-relative file path as a pointer.
+    pub fn attach_file(&self, ticket_id: &str, filename: &str, content: Option<&str>, vault_path: Option<&str>) -> Result<KanbanAttachment, KanbanError> {
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        let expected_prefix = format!("{domain}/{project}/docs/");
-        if !vault_path.starts_with(&expected_prefix) {
-            return Err(KanbanError::InvalidInput(format!(
-                "file must be in {expected_prefix}. Write it there first (e.g., {expected_prefix}{ticket_id}-yourfile.md), then call attach with that path."
-            )));
-        }
+        let (resolved_filename, resolved_path, file_size) = if let Some(text) = content {
+            if text.is_empty() {
+                return Err(KanbanError::InvalidInput("content is empty".into()));
+            }
+            let fname = if filename.starts_with(ticket_id) { filename.to_string() } else { format!("{ticket_id}-{filename}") };
+            let docs_dir = self.vault_root.join(&domain).join(&project).join("docs");
+            std::fs::create_dir_all(&docs_dir)?;
+            let dest = docs_dir.join(&fname);
+            std::fs::write(&dest, text)?;
+            let vault_rel = format!("{domain}/{project}/docs/{fname}");
+            (fname, vault_rel, text.len() as u64)
+        } else if let Some(vp) = vault_path {
+            let expected_prefix = format!("{domain}/{project}/docs/");
+            if !vp.starts_with(&expected_prefix) {
+                return Err(KanbanError::InvalidInput(format!(
+                    "file must be in {expected_prefix}. Pass content instead, or write the file there first."
+                )));
+            }
+            let full_path = self.vault_root.join(vp);
+            if !full_path.exists() {
+                return Err(KanbanError::InvalidInput(format!(
+                    "file not found at {vp}. Pass content instead, or write the file to the vault first."
+                )));
+            }
+            let size = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
+            let fname = Path::new(vp).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "unnamed".into());
+            (fname, vp.to_string(), size)
+        } else {
+            return Err(KanbanError::InvalidInput("provide either 'content' (to write and attach) or 'file_path' (to attach an existing vault file)".into()));
+        };
 
-        let filename = Path::new(vault_path).file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unnamed".into());
-        let mime_type = mime_from_ext(&filename);
-
-        let full_path = self.vault_root.join(vault_path);
-        if !full_path.exists() {
-            return Err(KanbanError::InvalidInput(format!(
-                "file not found at {vault_path}. Write the file to the vault first, then attach."
-            )));
-        }
-        let file_size = std::fs::metadata(&full_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-
+        let mime_type = mime_from_ext(&resolved_filename);
         let attachment_id = uuid::Uuid::new_v4().to_string();
 
         let event = KanbanEvent::Attach {
             ticket_id: ticket_id.into(), attachment_id: attachment_id.clone(),
-            filename: filename.clone(), mime_type: mime_type.clone(),
-            size: file_size, storage_path: vault_path.to_string(), timestamp: now.clone(),
+            filename: resolved_filename.clone(), mime_type: mime_type.clone(),
+            size: file_size, storage_path: resolved_path.clone(), timestamp: now.clone(),
         };
         events::append_event(&self.vault_root, &domain, &project, &event)?;
 
         conn.execute(
             "INSERT INTO kanban_attachments (attachment_id, ticket_id, filename, mime_type, size, storage_path, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![attachment_id, ticket_id, filename, mime_type, file_size as i64, vault_path, now],
+            rusqlite::params![attachment_id, ticket_id, resolved_filename, mime_type, file_size as i64, resolved_path, now],
         )?;
         conn.execute("UPDATE kanban_items SET updated_at=?1 WHERE ticket_id=?2", rusqlite::params![now, ticket_id])?;
 
         Ok(KanbanAttachment {
-            attachment_id, filename, mime_type, size: file_size,
-            read_path: vault_path.to_string(), storage_path: vault_path.to_string(), created_at: now,
+            attachment_id, filename: resolved_filename, mime_type, size: file_size,
+            read_path: resolved_path.clone(), storage_path: resolved_path, created_at: now,
         })
     }
 
