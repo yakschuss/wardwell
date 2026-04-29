@@ -583,72 +583,56 @@ impl KanbanStore {
         Ok(atts)
     }
 
-    pub fn attach_file(&self, ticket_id: &str, file_path: &Path) -> Result<KanbanAttachment, KanbanError> {
+    /// Register a vault-relative file path as an attachment on a ticket.
+    /// The file must already exist in the vault — this just records the pointer.
+    pub fn attach_file(&self, ticket_id: &str, vault_path: &str) -> Result<KanbanAttachment, KanbanError> {
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        let filename = file_path.file_name()
+        let filename = Path::new(vault_path).file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| "unnamed".into());
         let mime_type = mime_from_ext(&filename);
-        // Read content into memory first — filesystem copy can race with
-        // iCloud sync or unflushed writes from the same session.
-        let content = std::fs::read(file_path)?;
-        if content.is_empty() {
-            return Err(KanbanError::InvalidInput("cannot attach empty file (0 bytes)".into()));
-        }
-        let file_size = content.len() as u64;
+
+        let full_path = self.vault_root.join(vault_path);
+        let file_size = std::fs::metadata(&full_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
         let attachment_id = uuid::Uuid::new_v4().to_string();
-
-        // Store in vault docs directory: {domain}/{project}/docs/{ticket_id}-{filename}
-        let docs_dir = self.vault_root.join(&domain).join(&project).join("docs");
-        std::fs::create_dir_all(&docs_dir)?;
-        let dest_filename = if filename.starts_with(ticket_id) {
-            filename.clone()
-        } else {
-            format!("{ticket_id}-{filename}")
-        };
-        let dest = docs_dir.join(&dest_filename);
-        std::fs::write(&dest, &content)?;
-
-        // Vault-relative path for JSONL and SQLite
-        let storage_rel = format!("{domain}/{project}/docs/{dest_filename}");
 
         let event = KanbanEvent::Attach {
             ticket_id: ticket_id.into(), attachment_id: attachment_id.clone(),
             filename: filename.clone(), mime_type: mime_type.clone(),
-            size: file_size, storage_path: storage_rel.clone(), timestamp: now.clone(),
+            size: file_size, storage_path: vault_path.to_string(), timestamp: now.clone(),
         };
         events::append_event(&self.vault_root, &domain, &project, &event)?;
 
         conn.execute(
             "INSERT INTO kanban_attachments (attachment_id, ticket_id, filename, mime_type, size, storage_path, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![attachment_id, ticket_id, filename, mime_type, file_size as i64, storage_rel, now],
+            rusqlite::params![attachment_id, ticket_id, filename, mime_type, file_size as i64, vault_path, now],
         )?;
         conn.execute("UPDATE kanban_items SET updated_at=?1 WHERE ticket_id=?2", rusqlite::params![now, ticket_id])?;
 
         Ok(KanbanAttachment {
             attachment_id, filename, mime_type, size: file_size,
-            read_path: storage_rel.clone(), storage_path: storage_rel, created_at: now,
+            read_path: vault_path.to_string(), storage_path: vault_path.to_string(), created_at: now,
         })
     }
 
+    /// Remove an attachment pointer from a ticket. Does not delete the file.
     pub fn detach_file(&self, ticket_id: &str, attachment_id: &str) -> Result<(), KanbanError> {
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        let storage_path: String = conn.query_row(
+        let _storage_path: String = conn.query_row(
             "SELECT storage_path FROM kanban_attachments WHERE attachment_id=?1 AND ticket_id=?2",
             rusqlite::params![attachment_id, ticket_id], |row| row.get(0),
         ).optional()?.ok_or_else(|| KanbanError::NotFound(format!("attachment '{attachment_id}' not found on ticket '{ticket_id}'")))?;
-
-        // Delete from vault docs directory
-        let full_path = self.vault_root.join(&storage_path);
-        let _ = std::fs::remove_file(full_path);
 
         let event = KanbanEvent::Detach {
             ticket_id: ticket_id.into(), attachment_id: attachment_id.into(), timestamp: now.clone(),

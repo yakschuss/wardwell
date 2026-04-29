@@ -150,7 +150,7 @@ pub struct KanbanParams {
     pub include_done: Option<bool>,
     #[schemars(description = "Named query to run (e.g., 'overdue', 'stale', 'no_deadline', 'blocked', 'recent').")]
     pub question: Option<String>,
-    #[schemars(description = "Local filesystem path to a file to attach. Required for attach action.")]
+    #[schemars(description = "Vault-relative path to an existing file (e.g., 'personal/shulops/docs/SH-6-build-prompt.md'). The file must already exist in the vault. Required for attach action.")]
     pub file_path: Option<String>,
     #[schemars(description = "Attachment ID to detach. Required for detach action.")]
     pub attachment_id: Option<String>,
@@ -2056,18 +2056,14 @@ impl WardwellServer {
             return json_error("'ticket_id' is required for attach");
         };
         let Some(ref file_path) = p.file_path else {
-            return json_error("'file_path' is required for attach");
+            return json_error("'file_path' is required for attach — vault-relative path to an existing file (e.g., 'personal/shulops/docs/SH-6-build-prompt.md')");
         };
         if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
             if let Err(e) = self.check_kanban_domain_access(dom) {
                 return json_error(&e);
             }
         }
-        let path = std::path::Path::new(file_path);
-        if !path.exists() {
-            return json_error(&format!("file not found: {file_path}"));
-        }
-        match kanban.attach_file(ticket_id, path) {
+        match kanban.attach_file(ticket_id, file_path) {
             Ok(att) => {
                 let audit_line = format!("{ticket_id} attach: \"{}\" ({})", att.filename, att.attachment_id);
                 if let Some((ref dom, ref proj)) = self.lookup_item_domain(kanban, ticket_id) {
