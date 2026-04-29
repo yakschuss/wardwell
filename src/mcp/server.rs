@@ -120,7 +120,7 @@ pub struct ClipboardParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KanbanParams {
-    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: attach file (ticket_id+file_path required). detach: remove attachment (ticket_id+attachment_id required).")]
+    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: link an existing vault file to a ticket (ticket_id+file_path required). Write the file to the vault FIRST (e.g., {domain}/{project}/docs/{ticket_id}-{name}.md), then call attach with the vault-relative path. detach: unlink attachment (ticket_id+attachment_id required).")]
     pub action: String,
     #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note, attach, detach.")]
     pub ticket_id: Option<String>,
