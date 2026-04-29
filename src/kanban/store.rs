@@ -584,12 +584,19 @@ impl KanbanStore {
     }
 
     /// Register a vault-relative file path as an attachment on a ticket.
-    /// The file must already exist in the vault — this just records the pointer.
+    /// The file must already exist in the vault at {domain}/{project}/docs/.
     pub fn attach_file(&self, ticket_id: &str, vault_path: &str) -> Result<KanbanAttachment, KanbanError> {
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
+
+        let expected_prefix = format!("{domain}/{project}/docs/");
+        if !vault_path.starts_with(&expected_prefix) {
+            return Err(KanbanError::InvalidInput(format!(
+                "file must be in {expected_prefix}. Write it there first (e.g., {expected_prefix}{ticket_id}-yourfile.md), then call attach with that path."
+            )));
+        }
 
         let filename = Path::new(vault_path).file_name()
             .map(|f| f.to_string_lossy().to_string())
