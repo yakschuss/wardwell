@@ -20,7 +20,7 @@ fn create_100_items_in_one_project() {
     for i in 1..=100 {
         let title = format!("Item {i}");
         let item = store
-            .create_item(&title, "bigproject", "work", None, None, None, None, None, None, None, None, &pf)
+            .create_item(&title, "bigproject", "work", None, None, None, None, None, None, None, None, None, &pf)
             .unwrap();
         assert_eq!(item.ticket_id, format!("BI-{i}"));
     }
@@ -39,7 +39,7 @@ fn create_items_across_20_projects() {
     ];
     for p in &projects {
         store
-            .create_item(&format!("Task for {p}"), p, "work", None, None, None, None, None, None, None, None, &pf)
+            .create_item(&format!("Task for {p}"), p, "work", None, None, None, None, None, None, None, None, None, &pf)
             .unwrap();
     }
     let items = store.list(None, None, None, None, None, None, false, None).unwrap();
@@ -67,7 +67,7 @@ fn create_with_empty_title() {
     let pf = HashMap::new();
     // Empty string is technically valid — just an empty title
     let item = store
-        .create_item("", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
     assert_eq!(item.title, "");
 }
@@ -77,7 +77,7 @@ fn create_with_unicode_title() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     let item = store
-        .create_item("修复计费流程 🔥", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("修复计费流程 🔥", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
     assert_eq!(item.title, "修复计费流程 🔥");
 }
@@ -88,7 +88,7 @@ fn create_with_very_long_title() {
     let pf = HashMap::new();
     let long_title = "A".repeat(10_000);
     let item = store
-        .create_item(&long_title, "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item(&long_title, "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
     assert_eq!(item.title.len(), 10_000);
 }
@@ -102,7 +102,7 @@ fn create_with_sql_injection_in_title() {
             "'; DROP TABLE kanban_items; --",
             "proj",
             "work",
-            None, None, None, None, None, None, None, None, &pf,
+            None, None, None, None, None, None, None, None, None, &pf,
         )
         .unwrap();
     assert_eq!(item.title, "'; DROP TABLE kanban_items; --");
@@ -117,7 +117,7 @@ fn create_with_invalid_status() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     let result = store.create_item(
-        "Task", "proj", "work", None, Some("invalid_status"), None, None, None, None, None, None, &pf,
+        "Task", "proj", "work", None, Some("invalid_status"), None, None, None, None, None, None, None, &pf,
     );
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("invalid status"));
@@ -128,7 +128,7 @@ fn create_with_invalid_priority() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     let result = store.create_item(
-        "Task", "proj", "work", None, None, Some("critical"), None, None, None, None, None, &pf,
+        "Task", "proj", "work", None, None, Some("critical"), None, None, None, None, None, None, &pf,
     );
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("invalid priority"));
@@ -141,7 +141,7 @@ fn move_through_all_statuses() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, Some("backlog"), None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, Some("backlog"), None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     let statuses = ["todo", "in_progress", "review", "done", "in_progress", "review", "done"];
@@ -161,7 +161,7 @@ fn move_to_same_status() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, Some("todo"), None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, Some("todo"), None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     let (item, transition) = store.move_item("PR-1", "todo").unwrap();
@@ -174,7 +174,7 @@ fn move_to_invalid_status() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     let result = store.move_item("PR-1", "archived");
@@ -196,11 +196,11 @@ fn update_no_fields() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     // Update with no fields changed — should just bump updated_at
-    let item = store.update_item("PR-1", None, None, None, None, None, None, None, None).unwrap();
+    let item = store.update_item("PR-1", None, None, None, None, None, None, None, None, None).unwrap();
     assert_eq!(item.title, "Task");
 }
 
@@ -209,16 +209,16 @@ fn update_status_to_done_and_back() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     let item = store
-        .update_item("PR-1", None, None, Some("done"), None, None, None, None, None)
+        .update_item("PR-1", None, None, Some("done"), None, None, None, None, None, None)
         .unwrap();
     assert!(item.completed_at.is_some());
 
     let item = store
-        .update_item("PR-1", None, None, Some("todo"), None, None, None, None, None)
+        .update_item("PR-1", None, None, Some("todo"), None, None, None, None, None, None)
         .unwrap();
     assert!(item.completed_at.is_none());
 }
@@ -226,7 +226,7 @@ fn update_status_to_done_and_back() {
 #[test]
 fn update_nonexistent_ticket() {
     let (_dir, store) = make_store();
-    let result = store.update_item("XX-999", Some("New title"), None, None, None, None, None, None, None);
+    let result = store.update_item("XX-999", Some("New title"), None, None, None, None, None, None, None, None);
     assert!(result.is_err());
 }
 
@@ -237,7 +237,7 @@ fn add_many_notes() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     for i in 1..=50 {
@@ -253,7 +253,7 @@ fn add_note_with_unicode() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     store.add_note("PR-1", "Talked to David — needs 🧪 testing", None).unwrap();
@@ -283,10 +283,10 @@ fn query_with_custom_query() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Urgent", "proj", "work", None, Some("todo"), Some("urgent"), None, None, None, None, None, &pf)
+        .create_item("Urgent", "proj", "work", None, Some("todo"), Some("urgent"), None, None, None, None, None, None, &pf)
         .unwrap();
     store
-        .create_item("Low", "proj", "work", None, Some("todo"), Some("low"), None, None, None, None, None, &pf)
+        .create_item("Low", "proj", "work", None, Some("todo"), Some("low"), None, None, None, None, None, None, &pf)
         .unwrap();
 
     let mut queries = HashMap::new();
@@ -341,11 +341,11 @@ fn list_with_all_filters() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
 
-    store.create_item("Match", "proj", "work", None, Some("todo"), Some("high"), Some("jack"), None, None, None, None, &pf).unwrap();
-    store.create_item("Wrong status", "proj", "work", None, Some("backlog"), Some("high"), Some("jack"), None, None, None, None, &pf).unwrap();
-    store.create_item("Wrong priority", "proj", "work", None, Some("todo"), Some("low"), Some("jack"), None, None, None, None, &pf).unwrap();
-    store.create_item("Wrong assignee", "proj", "work", None, Some("todo"), Some("high"), Some("alice"), None, None, None, None, &pf).unwrap();
-    store.create_item("Wrong project", "other", "work", None, Some("todo"), Some("high"), Some("jack"), None, None, None, None, &pf).unwrap();
+    store.create_item("Match", "proj", "work", None, Some("todo"), Some("high"), Some("jack"), None, None, None, None, None, &pf).unwrap();
+    store.create_item("Wrong status", "proj", "work", None, Some("backlog"), Some("high"), Some("jack"), None, None, None, None, None, &pf).unwrap();
+    store.create_item("Wrong priority", "proj", "work", None, Some("todo"), Some("low"), Some("jack"), None, None, None, None, None, &pf).unwrap();
+    store.create_item("Wrong assignee", "proj", "work", None, Some("todo"), Some("high"), Some("alice"), None, None, None, None, None, &pf).unwrap();
+    store.create_item("Wrong project", "other", "work", None, Some("todo"), Some("high"), Some("jack"), None, None, None, None, None, &pf).unwrap();
 
     let items = store
         .list(Some("proj"), Some("todo"), Some("high"), Some("jack"), None, None, false, None)
@@ -359,9 +359,9 @@ fn list_ordering_priority_then_recency() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
 
-    store.create_item("Low", "proj", "work", None, None, Some("low"), None, None, None, None, None, &pf).unwrap();
-    store.create_item("Urgent", "proj", "work", None, None, Some("urgent"), None, None, None, None, None, &pf).unwrap();
-    store.create_item("High", "proj", "work", None, None, Some("high"), None, None, None, None, None, &pf).unwrap();
+    store.create_item("Low", "proj", "work", None, None, Some("low"), None, None, None, None, None, None, &pf).unwrap();
+    store.create_item("Urgent", "proj", "work", None, None, Some("urgent"), None, None, None, None, None, None, &pf).unwrap();
+    store.create_item("High", "proj", "work", None, None, Some("high"), None, None, None, None, None, None, &pf).unwrap();
 
     let items = store.list(None, None, None, None, None, None, false, None).unwrap();
     assert_eq!(items[0].priority, "urgent");
@@ -376,7 +376,7 @@ fn prefix_derivation_with_numbers() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     store
-        .create_item("Task", "v2app", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "v2app", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     let conn = store.conn().unwrap();
@@ -393,7 +393,7 @@ fn prefix_with_config_override() {
     pf.insert("myproj".to_string(), "ZZ".to_string());
 
     store
-        .create_item("Task", "myproj", "work", None, None, None, None, None, None, None, None, &pf)
+        .create_item("Task", "myproj", "work", None, None, None, None, None, None, None, None, None, &pf)
         .unwrap();
 
     let conn = store.conn().unwrap();
@@ -413,7 +413,7 @@ fn rapid_create_move_note_cycle() {
     for i in 1..=20 {
         let title = format!("Ticket {i}");
         let item = store
-            .create_item(&title, "proj", "work", None, None, None, None, None, None, None, None, &pf)
+            .create_item(&title, "proj", "work", None, None, None, None, None, None, None, None, None, &pf)
             .unwrap();
         let tid = &item.ticket_id;
 
@@ -440,8 +440,8 @@ fn list_with_domain_filter() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
 
-    store.create_item("Work task", "proj", "work", None, None, None, None, None, None, None, None, &pf).unwrap();
-    store.create_item("Personal task", "hobby", "personal", None, None, None, None, None, None, None, None, &pf).unwrap();
+    store.create_item("Work task", "proj", "work", None, None, None, None, None, None, None, None, None, &pf).unwrap();
+    store.create_item("Personal task", "hobby", "personal", None, None, None, None, None, None, None, None, None, &pf).unwrap();
 
     let work_only = store
         .list(None, None, None, None, None, None, false, Some(&["work".to_string()]))
