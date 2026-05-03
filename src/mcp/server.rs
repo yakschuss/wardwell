@@ -62,7 +62,7 @@ pub struct SearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WriteParams {
-    #[schemars(description = "sync: replace current_state.md and optionally append history. decide: append to decisions.md. append_history: append to history.jsonl. lesson: append to lessons.jsonl. append: append to a named JSONL list (requires 'list' param). IMPORTANT for append: check existing lists first (they're returned if list doesn't exist). ASK the user before creating a new list — do not create lists speculatively.")]
+    #[schemars(description = "sync: replace current_state.md and optionally append history. decide: append to decisions.md. append_history: append to history.jsonl. lesson: append to lessons.jsonl. append: append to a named JSONL list (requires 'list' param). write_file: write content to a file in the project directory (requires 'path' for relative path within project, e.g. 'docs/my-audit.md', and 'body' for content). IMPORTANT for append: check existing lists first (they're returned if list doesn't exist). ASK the user before creating a new list — do not create lists speculatively.")]
     pub action: String,
     #[schemars(description = "Domain folder under vault root (e.g., 'work', 'personal')")]
     pub domain: String,
@@ -98,6 +98,10 @@ pub struct WriteParams {
     pub list: Option<String>,
     #[schemars(description = "For append: set to true to confirm creating a NEW list. Required when the list doesn't exist yet.")]
     pub confirmed: Option<bool>,
+
+    // -- write_file fields --
+    #[schemars(description = "For write_file: path relative to project directory (e.g., 'docs/my-audit.md'). Directories created automatically.")]
+    pub path: Option<String>,
 
     // -- source tagging --
     #[schemars(description = "Where this write originates: 'desktop' (Claude Desktop / claude.ai), 'code' (Claude Code), or 'manual'. Used to track intent vs execution.")]
@@ -286,7 +290,8 @@ impl WardwellServer {
             "append_history" => self.action_append_history(&p, &project, warning.as_deref()),
             "lesson" => self.action_lesson(&p, &project, warning.as_deref()),
             "append" => self.action_append_list(&p, &project, warning.as_deref()),
-            other => json_error(&format!("Unknown action: '{other}'. Use sync, decide, append_history, lesson, or append.")),
+            "write_file" => self.action_write_file(&p, &project),
+            other => json_error(&format!("Unknown action: '{other}'. Use sync, decide, append_history, lesson, append, or write_file.")),
         }
     }
 
@@ -1859,6 +1864,45 @@ impl WardwellServer {
         serde_json::to_string(&resp).unwrap_or_default()
     }
 
+    fn action_write_file(&self, p: &WriteParams, project: &str) -> String {
+        let Some(ref rel_path) = p.path else {
+            return json_error("'path' is required for write_file (e.g., 'docs/my-audit.md')");
+        };
+        let Some(ref content) = p.body else {
+            return json_error("'body' is required for write_file — the file content to write");
+        };
+
+        // Reject path traversal
+        if rel_path.contains("..") {
+            return json_error("path cannot contain '..'");
+        }
+
+        let project_dir = self.vault_root.join(&p.domain).join(project);
+        let file_path = project_dir.join(rel_path);
+
+        // Create parent directories
+        if let Some(parent) = file_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return json_error(&format!("failed to create directory: {e}"));
+            }
+        }
+
+        if let Err(e) = std::fs::write(&file_path, content) {
+            return json_error(&format!("failed to write file: {e}"));
+        }
+
+        // Reindex the file so wardwell_search can find it immediately
+        self.reindex_file(&file_path);
+
+        let vault_rel = format!("{}/{}/{}", p.domain, project, rel_path);
+        serde_json::to_string(&serde_json::json!({
+            "written": true,
+            "path": vault_rel,
+            "size": content.len(),
+            "hint": format!("Read with wardwell_search action:read path:{vault_rel}")
+        })).unwrap_or_default()
+    }
+
     /// Re-read a file from disk and upsert it into the FTS index.
     fn reindex_file(&self, path: &std::path::Path) {
         if let Ok(vf) = crate::vault::reader::read_file(path) {
@@ -2144,7 +2188,7 @@ impl ServerHandler for WardwellServer {
             "Wardwell: Personal AI knowledge vault. Four tools: \
              wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
-             wardwell_write (action: sync|decide|append_history|lesson|append), \
+             wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
              wardwell_clipboard (copy to clipboard, ask first), \
              wardwell_kanban (action: list|create|update|move|note|query — project kanban board with tickets, statuses, priorities, deadlines)."
                 .to_string()
@@ -2152,7 +2196,7 @@ impl ServerHandler for WardwellServer {
             "Wardwell: Personal AI knowledge vault. Three tools: \
              wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
-             wardwell_write (action: sync|decide|append_history|lesson|append), \
+             wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
              wardwell_clipboard (copy to clipboard, ask first)."
                 .to_string()
         };
@@ -3060,7 +3104,8 @@ mod tests {
             body: Some("Details".to_string()),
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None, source: None,
+            what_happened: None, root_cause: None, prevention: None, path: None,
+            source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -3088,7 +3133,8 @@ mod tests {
             body: Some("Literally".to_string()),
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None, source: None,
+            what_happened: None, root_cause: None, prevention: None, path: None,
+            source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -3119,7 +3165,8 @@ mod tests {
             body: None,
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None, source: None,
+            what_happened: None, root_cause: None, prevention: None, path: None,
+            source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         assert!(result.contains("built-in list"));
@@ -3148,7 +3195,8 @@ mod tests {
             body: None,
             status: None, focus: None, why_this_matters: None, next_action: None,
             open_questions: None, blockers: None, waiting_on: None, commit_message: None,
-            what_happened: None, root_cause: None, prevention: None, source: None,
+            what_happened: None, root_cause: None, prevention: None, path: None,
+            source: None,
         };
         let result = server.action_append_list(&params, "test-proj", None);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
