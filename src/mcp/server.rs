@@ -124,7 +124,7 @@ pub struct ClipboardParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KanbanParams {
-    #[schemars(description = "list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: write content to a ticket as a doc (ticket_id+title+text) — or link an existing vault file (ticket_id+file_path). detach: unlink attachment (ticket_id+attachment_id required).")]
+    #[schemars(description = "get: fetch a single ticket by ID (ticket_id required). search: find tickets by text (query required, searches title+description). list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: write content to a ticket as a doc (ticket_id+title+text) — or link an existing vault file (ticket_id+file_path). detach: unlink attachment (ticket_id+attachment_id required).")]
     pub action: String,
     #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note, attach, detach.")]
     pub ticket_id: Option<String>,
@@ -164,6 +164,8 @@ pub struct KanbanParams {
     pub file_path: Option<String>,
     #[schemars(description = "Attachment ID to detach. Required for detach action.")]
     pub attachment_id: Option<String>,
+    #[schemars(description = "For search: text to search for in ticket ID, title, and description.")]
+    pub query: Option<String>,
 }
 
 #[tool_router(router = tool_router)]
@@ -322,7 +324,9 @@ impl WardwellServer {
             "query" => self.kanban_query(kanban, &p),
             "attach" => self.kanban_attach(kanban, &p),
             "detach" => self.kanban_detach(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: list, create, update, move, note, query, attach, detach")),
+            "get" => self.kanban_get(kanban, &p),
+            "search" => self.kanban_search(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach")),
         }
     }
 }
@@ -1921,6 +1925,35 @@ impl WardwellServer {
             Ok(())
         } else {
             Err(format!("domain '{}' not in allowed domains for this session", domain))
+        }
+    }
+
+    fn kanban_get(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for get");
+        };
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
+            if let Err(e) = self.check_kanban_domain_access(dom) {
+                return json_error(&e);
+            }
+        }
+        match kanban.get_item(ticket_id) {
+            Ok(item) => serde_json::to_string(&serde_json::json!({"item": item})).unwrap_or_default(),
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
+
+    fn kanban_search(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref query) = p.query else {
+            return json_error("'query' is required for search (text to find in ticket ID, title, or description)");
+        };
+        let domains = if self.allowed_domains.is_empty() { None } else { Some(self.allowed_domains.as_slice()) };
+        match kanban.search(query, p.project.as_deref(), domains) {
+            Ok(items) => {
+                let total = items.len();
+                serde_json::to_string(&serde_json::json!({"items": items, "total": total})).unwrap_or_default()
+            }
+            Err(e) => json_error(&e.to_string()),
         }
     }
 

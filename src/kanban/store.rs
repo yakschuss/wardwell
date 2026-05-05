@@ -392,6 +392,73 @@ impl KanbanStore {
 
     // ---- Read path: SQLite only ----
 
+    pub fn get_item(&self, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
+        let conn = self.conn()?;
+        let item = self.get_item_with_conn(&conn, ticket_id)?;
+        let mut items = vec![item];
+        self.populate_children(&conn, &mut items)?;
+        Ok(items.into_iter().next().ok_or_else(|| KanbanError::NotFound(ticket_id.into()))?)
+    }
+
+    pub fn search(&self, query: &str, project: Option<&str>, domains: Option<&[String]>) -> Result<Vec<KanbanItem>, KanbanError> {
+        let conn = self.conn()?;
+        let use_domain = domains.map(|d| !d.is_empty()).unwrap_or(false);
+        let from = if use_domain {
+            "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
+        } else { "FROM kanban_items" };
+
+        let mut conditions = vec!["(kanban_items.title LIKE ?1 OR kanban_items.description LIKE ?1 OR kanban_items.ticket_id LIKE ?1)".to_string()];
+        let search_pat = format!("%{query}%");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(search_pat)];
+        let mut idx = 2;
+
+        if use_domain {
+            if let Some(dl) = domains {
+                let ph: Vec<String> = dl.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
+                conditions.push(format!("p.domain IN ({})", ph.join(",")));
+                for d in dl { params.push(Box::new(d.clone())); }
+            }
+        }
+        if let Some(proj) = project {
+            let group_members = self.resolve_group_members(proj);
+            if group_members.is_empty() {
+                conditions.push(format!("kanban_items.project=?{idx}"));
+                params.push(Box::new(proj.to_string()));
+            } else {
+                let ph: Vec<String> = group_members.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
+                conditions.push(format!("kanban_items.project IN ({})", ph.join(",")));
+                for m in &group_members { params.push(Box::new(m.clone())); }
+            }
+            let _ = idx;
+        }
+
+        let wh = format!("WHERE {}", conditions.join(" AND "));
+        let sql = format!(
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC LIMIT 20"
+        );
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
+            Ok(KanbanItem {
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
+                parent: row.get(3)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(4).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
+                assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
+                created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
+                notes: vec![], attachments: vec![],
+            })
+        })?.collect::<Result<_, _>>()?;
+
+        let mut items: Vec<KanbanItem> = items.into_iter().map(|mut item| {
+            item.group = self.project_to_group.get(&item.project).cloned();
+            Ok(item)
+        }).collect::<Result<_, KanbanError>>()?;
+        self.populate_children(&conn, &mut items)?;
+        Ok(items)
+    }
+
     pub fn list(
         &self, project: Option<&str>, status: Option<&str>, priority: Option<&str>,
         assignee: Option<&str>, epic: Option<&str>, tag: Option<&str>, include_done: bool, domains: Option<&[String]>,
