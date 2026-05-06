@@ -32,6 +32,19 @@ pub struct KanbanItem {
     pub notes: Vec<KanbanNote>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<KanbanAttachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activity: Vec<ActivityEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children_activity: Vec<ActivityEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActivityEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<String>,
+    pub event: String,
+    pub timestamp: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -254,7 +267,7 @@ impl KanbanStore {
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), parent: parent.map(str::to_string), children: vec![],
             tags: tags_vec, created_at: now.clone(), updated_at: now,
-            completed_at, notes: vec![], attachments: vec![],
+            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
         })
     }
 
@@ -394,10 +407,42 @@ impl KanbanStore {
 
     pub fn get_item(&self, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
         let conn = self.conn()?;
-        let item = self.get_item_with_conn(&conn, ticket_id)?;
+        let mut item = self.get_item_with_conn(&conn, ticket_id)?;
         let mut items = vec![item];
         self.populate_children(&conn, &mut items)?;
-        Ok(items.into_iter().next().ok_or_else(|| KanbanError::NotFound(ticket_id.into()))?)
+        item = items.into_iter().next().ok_or_else(|| KanbanError::NotFound(ticket_id.into()))?;
+
+        // Build activity feed from JSONL
+        let domain_project = conn.query_row(
+            "SELECT p.domain, i.project FROM kanban_items i JOIN kanban_projects p ON i.project = p.project WHERE i.ticket_id=?1",
+            rusqlite::params![ticket_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).ok();
+
+        if let Some((domain, project)) = domain_project {
+            let all_events = events::read_events(&self.vault_root, &domain, &project);
+            item.activity = all_events.iter()
+                .filter(|e| e.ticket_id() == ticket_id)
+                .map(|e| event_to_activity(e, None))
+                .collect();
+
+            // Children activity: last 2 events per child
+            if !item.children.is_empty() {
+                let child_ids: Vec<&str> = item.children.iter().map(|c| c.ticket_id.as_str()).collect();
+                let mut children_activity: Vec<ActivityEntry> = Vec::new();
+                for child_id in &child_ids {
+                    let child_events: Vec<ActivityEntry> = all_events.iter()
+                        .filter(|e| e.ticket_id() == *child_id)
+                        .map(|e| event_to_activity(e, Some(child_id)))
+                        .collect();
+                    let start = child_events.len().saturating_sub(2);
+                    children_activity.extend_from_slice(&child_events[start..]);
+                }
+                children_activity.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                item.children_activity = children_activity;
+            }
+        }
+
+        Ok(item)
     }
 
     pub fn search(&self, query: &str, project: Option<&str>, domains: Option<&[String]>) -> Result<Vec<KanbanItem>, KanbanError> {
@@ -447,7 +492,7 @@ impl KanbanStore {
                 title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
                 assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
                 created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
-                notes: vec![], attachments: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -514,7 +559,7 @@ impl KanbanStore {
                 title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
                 assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
                 created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
-                notes: vec![], attachments: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -570,7 +615,7 @@ impl KanbanStore {
                 title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
                 assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
                 created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
-                notes: vec![], attachments: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -809,7 +854,7 @@ impl KanbanStore {
                 title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
                 assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
                 created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
-                notes: vec![], attachments: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             }),
         ).optional()?;
         let mut item = item.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
@@ -888,6 +933,36 @@ fn load_kanban_yml(vault_root: &Path) -> HashMap<String, Vec<String>> {
     match serde_yaml::from_str::<KanbanYml>(&content) {
         Ok(yml) => yml.groups,
         Err(_) => HashMap::new(),
+    }
+}
+
+fn event_to_activity(event: &events::KanbanEvent, ticket_override: Option<&str>) -> ActivityEntry {
+    let (event_type, summary) = match event {
+        events::KanbanEvent::Create { title, .. } => ("create", title.clone()),
+        events::KanbanEvent::Move { from, to, .. } => {
+            let from_str = from.as_deref().unwrap_or("?");
+            ("move", format!("{from_str} → {to}"))
+        }
+        events::KanbanEvent::Update { fields, .. } => {
+            let keys: Vec<&str> = fields.keys().map(String::as_str).collect();
+            ("update", keys.join(", "))
+        }
+        events::KanbanEvent::Note { text, .. } => {
+            let truncated = if text.len() > 80 {
+                let boundary = text.floor_char_boundary(80);
+                format!("{}…", &text[..boundary])
+            } else { text.clone() };
+            ("note", truncated)
+        }
+        events::KanbanEvent::Archive { .. } => ("archive", "archived".into()),
+        events::KanbanEvent::Attach { filename, .. } => ("attach", filename.clone()),
+        events::KanbanEvent::Detach { attachment_id, .. } => ("detach", attachment_id.clone()),
+    };
+    ActivityEntry {
+        ticket_id: ticket_override.map(String::from),
+        event: event_type.into(),
+        timestamp: event.timestamp().into(),
+        summary,
     }
 }
 

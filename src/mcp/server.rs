@@ -166,6 +166,8 @@ pub struct KanbanParams {
     pub attachment_id: Option<String>,
     #[schemars(description = "For search: text to search for in ticket ID, title, and description.")]
     pub query: Option<String>,
+    #[schemars(description = "Include per-ticket activity feed (JSONL event history). Default false. Only use with get or small result sets.")]
+    pub include_activity: Option<bool>,
 }
 
 #[tool_router(router = tool_router)]
