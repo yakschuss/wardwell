@@ -76,6 +76,17 @@ pub enum KanbanEvent {
         attachment_id: String,
         timestamp: String,
     },
+    #[serde(rename = "reorder")]
+    Reorder {
+        ticket_id: String,
+        data: ReorderData,
+        timestamp: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReorderData {
+    pub position: i64,
 }
 
 fn default_backlog() -> String { "backlog".into() }
@@ -90,7 +101,8 @@ impl KanbanEvent {
             | Self::Note { ticket_id, .. }
             | Self::Archive { ticket_id, .. }
             | Self::Attach { ticket_id, .. }
-            | Self::Detach { ticket_id, .. } => ticket_id,
+            | Self::Detach { ticket_id, .. }
+            | Self::Reorder { ticket_id, .. } => ticket_id,
         }
     }
 
@@ -102,7 +114,8 @@ impl KanbanEvent {
             | Self::Note { timestamp, .. }
             | Self::Archive { timestamp, .. }
             | Self::Attach { timestamp, .. }
-            | Self::Detach { timestamp, .. } => timestamp,
+            | Self::Detach { timestamp, .. }
+            | Self::Reorder { timestamp, .. } => timestamp,
         }
     }
 }
@@ -228,6 +241,7 @@ pub struct MaterializedItem {
     pub group: Option<String>,
     pub epic: Option<String>,
     pub parent: Option<String>,
+    pub position: Option<i64>,
     pub tags: Vec<String>,
     pub domain: String,
     pub title: String,
@@ -278,6 +292,7 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     group: group.clone(),
                     epic: epic.clone(),
                     parent: parent.clone(),
+                    position: None,
                     tags: tags.clone(),
                     domain: domain.to_string(),
                     title: title.clone(),
@@ -370,6 +385,12 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
             KanbanEvent::Detach { ticket_id, attachment_id, timestamp } => {
                 if let Some(item) = items.get_mut(ticket_id) {
                     item.attachments.retain(|a| a.attachment_id != *attachment_id);
+                    item.updated_at = timestamp.clone();
+                }
+            }
+            KanbanEvent::Reorder { ticket_id, data, timestamp } => {
+                if let Some(item) = items.get_mut(ticket_id) {
+                    item.position = Some(data.position);
                     item.updated_at = timestamp.clone();
                 }
             }

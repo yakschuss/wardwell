@@ -25,6 +25,8 @@ pub struct KanbanItem {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<KanbanChild>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -101,7 +103,7 @@ pub struct KanbanStore {
 }
 
 impl KanbanStore {
-    const SCHEMA_VERSION: i64 = 6;
+    const SCHEMA_VERSION: i64 = 7;
 
     pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
         let groups = load_kanban_yml(&vault_root);
@@ -158,6 +160,7 @@ impl KanbanStore {
                 source       TEXT,
                 epic         TEXT,
                 parent       TEXT,
+                position     INTEGER,
                 tags         TEXT DEFAULT '[]',
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL,
@@ -265,7 +268,7 @@ impl KanbanStore {
             ticket_id, project: project.into(), group, epic: epic.map(str::to_string), title: title.into(),
             description: description.map(str::to_string), status: status.into(), priority: priority.into(),
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
-            source: source.map(str::to_string), parent: parent.map(str::to_string), children: vec![],
+            source: source.map(str::to_string), parent: parent.map(str::to_string), position: None, children: vec![],
             tags: tags_vec, created_at: now.clone(), updated_at: now,
             completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
         })
@@ -403,6 +406,57 @@ impl KanbanStore {
         self.get_item_with_conn(&conn, ticket_id)
     }
 
+    pub fn sequence_single(&self, ticket_id: &str, position: i64) -> Result<KanbanItem, KanbanError> {
+        let conn = self.conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
+
+        let event = KanbanEvent::Reorder {
+            ticket_id: ticket_id.into(),
+            data: events::ReorderData { position },
+            timestamp: now.clone(),
+        };
+        events::append_event(&self.vault_root, &domain, &project, &event)?;
+
+        conn.execute(
+            "UPDATE kanban_items SET position=?1, updated_at=?2 WHERE ticket_id=?3",
+            rusqlite::params![position, now, ticket_id],
+        )?;
+
+        self.get_item_with_conn(&conn, ticket_id)
+    }
+
+    pub fn sequence_bulk(&self, project: &str, order: &[String]) -> Result<Vec<KanbanItem>, KanbanError> {
+        let conn = self.conn()?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Get domain from first ticket
+        let domain: String = conn.query_row(
+            "SELECT p.domain FROM kanban_projects p WHERE p.project=?1",
+            rusqlite::params![project], |row| row.get(0),
+        ).map_err(|_| KanbanError::NotFound(format!("project '{project}' not found")))?;
+
+        for (i, tid) in order.iter().enumerate() {
+            let position = (i + 1) as i64;
+            let event = KanbanEvent::Reorder {
+                ticket_id: tid.clone(),
+                data: events::ReorderData { position },
+                timestamp: now.clone(),
+            };
+            events::append_event(&self.vault_root, &domain, project, &event)?;
+            conn.execute(
+                "UPDATE kanban_items SET position=?1, updated_at=?2 WHERE ticket_id=?3",
+                rusqlite::params![position, now, tid],
+            )?;
+        }
+
+        let mut items: Vec<KanbanItem> = order.iter()
+            .filter_map(|tid| self.get_item_with_conn(&conn, tid).ok())
+            .collect();
+        self.populate_children(&conn, &mut items)?;
+        Ok(items)
+    }
+
     // ---- Read path: SQLite only ----
 
     pub fn get_item(&self, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
@@ -479,7 +533,7 @@ impl KanbanStore {
 
         let wh = format!("WHERE {}", conditions.join(" AND "));
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC LIMIT 20"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC LIMIT 20"
         );
 
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -487,11 +541,11 @@ impl KanbanStore {
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
                 ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
-                parent: row.get(3)?, children: vec![],
-                tags: { let t: String = row.get::<_, String>(4).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
-                title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
-                assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
-                created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
+                parent: row.get(3)?, position: row.get(4)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
+                assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
+                created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             })
         })?.collect::<Result<_, _>>()?;
@@ -546,7 +600,7 @@ impl KanbanStore {
 
         let wh = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
         );
 
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -554,11 +608,11 @@ impl KanbanStore {
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
                 ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
-                parent: row.get(3)?, children: vec![],
-                tags: { let t: String = row.get::<_, String>(4).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
-                title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
-                assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
-                created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
+                parent: row.get(3)?, position: row.get(4)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
+                assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
+                created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             })
         })?.collect::<Result<_, _>>()?;
@@ -601,7 +655,7 @@ impl KanbanStore {
 
         let wh = if extra.is_empty() { format!("WHERE {named_where}") } else { format!("WHERE ({named_where}) AND {}", extra.join(" AND ")) };
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC"
         );
 
         let conn = self.conn()?;
@@ -610,11 +664,11 @@ impl KanbanStore {
         let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
             Ok(KanbanItem {
                 ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
-                parent: row.get(3)?, children: vec![],
-                tags: { let t: String = row.get::<_, String>(4).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
-                title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
-                assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
-                created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
+                parent: row.get(3)?, position: row.get(4)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
+                assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
+                created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             })
         })?.collect::<Result<_, _>>()?;
@@ -661,7 +715,7 @@ impl KanbanStore {
                 ticket_id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL,
                 description TEXT, status TEXT NOT NULL DEFAULT 'backlog',
                 priority TEXT NOT NULL DEFAULT 'medium', assignee TEXT, deadline TEXT,
-                source TEXT, epic TEXT, parent TEXT, tags TEXT DEFAULT '[]', created_at TEXT NOT NULL,
+                source TEXT, epic TEXT, parent TEXT, position INTEGER, tags TEXT DEFAULT '[]', created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL, completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS kanban_notes (
@@ -691,8 +745,8 @@ impl KanbanStore {
 
                 let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
                 conn.execute(
-                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, tags, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.parent, tags_json, item.created_at, item.updated_at, item.completed_at],
+                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, position, tags, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.parent, item.position, tags_json, item.created_at, item.updated_at, item.completed_at],
                 )?;
 
                 for note in &item.notes {
@@ -845,15 +899,15 @@ impl KanbanStore {
 
     fn get_item_with_conn(&self, conn: &Connection, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
         let item: Option<KanbanItem> = conn.query_row(
-            "SELECT ticket_id, project, epic, parent, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
+            "SELECT ticket_id, project, epic, parent, position, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
             rusqlite::params![ticket_id],
             |row| Ok(KanbanItem {
                 ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
-                parent: row.get(3)?, children: vec![],
-                tags: { let t: String = row.get::<_, String>(4).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
-                title: row.get(5)?, description: row.get(6)?, status: row.get(7)?, priority: row.get(8)?,
-                assignee: row.get(9)?, deadline: row.get(10)?, source: row.get(11)?,
-                created_at: row.get(12)?, updated_at: row.get(13)?, completed_at: row.get(14)?,
+                parent: row.get(3)?, position: row.get(4)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
+                assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
+                created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
             }),
         ).optional()?;
@@ -957,6 +1011,7 @@ fn event_to_activity(event: &events::KanbanEvent, ticket_override: Option<&str>)
         events::KanbanEvent::Archive { .. } => ("archive", "archived".into()),
         events::KanbanEvent::Attach { filename, .. } => ("attach", filename.clone()),
         events::KanbanEvent::Detach { attachment_id, .. } => ("detach", attachment_id.clone()),
+        events::KanbanEvent::Reorder { data, .. } => ("reorder", format!("position {}", data.position)),
     };
     ActivityEntry {
         ticket_id: ticket_override.map(String::from),

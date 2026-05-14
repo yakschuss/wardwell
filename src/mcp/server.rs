@@ -124,7 +124,7 @@ pub struct ClipboardParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct KanbanParams {
-    #[schemars(description = "get: fetch a single ticket by ID (ticket_id required). search: find tickets by text (query required, searches title+description). list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: write content to a ticket as a doc (ticket_id+title+text) — or link an existing vault file (ticket_id+file_path). detach: unlink attachment (ticket_id+attachment_id required).")]
+    #[schemars(description = "get: fetch a single ticket by ID (ticket_id required). search: find tickets by text (query required). list: filter and return items. create: new item (title+project required). update: modify fields (ticket_id required). move: status transition (ticket_id+status required). note: append note (ticket_id+text required). query: run a named query (question required). attach: write content to a ticket as a doc (ticket_id+title+text) — or link an existing vault file (ticket_id+file_path). detach: unlink attachment (ticket_id+attachment_id required). sequence: set ticket position — single (ticket_id+position) or bulk (project+order array). export_roadmap: generate PDF roadmap (project required).")]
     pub action: String,
     #[schemars(description = "Ticket identifier (e.g., 'SH-3'). Required for update, move, note, attach, detach.")]
     pub ticket_id: Option<String>,
@@ -168,6 +168,10 @@ pub struct KanbanParams {
     pub query: Option<String>,
     #[schemars(description = "Include per-ticket activity feed (JSONL event history). Default false. Only use with get or small result sets.")]
     pub include_activity: Option<bool>,
+    #[schemars(description = "For sequence: 1-based position number for single ticket reorder.")]
+    pub position: Option<i64>,
+    #[schemars(description = "For sequence bulk: ordered array of ticket IDs. Position assigned 1, 2, 3... in array order. Requires project.")]
+    pub order: Option<Vec<String>>,
 }
 
 #[tool_router(router = tool_router)]
@@ -328,7 +332,9 @@ impl WardwellServer {
             "detach" => self.kanban_detach(kanban, &p),
             "get" => self.kanban_get(kanban, &p),
             "search" => self.kanban_search(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach")),
+            "sequence" => self.kanban_sequence(kanban, &p),
+            "export_roadmap" => self.kanban_export_roadmap(&p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap")),
         }
     }
 }
@@ -1927,6 +1933,49 @@ impl WardwellServer {
             Ok(())
         } else {
             Err(format!("domain '{}' not in allowed domains for this session", domain))
+        }
+    }
+
+    fn kanban_sequence(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        if let Some(ref order) = p.order {
+            let Some(ref project) = p.project else {
+                return json_error("'project' is required for bulk sequence");
+            };
+            match kanban.sequence_bulk(project, order) {
+                Ok(items) => serde_json::to_string(&serde_json::json!({"sequenced": true, "items": items})).unwrap_or_default(),
+                Err(e) => json_error(&e.to_string()),
+            }
+        } else if let Some(ref ticket_id) = p.ticket_id {
+            let Some(position) = p.position else {
+                return json_error("'position' is required for single sequence (1-based integer)");
+            };
+            match kanban.sequence_single(ticket_id, position) {
+                Ok(item) => serde_json::to_string(&serde_json::json!({"sequenced": true, "item": item})).unwrap_or_default(),
+                Err(e) => json_error(&e.to_string()),
+            }
+        } else {
+            json_error("provide ticket_id+position (single) or project+order (bulk)")
+        }
+    }
+
+    fn kanban_export_roadmap(&self, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for export_roadmap");
+        };
+        let url = format!("http://localhost:9292/api/kanban/{project}/roadmap.pdf?save=true");
+        match std::process::Command::new("curl")
+            .args(["-s", "-X", "POST", &url])
+            .output()
+        {
+            Ok(output) => {
+                let body = String::from_utf8_lossy(&output.stdout);
+                if output.status.success() {
+                    serde_json::to_string(&serde_json::json!({"exported": true, "response": body.trim()})).unwrap_or_default()
+                } else {
+                    json_error(&format!("roadmap export failed ({}): {}", output.status, body.trim()))
+                }
+            }
+            Err(e) => json_error(&format!("failed to call roadmap API: {e}")),
         }
     }
 
