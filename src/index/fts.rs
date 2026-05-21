@@ -19,6 +19,8 @@ pub struct SearchResult {
     pub path: String,
     pub frontmatter: Frontmatter,
     pub snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_lines: Option<usize>,
 }
 
 /// Search response with results and total count.
@@ -39,7 +41,8 @@ impl IndexStore {
         let mut sql = String::from(
             "SELECT m.path, m.type, m.domain, m.status, m.confidence, m.updated,
                     m.summary, m.related, m.tags,
-                    snippet(vault_search, 7, '', '', '...', 40) as snip
+                    snippet(vault_search, 7, '', '', '...', 40) as snip,
+                    s.body
              FROM vault_search s
              JOIN vault_meta m ON s.path = m.path
              WHERE vault_search MATCH ?1"
@@ -104,12 +107,13 @@ impl IndexStore {
                 let related: Option<String> = row.get(7)?;
                 let tags: Option<String> = row.get(8)?;
                 let snippet: String = row.get(9)?;
+                let body: Option<String> = row.get(10)?;
 
-                Ok((path, file_type, domain, status, confidence, updated, summary, related, tags, snippet))
+                Ok((path, file_type, domain, status, confidence, updated, summary, related, tags, snippet, body))
             })?;
 
             for row in rows {
-                let (path, file_type, domain, status, confidence, updated, summary, related, tags, snippet) = row?;
+                let (path, file_type, domain, status, confidence, updated, summary, related, tags, snippet, body) = row?;
 
                 let frontmatter = Frontmatter {
                     file_type: parse_vault_type(&file_type),
@@ -123,7 +127,8 @@ impl IndexStore {
                     can_read: Vec::new(),
                 };
 
-                results.push(SearchResult { path, frontmatter, snippet });
+                let total_lines = body.as_ref().map(|b| b.lines().count());
+                results.push(SearchResult { path, frontmatter, snippet, total_lines });
             }
         }
 

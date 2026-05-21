@@ -58,6 +58,10 @@ pub struct SearchParams {
     pub include_archived: Option<bool>,
     #[schemars(description = "Search mode: 'keyword' (FTS5 only, default) or 'semantic' (hybrid BM25 + vector + RRF). Use 'semantic' for broad/conceptual queries. Use default 'keyword' for exact terms or file names.")]
     pub mode: Option<String>,
+    #[schemars(description = "For read: 1-indexed start line of body (frontmatter always returned in full). Omit for full content.")]
+    pub offset: Option<usize>,
+    #[schemars(description = "For read: number of body lines to return. Omit for all remaining lines.")]
+    pub read_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -174,6 +178,18 @@ pub struct KanbanParams {
     pub order: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GraphParams {
+    #[schemars(description = "links: get forward links and backlinks for a vault file (path required). resolve: find entities by fuzzy name match (query required). mentions: find unlinked references to an entity across vault content (path required).")]
+    pub action: String,
+    #[schemars(description = "For links/mentions: vault-relative file path.")]
+    pub path: Option<String>,
+    #[schemars(description = "For resolve: name, title, or alias to search for.")]
+    pub query: Option<String>,
+    #[schemars(description = "Max results. Default 5.")]
+    pub limit: Option<usize>,
+}
+
 #[tool_router(router = tool_router)]
 impl WardwellServer {
     pub fn new(config: WardwellConfig, index: Arc<IndexStore>, embedder: Arc<Mutex<Option<crate::index::embed::Embedder>>>, domain: Option<String>, kanban: Option<crate::kanban::store::KanbanStore>) -> Self {
@@ -226,6 +242,13 @@ impl WardwellServer {
         let mut tool_router = Self::tool_router();
         if kanban.is_none() {
             tool_router.remove_route("wardwell_kanban");
+        }
+        // Feature-flag gate the graph tool
+        let graph_enabled = config.features.graph_navigation
+            || config.features.entity_resolution
+            || config.features.unlinked_mentions;
+        if !graph_enabled {
+            tool_router.remove_route("wardwell_graph");
         }
         let kanban = kanban.map(Arc::new);
 
@@ -335,6 +358,17 @@ impl WardwellServer {
             "sequence" => self.kanban_sequence(kanban, &p),
             "export_roadmap" => self.kanban_export_roadmap(&p),
             other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap")),
+        }
+    }
+
+    #[tool(description = "Navigate the vault knowledge graph. Get links/backlinks for a file, resolve entities by name, or find unlinked mentions across content.")]
+    async fn wardwell_graph(&self, params: Parameters<GraphParams>) -> String {
+        let p = params.0;
+        match p.action.as_str() {
+            "links" => self.graph_links(&p),
+            "resolve" => self.graph_resolve(&p),
+            "mentions" => self.graph_mentions(&p),
+            other => json_error(&format!("unknown graph action '{other}'. Use: links, resolve, mentions")),
         }
     }
 }
@@ -543,12 +577,43 @@ impl WardwellServer {
             }
         }
 
-        serde_json::to_string_pretty(&serde_json::json!({
+        let body_lines: Vec<&str> = vf.body.lines().collect();
+        let total_lines = body_lines.len();
+
+        let (content, partial_meta) = if self.config.features.partial_reads && (p.offset.is_some() || p.read_limit.is_some()) {
+            let start = p.offset.unwrap_or(1).max(1) - 1; // convert 1-indexed to 0-indexed
+            let end = match p.read_limit {
+                Some(lim) => (start + lim).min(total_lines),
+                None => total_lines,
+            };
+            let sliced: String = if start < total_lines {
+                body_lines[start..end].join("\n")
+            } else {
+                String::new()
+            };
+            let returned = if start < total_lines { end - start } else { 0 };
+            (sliced, Some(serde_json::json!({
+                "totalLines": total_lines,
+                "returnedLines": returned,
+                "offset": start + 1,
+                "limit": p.read_limit,
+            })))
+        } else {
+            (vf.body, None)
+        };
+
+        let mut result = serde_json::json!({
             "path": path,
             "frontmatter": vf.frontmatter,
-            "content": vf.body,
+            "content": content,
+            "totalLines": total_lines,
             "related_previews": related_previews,
-        })).unwrap_or_default()
+        });
+        if let Some(meta) = partial_meta {
+            result["partial"] = meta;
+        }
+
+        serde_json::to_string_pretty(&result).unwrap_or_default()
     }
 
     fn action_history(&self, p: &SearchParams) -> String {
@@ -2294,6 +2359,181 @@ impl ServerHandler for WardwellServer {
     }
 }
 
+// -- Graph actions --
+
+impl WardwellServer {
+    fn graph_links(&self, p: &GraphParams) -> String {
+        if !self.config.features.graph_navigation {
+            return json_error("graph_navigation feature is disabled in config.yml");
+        }
+        let path = match &p.path {
+            Some(path) => path.clone(),
+            None => return json_error("'path' is required for action 'links'."),
+        };
+
+        let clean = path.strip_prefix('/').unwrap_or(&path).to_string();
+
+        let forward = match self.index.get_forward_links(&clean) {
+            Ok(links) => links,
+            Err(e) => return json_error(&format!("failed to get forward links: {e}")),
+        };
+
+        let backlinks = match self.index.get_backlinks(&clean) {
+            Ok(links) => links,
+            Err(e) => return json_error(&format!("failed to get backlinks: {e}")),
+        };
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "path": clean,
+            "forward_links": forward,
+            "forward_count": forward.len(),
+            "backlinks": backlinks,
+            "backlink_count": backlinks.len(),
+        })).unwrap_or_default()
+    }
+
+    fn graph_resolve(&self, p: &GraphParams) -> String {
+        if !self.config.features.entity_resolution {
+            return json_error("entity_resolution feature is disabled in config.yml");
+        }
+        let query = match &p.query {
+            Some(q) => q.clone(),
+            None => return json_error("'query' is required for action 'resolve'."),
+        };
+
+        let limit = p.limit.unwrap_or(5);
+        let query_lower = query.to_lowercase();
+
+        // Check aliases first (via domain registry)
+        let mut alias_matches = Vec::new();
+        if let Ok(reg) = self.registry.try_read() {
+            for domain in reg.all() {
+                for (alias, target) in &domain.aliases {
+                    if alias.to_lowercase() == query.to_lowercase()
+                        || target.to_lowercase() == query.to_lowercase()
+                    {
+                        alias_matches.push(serde_json::json!({
+                            "type": "alias",
+                            "alias": alias,
+                            "target": target,
+                            "domain": domain.name.as_str(),
+                            "score": 1.0,
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Entity resolution from index
+        let entity_matches = match self.index.resolve_entity(&query, limit) {
+            Ok(matches) => matches,
+            Err(e) => return json_error(&format!("entity resolution failed: {e}")),
+        };
+
+        // Check kanban tickets — filter by similarity to avoid noisy substring matches
+        let mut kanban_matches = Vec::new();
+        if let Some(ref kanban) = self.kanban {
+            if let Ok(results) = kanban.search(&query, None, None) {
+                for item in results {
+                    let id_lower = item.ticket_id.to_lowercase();
+                    let title_lower = item.title.to_lowercase();
+
+                    let score = if id_lower == query_lower || title_lower == query_lower {
+                        1.0
+                    } else if id_lower.starts_with(&query_lower) || title_lower.starts_with(&query_lower) {
+                        0.95
+                    } else {
+                        let id_sim = strsim::jaro_winkler(&query_lower, &id_lower);
+                        let title_sim = strsim::jaro_winkler(&query_lower, &title_lower);
+                        id_sim.max(title_sim)
+                    };
+
+                    if score > 0.7 {
+                        kanban_matches.push((score, serde_json::json!({
+                            "type": "kanban_ticket",
+                            "ticket_id": item.ticket_id,
+                            "title": item.title,
+                            "project": item.project,
+                            "status": item.status,
+                            "score": score,
+                        })));
+                    }
+                }
+                kanban_matches.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                kanban_matches.truncate(limit);
+            }
+        }
+        let kanban_matches: Vec<_> = kanban_matches.into_iter().map(|(_, v)| v).collect();
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "query": query,
+            "aliases": alias_matches,
+            "entities": entity_matches,
+            "kanban_tickets": kanban_matches,
+        })).unwrap_or_default()
+    }
+
+    fn graph_mentions(&self, p: &GraphParams) -> String {
+        if !self.config.features.unlinked_mentions {
+            return json_error("unlinked_mentions feature is disabled in config.yml");
+        }
+        let path = match &p.path {
+            Some(path) => path.clone(),
+            None => return json_error("'path' is required for action 'mentions'."),
+        };
+
+        let clean = path.strip_prefix('/').unwrap_or(&path).to_string();
+
+        // Build target names from file stem and frontmatter summary
+        let mut target_names = Vec::new();
+        let full_path = resolve_path(&self.vault_root, &clean);
+        if let Some(fp) = full_path {
+            if let Ok(vf) = crate::vault::reader::read_file(&fp) {
+                // Use filename stem
+                if let Some(stem) = fp.file_stem().and_then(|s| s.to_str()) {
+                    if stem.len() >= 3 {
+                        target_names.push(stem.to_string());
+                    }
+                }
+                // Use summary/title if available
+                if let Some(ref summary) = vf.frontmatter.summary {
+                    if summary.len() >= 3 {
+                        target_names.push(summary.clone());
+                    }
+                }
+            }
+        }
+
+        if target_names.is_empty() {
+            // Fallback to filename stem from path
+            if let Some(stem) = std::path::Path::new(&clean).file_stem().and_then(|s| s.to_str()) {
+                if stem.len() >= 3 {
+                    target_names.push(stem.to_string());
+                }
+            }
+        }
+
+        if target_names.is_empty() {
+            return json_error("could not derive searchable names from the file path");
+        }
+
+        let mentions = match self.index.find_unlinked_mentions(&clean, &target_names) {
+            Ok(m) => m,
+            Err(e) => return json_error(&format!("unlinked mentions search failed: {e}")),
+        };
+
+        let limit = p.limit.unwrap_or(10);
+        let truncated: Vec<_> = mentions.into_iter().take(limit).collect();
+
+        serde_json::to_string_pretty(&serde_json::json!({
+            "path": clean,
+            "searched_names": target_names,
+            "mentions": truncated,
+            "total": truncated.len(),
+        })).unwrap_or_default()
+    }
+}
+
 // -- Helpers --
 
 fn json_error(msg: &str) -> String {
@@ -2652,6 +2892,7 @@ mod tests {
             kanban_enabled: false,
             kanban_queries: std::collections::HashMap::new(),
             kanban_prefixes: std::collections::HashMap::new(),
+            features: Default::default(),
         };
         WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None, None)
     }

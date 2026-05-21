@@ -5,6 +5,26 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Feature flags for optional MCP capabilities.
+#[derive(Debug, Clone)]
+pub struct FeatureFlags {
+    pub partial_reads: bool,
+    pub graph_navigation: bool,
+    pub entity_resolution: bool,
+    pub unlinked_mentions: bool,
+}
+
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self {
+            partial_reads: true,
+            graph_navigation: true,
+            entity_resolution: true,
+            unlinked_mentions: true,
+        }
+    }
+}
+
 /// Top-level wardwell configuration.
 #[derive(Debug)]
 pub struct WardwellConfig {
@@ -21,6 +41,8 @@ pub struct WardwellConfig {
     pub kanban_queries: HashMap<String, String>,
     /// Prefix mappings for kanban item display (prefix → label).
     pub kanban_prefixes: HashMap<String, String>,
+    /// Feature flags for optional MCP capabilities.
+    pub features: FeatureFlags,
 }
 
 /// AI configuration for session summarization.
@@ -66,6 +88,8 @@ struct RawConfig {
     stop_hook: bool,
     #[serde(default)]
     kanban: Option<RawKanbanConfig>,
+    #[serde(default)]
+    features: Option<RawFeatureFlags>,
 }
 
 fn default_true() -> bool {
@@ -89,6 +113,18 @@ struct RawKanbanConfig {
     queries: HashMap<String, String>,
     #[serde(default)]
     prefixes: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFeatureFlags {
+    #[serde(default = "default_true")]
+    partial_reads: bool,
+    #[serde(default = "default_true")]
+    graph_navigation: bool,
+    #[serde(default = "default_true")]
+    entity_resolution: bool,
+    #[serde(default = "default_true")]
+    unlinked_mentions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +199,16 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         None => (false, HashMap::new(), HashMap::new()),
     };
 
+    let features = match raw.features {
+        Some(f) => FeatureFlags {
+            partial_reads: f.partial_reads,
+            graph_navigation: f.graph_navigation,
+            entity_resolution: f.entity_resolution,
+            unlinked_mentions: f.unlinked_mentions,
+        },
+        None => FeatureFlags::default(),
+    };
+
     Ok(WardwellConfig {
         vault_path,
         registry,
@@ -173,6 +219,7 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         kanban_enabled,
         kanban_queries,
         kanban_prefixes,
+        features,
     })
 }
 

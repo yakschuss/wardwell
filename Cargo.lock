@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "wardwell"
-version = "0.7.22"
+version = "0.7.23"
 dependencies = [
  "chrono",
  "clap",
@@ -3480,6 +3480,7 @@ dependencies = [
  "fastembed",
  "glob",
  "notify",
+ "regex",
  "rmcp",
  "rusqlite",
  "schemars",

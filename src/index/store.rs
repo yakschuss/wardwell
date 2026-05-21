@@ -1,7 +1,53 @@
 use crate::index::chunk::Chunk;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
+
+/// A directed link from one vault file to another.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Link {
+    pub target_path: String,
+    pub link_type: String,
+    pub line_number: Option<usize>,
+    pub context: Option<String>,
+}
+
+/// A backlink — another file that links to a target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackLink {
+    pub source_path: String,
+    pub link_type: String,
+    pub line_number: Option<usize>,
+    pub context: Option<String>,
+}
+
+/// A named entity in the vault (domain, project, kanban ticket, alias).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Entity {
+    pub entity_id: String,
+    pub entity_type: String,
+    pub name: String,
+    pub path: Option<String>,
+    pub domain: Option<String>,
+    pub title: Option<String>,
+}
+
+/// An entity match with similarity score.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityMatch {
+    pub entity: Entity,
+    pub score: f64,
+}
+
+/// A file that mentions a target but doesn't formally link to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnlinkedMention {
+    pub source_path: String,
+    pub line_number: usize,
+    pub context: String,
+    pub matched_name: String,
+}
 
 /// Errors from index operations.
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +173,34 @@ impl IndexStore {
             );"
         )?;
 
+        // Link graph for wiki-links, related refs, and callsigns
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vault_links (
+                source_path TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                line_number INTEGER,
+                context TEXT,
+                UNIQUE (source_path, target_path, link_type, line_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_links_target ON vault_links(target_path);
+            CREATE INDEX IF NOT EXISTS idx_links_source ON vault_links(source_path);"
+        )?;
+
+        // Named entity index for resolution (domains, projects, kanban tickets, aliases)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vault_entities (
+                entity_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT,
+                domain TEXT,
+                title TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_name ON vault_entities(name);
+            CREATE INDEX IF NOT EXISTS idx_entities_type ON vault_entities(entity_type);"
+        )?;
+
         // sqlite-vec virtual table for embeddings (optional — server works without it)
         let vec_exists: bool = conn
             .query_row(
@@ -200,7 +274,29 @@ impl IndexStore {
                 path TEXT PRIMARY KEY,
                 line_count INTEGER NOT NULL,
                 indexed_at TEXT NOT NULL
-            );"
+            );
+
+            CREATE TABLE vault_links (
+                source_path TEXT NOT NULL,
+                target_path TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                line_number INTEGER,
+                context TEXT,
+                UNIQUE (source_path, target_path, link_type, line_number)
+            );
+            CREATE INDEX idx_links_target ON vault_links(target_path);
+            CREATE INDEX idx_links_source ON vault_links(source_path);
+
+            CREATE TABLE vault_entities (
+                entity_id TEXT PRIMARY KEY,
+                entity_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                path TEXT,
+                domain TEXT,
+                title TEXT
+            );
+            CREATE INDEX idx_entities_name ON vault_entities(name);
+            CREATE INDEX idx_entities_type ON vault_entities(entity_type);"
         )?;
 
         Ok(Self { conn: Mutex::new(conn) })
@@ -218,6 +314,8 @@ impl IndexStore {
         conn.execute("DELETE FROM chunk_search", [])?;
         conn.execute("DELETE FROM vault_chunks", [])?;
         conn.execute("DELETE FROM chunk_vec", [])?;
+        conn.execute("DELETE FROM vault_links", [])?;
+        conn.execute("DELETE FROM vault_entities", [])?;
         Ok(())
     }
 
@@ -626,6 +724,218 @@ impl IndexStore {
             rusqlite::params![path],
         )?;
         Ok(())
+    }
+
+    // -- Link graph methods --
+
+    /// Replace all links for a source file.
+    pub fn upsert_links(&self, source_path: &str, links: &[Link]) -> Result<(), IndexError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM vault_links WHERE source_path = ?1",
+            rusqlite::params![source_path],
+        )?;
+        for link in links {
+            conn.execute(
+                "INSERT OR IGNORE INTO vault_links (source_path, target_path, link_type, line_number, context)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    source_path,
+                    link.target_path,
+                    link.link_type,
+                    link.line_number.map(|n| n as i64),
+                    link.context,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get forward links from a source file.
+    pub fn get_forward_links(&self, source_path: &str) -> Result<Vec<Link>, IndexError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT target_path, link_type, line_number, context FROM vault_links WHERE source_path = ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source_path], |row| {
+            Ok(Link {
+                target_path: row.get(0)?,
+                link_type: row.get(1)?,
+                line_number: row.get::<_, Option<i64>>(2)?.map(|n| n as usize),
+                context: row.get(3)?,
+            })
+        })?;
+        let mut links = Vec::new();
+        for row in rows {
+            links.push(row?);
+        }
+        Ok(links)
+    }
+
+    /// Get backlinks (files that link TO this target).
+    pub fn get_backlinks(&self, target_path: &str) -> Result<Vec<BackLink>, IndexError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_path, link_type, line_number, context FROM vault_links WHERE target_path = ?1"
+        )?;
+        let rows = stmt.query_map(rusqlite::params![target_path], |row| {
+            Ok(BackLink {
+                source_path: row.get(0)?,
+                link_type: row.get(1)?,
+                line_number: row.get::<_, Option<i64>>(2)?.map(|n| n as usize),
+                context: row.get(3)?,
+            })
+        })?;
+        let mut links = Vec::new();
+        for row in rows {
+            links.push(row?);
+        }
+        Ok(links)
+    }
+
+    /// Remove all links originating from a source file.
+    pub fn remove_links(&self, source_path: &str) -> Result<(), IndexError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM vault_links WHERE source_path = ?1",
+            rusqlite::params![source_path],
+        )?;
+        Ok(())
+    }
+
+    // -- Entity resolution methods --
+
+    /// Upsert an entity into the entity index.
+    pub fn upsert_entity(&self, entity: &Entity) -> Result<(), IndexError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_entities (entity_id, entity_type, name, path, domain, title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                entity.entity_id,
+                entity.entity_type,
+                entity.name,
+                entity.path,
+                entity.domain,
+                entity.title,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve entities by fuzzy name match. Returns up to `limit` results ranked by similarity.
+    pub fn resolve_entity(&self, query: &str, limit: usize) -> Result<Vec<EntityMatch>, IndexError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT entity_id, entity_type, name, path, domain, title FROM vault_entities"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Entity {
+                entity_id: row.get(0)?,
+                entity_type: row.get(1)?,
+                name: row.get(2)?,
+                path: row.get(3)?,
+                domain: row.get(4)?,
+                title: row.get(5)?,
+            })
+        })?;
+
+        let query_lower = query.to_lowercase();
+        let mut scored: Vec<(f64, Entity)> = Vec::new();
+        for row in rows {
+            let entity = row?;
+            let name_lower = entity.name.to_lowercase();
+            let title_lower = entity.title.as_deref().unwrap_or("").to_lowercase();
+
+            // Exact match gets highest score
+            if name_lower == query_lower || title_lower == query_lower {
+                scored.push((1.0, entity));
+                continue;
+            }
+
+            // Prefix match
+            if name_lower.starts_with(&query_lower) || title_lower.starts_with(&query_lower) {
+                scored.push((0.95, entity));
+                continue;
+            }
+
+            // Jaro-Winkler similarity
+            let name_sim = strsim::jaro_winkler(&query_lower, &name_lower);
+            let title_sim = strsim::jaro_winkler(&query_lower, &title_lower);
+            let best = name_sim.max(title_sim);
+            if best > 0.7 {
+                scored.push((best, entity));
+            }
+        }
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored.into_iter().map(|(score, entity)| EntityMatch { entity, score }).collect())
+    }
+
+    /// Clear all entities (used before full rebuild).
+    pub fn clear_entities(&self) -> Result<(), IndexError> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM vault_entities", [])?;
+        Ok(())
+    }
+
+    /// Find unlinked mentions of a target path across all indexed content.
+    /// Returns files that mention the target's name/title in their body but don't have a formal link.
+    pub fn find_unlinked_mentions(&self, target_path: &str, target_names: &[String]) -> Result<Vec<UnlinkedMention>, IndexError> {
+        // First, get all files that formally link to this target
+        let linked_sources: std::collections::HashSet<String> = self.get_backlinks(target_path)?
+            .into_iter()
+            .map(|bl| bl.source_path)
+            .collect();
+
+        let conn = self.lock()?;
+        let mut mentions = Vec::new();
+
+        for name in target_names {
+            if name.is_empty() {
+                continue;
+            }
+            let pattern = format!("%{name}%");
+            let mut stmt = conn.prepare(
+                "SELECT path, body FROM vault_search WHERE body LIKE ?1"
+            )?;
+            let rows = stmt.query_map(rusqlite::params![pattern], |row| {
+                let path: String = row.get(0)?;
+                let body: String = row.get(1)?;
+                Ok((path, body))
+            })?;
+            for row in rows {
+                let (path, body) = row?;
+                if path == target_path || linked_sources.contains(&path) {
+                    continue;
+                }
+                // Find the line number and context
+                for (i, line) in body.lines().enumerate() {
+                    if line.to_lowercase().contains(&name.to_lowercase()) {
+                        let ctx = if line.len() > 120 {
+                            let end = line.floor_char_boundary(120);
+                            format!("{}...", &line[..end])
+                        } else {
+                            line.to_string()
+                        };
+                        mentions.push(UnlinkedMention {
+                            source_path: path.clone(),
+                            line_number: i + 1,
+                            context: ctx,
+                            matched_name: name.clone(),
+                        });
+                        break; // one mention per file per name
+                    }
+                }
+            }
+        }
+
+        // Dedup by source_path
+        let mut seen = std::collections::HashSet::new();
+        mentions.retain(|m| seen.insert(m.source_path.clone()));
+        Ok(mentions)
     }
 }
 

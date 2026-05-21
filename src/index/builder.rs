@@ -1,7 +1,9 @@
 use crate::index::chunk::{chunk_file, chunk_jsonl};
 use crate::index::embed::Embedder;
-use crate::index::store::{IndexError, IndexStore};
+use crate::index::links::extract_links;
+use crate::index::store::{Entity, IndexError, IndexStore};
 use crate::vault::reader::walk_vault_filtered;
+use crate::vault::types::VaultType;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::Path;
@@ -38,13 +40,11 @@ impl IndexBuilder {
         exclude: &[String],
         mut embedder: Option<&mut Embedder>,
     ) -> Result<BuildStats, IndexError> {
+        // Phase 1: collect all vault files and their relative paths
         let results = walk_vault_filtered(vault_root, exclude);
-        let mut indexed = 0;
-        let mut skipped = 0;
+        let mut vault_files = Vec::new();
         let mut errors = 0;
-        let mut chunks_embedded = 0;
         let mut error_details = Vec::new();
-        let mut seen_paths = HashSet::new();
 
         for result in results {
             match result {
@@ -54,79 +54,124 @@ impl IndexBuilder {
                         .unwrap_or(&vf.path)
                         .to_string_lossy()
                         .to_string();
-                    seen_paths.insert(rel_path.clone());
-
-                    let is_jsonl = vf.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
-
-                    if is_jsonl {
-                        // Watermark-based incremental indexing for append-only JSONL files
-                        match index_jsonl_incremental(store, &vf, &rel_path, vault_root, &mut embedder, &mut error_details) {
-                            Ok(new_chunks) => {
-                                if new_chunks > 0 {
-                                    indexed += 1;
-                                    chunks_embedded += new_chunks;
-                                } else {
-                                    skipped += 1;
-                                }
-                            }
-                            Err(e) => {
-                                error_details.push(format!("{rel_path}: {e}"));
-                                errors += 1;
-                            }
-                        }
-                    } else {
-                        match store.upsert(&vf, vault_root) {
-                            Ok(true) => {
-                                indexed += 1;
-
-                                // Chunk the file and upsert chunks
-                                let chunks = chunk_file(&vf.path, &vf.body);
-                                if !chunks.is_empty() {
-                                    match store.upsert_chunks(&rel_path, &chunks) {
-                                        Ok(changed_ids) => {
-                                            // Embed changed chunks if embedder available
-                                            if let Some(ref mut emb) = embedder
-                                                && !changed_ids.is_empty() {
-                                                    // Collect texts for changed chunks
-                                                    let texts: Vec<String> = changed_ids.iter()
-                                                        .filter_map(|id| {
-                                                            chunks.iter()
-                                                                .find(|c| format!("{rel_path}::{}", c.index) == *id)
-                                                                .map(|c| c.body.clone())
-                                                        })
-                                                        .collect();
-
-                                                    match emb.embed_batch(&texts) {
-                                                        Ok(vecs) => {
-                                                            if let Err(e) = store.upsert_embeddings(&changed_ids, &vecs) {
-                                                                error_details.push(format!("{rel_path} embeddings: {e}"));
-                                                            } else {
-                                                                chunks_embedded += vecs.len();
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            error_details.push(format!("{rel_path} embed: {e}"));
-                                                        }
-                                                    }
-                                                }
-                                        }
-                                        Err(e) => {
-                                            error_details.push(format!("{rel_path} chunks: {e}"));
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(false) => skipped += 1,
-                            Err(e) => {
-                                error_details.push(format!("{rel_path}: {e}"));
-                                errors += 1;
-                            }
-                        }
-                    }
+                    vault_files.push((rel_path, vf));
                 }
                 Err(e) => {
                     error_details.push(format!("{e}"));
                     errors += 1;
+                }
+            }
+        }
+
+        // Collect all paths for wiki-link resolution
+        let all_paths: Vec<String> = vault_files.iter().map(|(p, _)| p.clone()).collect();
+        let seen_paths: HashSet<String> = all_paths.iter().cloned().collect();
+
+        // Phase 2: index files, extract links, build entities
+        let mut indexed = 0;
+        let mut skipped = 0;
+        let mut chunks_embedded = 0;
+
+        store.clear_entities()?;
+
+        for (rel_path, vf) in &vault_files {
+            let is_jsonl = vf.path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+
+            if is_jsonl {
+                match index_jsonl_incremental(store, vf, rel_path, vault_root, &mut embedder, &mut error_details) {
+                    Ok(new_chunks) => {
+                        if new_chunks > 0 {
+                            indexed += 1;
+                            chunks_embedded += new_chunks;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    Err(e) => {
+                        error_details.push(format!("{rel_path}: {e}"));
+                        errors += 1;
+                    }
+                }
+            } else {
+                match store.upsert(vf, vault_root) {
+                    Ok(true) => {
+                        indexed += 1;
+
+                        let chunks = chunk_file(&vf.path, &vf.body);
+                        if !chunks.is_empty() {
+                            match store.upsert_chunks(rel_path, &chunks) {
+                                Ok(changed_ids) => {
+                                    if let Some(ref mut emb) = embedder
+                                        && !changed_ids.is_empty() {
+                                            let texts: Vec<String> = changed_ids.iter()
+                                                .filter_map(|id| {
+                                                    chunks.iter()
+                                                        .find(|c| format!("{rel_path}::{}", c.index) == *id)
+                                                        .map(|c| c.body.clone())
+                                                })
+                                                .collect();
+
+                                            match emb.embed_batch(&texts) {
+                                                Ok(vecs) => {
+                                                    if let Err(e) = store.upsert_embeddings(&changed_ids, &vecs) {
+                                                        error_details.push(format!("{rel_path} embeddings: {e}"));
+                                                    } else {
+                                                        chunks_embedded += vecs.len();
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error_details.push(format!("{rel_path} embed: {e}"));
+                                                }
+                                            }
+                                        }
+                                }
+                                Err(e) => {
+                                    error_details.push(format!("{rel_path} chunks: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Ok(false) => skipped += 1,
+                    Err(e) => {
+                        error_details.push(format!("{rel_path}: {e}"));
+                        errors += 1;
+                    }
+                }
+
+                // Extract links from this file
+                let links = extract_links(&vf.body, &vf.frontmatter.related, &all_paths);
+                if let Err(e) = store.upsert_links(rel_path, &links) {
+                    error_details.push(format!("{rel_path} links: {e}"));
+                }
+
+                // Register entities for named types (projects, domains)
+                if matches!(vf.frontmatter.file_type, VaultType::Project | VaultType::Domain) {
+                    // Use parent directory name for common filenames, file stem otherwise
+                    let file_stem = vf.path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let name = if matches!(file_stem, "current_state" | "INDEX" | "index" | "README" | "decisions") {
+                        // Use parent directory as the entity name
+                        vf.path.parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(file_stem)
+                    } else {
+                        file_stem
+                    };
+                    if !name.is_empty() {
+                        let entity = Entity {
+                            entity_id: format!("{}:{}", vf.frontmatter.file_type, rel_path),
+                            entity_type: vf.frontmatter.file_type.to_string(),
+                            name: name.to_string(),
+                            path: Some(rel_path.clone()),
+                            domain: vf.frontmatter.domain.clone(),
+                            title: vf.frontmatter.summary.clone(),
+                        };
+                        if let Err(e) = store.upsert_entity(&entity) {
+                            error_details.push(format!("{rel_path} entity: {e}"));
+                        }
+                    }
                 }
             }
         }

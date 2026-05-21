@@ -4,6 +4,7 @@ pub mod fts;
 pub mod chunk;
 pub mod embed;
 pub mod hybrid;
+pub mod links;
 
 pub use store::*;
 pub use builder::*;
