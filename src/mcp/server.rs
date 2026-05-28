@@ -206,6 +206,16 @@ pub struct KanbanParams {
     // -- proposal fields --
     #[schemars(description = "For proposal_create: array of change operations. Each is a JSON object with 'op' field (update_ticket, append_note, create_relationship, create_question, answer_question, invalidate_question) and relevant sub-fields.")]
     pub changes: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "For proposal_create: intent category. One of: context_capture, context_migration, closure, priority_change, split, merge, supersede, decision_record.")]
+    pub intent: Option<String>,
+    #[schemars(description = "For proposal_create: rationale for changes. Recommended for closures, required (by convention) for priority changes.")]
+    pub rationale: Option<String>,
+    #[schemars(description = "For proposal_create: context transfers. Array of {from_ticket_id, to_ticket_id, description?}.")]
+    pub context_transfers: Option<Vec<serde_json::Value>>,
+    #[schemars(description = "For proposal_create: closure summary. Object with shipped_scope?, not_shipped?, context_destination?.")]
+    pub closure_summary: Option<serde_json::Value>,
+    #[schemars(description = "For proposal_create: questions for the reviewer to consider before approving.")]
+    pub reviewer_questions: Option<Vec<String>>,
 
     // -- verification fields --
     #[schemars(description = "For verify: source of verification. One of: user, code, git, meeting, board, agent.")]
@@ -386,7 +396,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions.")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions.")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -2746,8 +2756,19 @@ impl WardwellServer {
             return json_error("'changes' must not be empty");
         }
 
+        let intent = p.intent.as_deref().and_then(crate::kanban::proposals::ProposalIntent::parse);
+        let rationale = p.rationale.clone();
+        let context_transfers: Vec<crate::kanban::proposals::ContextTransfer> = p.context_transfers
+            .as_ref()
+            .map(|arr| arr.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect())
+            .unwrap_or_default();
+        let closure_summary: Option<crate::kanban::proposals::ClosureSummary> = p.closure_summary
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let reviewer_questions: Vec<String> = p.reviewer_questions.clone().unwrap_or_default();
+
         let now = chrono::Utc::now().to_rfc3339();
-        let proposal = crate::kanban::proposals::Proposal {
+        let mut proposal = crate::kanban::proposals::Proposal {
             id: uuid::Uuid::new_v4().to_string(),
             project: project.clone(),
             title: title.clone(),
@@ -2759,14 +2780,29 @@ impl WardwellServer {
             applied_at: None,
             source: p.source.clone(),
             ticket_snapshots,
+            intent,
+            rationale,
+            risk_flags: vec![],
+            context_transfers,
+            closure_summary,
+            reviewer_questions,
         };
+
+        // Compute review with board context
+        let review_items: Vec<_> = snapshot_ids.iter()
+            .filter_map(|tid| kanban.get_item(tid).ok())
+            .collect();
+        let review_questions = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+        let review_rels = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
+        let review = crate::kanban::proposals::review_proposal(&proposal, &review_items, &review_questions, &review_rels);
+        proposal.risk_flags = review.risk_flags.clone();
 
         if let Err(e) = crate::kanban::proposals::append_event(&self.vault_root, &domain, project, &crate::kanban::proposals::ProposalEvent::Create(proposal.clone())) {
             return json_error(&format!("failed to write proposal: {e}"));
         }
         let audit_line = format!("proposal created: {} ({} changes)", title, proposal.changes.len());
         let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
-        serde_json::to_string(&serde_json::json!({"created": true, "proposal": proposal})).unwrap_or_default()
+        serde_json::to_string(&serde_json::json!({"created": true, "proposal": proposal, "review": review})).unwrap_or_default()
     }
 
     fn kanban_proposal_get(&self, p: &KanbanParams) -> String {
@@ -2785,7 +2821,10 @@ impl WardwellServer {
         };
         let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
         match proposals.into_iter().find(|prop| prop.id == *target_id) {
-            Some(prop) => serde_json::to_string(&serde_json::json!({"proposal": prop})).unwrap_or_default(),
+            Some(prop) => {
+                let summary = crate::kanban::proposals::summarize_proposal(&prop);
+                serde_json::to_string(&serde_json::json!({"proposal": prop, "summary": summary})).unwrap_or_default()
+            }
             None => json_error(&format!("proposal '{}' not found", target_id)),
         }
     }

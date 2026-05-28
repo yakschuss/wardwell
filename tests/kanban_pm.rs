@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use wardwell::kanban::store::KanbanStore;
 use wardwell::kanban::relationships::{self, RelationshipType, RelationshipEvent, Relationship};
 use wardwell::kanban::questions::{self, QuestionEvent, Question, QuestionStatus};
-use wardwell::kanban::proposals::{self, ProposalEvent, Proposal, ProposalStatus, ChangeOperation, TicketSnapshot};
+use wardwell::kanban::proposals::{self, ProposalEvent, Proposal, ProposalStatus, ProposalIntent, ChangeOperation, TicketSnapshot, ContextTransfer, ClosureSummary};
 use wardwell::kanban::verification::{self, VerificationEvent, Verification, VerificationSource, Confidence};
 use wardwell::kanban::reality_check::{self, RealityCheckOptions};
 
@@ -271,6 +271,8 @@ fn proposal_create_with_multiple_operations() {
         ticket_snapshots: vec![
             TicketSnapshot { ticket_id: "P-1".into(), updated_at: "2026-01-01T00:00:00Z".into() },
         ],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Create(p)).unwrap();
     let props = proposals::read_all(&vault, "d", "proj");
@@ -292,6 +294,8 @@ fn proposal_approve_without_applying() {
         created_at: "2026-01-01T00:00:00Z".into(),
         decided_at: None, applied_at: None, source: None,
         ticket_snapshots: vec![],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Create(p)).unwrap();
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Approve {
@@ -326,6 +330,8 @@ fn proposal_apply_approved() {
         ticket_snapshots: vec![
             TicketSnapshot { ticket_id: item.ticket_id.clone(), updated_at: item.updated_at.clone() },
         ],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault_root(&dir), "dom", "proj", &ProposalEvent::Create(p)).unwrap();
     proposals::append_event(&vault_root(&dir), "dom", "proj", &ProposalEvent::Approve {
@@ -364,6 +370,8 @@ fn proposal_reject() {
         created_at: "2026-01-01T00:00:00Z".into(),
         decided_at: None, applied_at: None, source: None,
         ticket_snapshots: vec![],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Create(p)).unwrap();
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Reject {
@@ -393,6 +401,8 @@ fn proposal_detects_conflict() {
         created_at: "2026-01-01T00:00:00Z".into(),
         decided_at: None, applied_at: None, source: None,
         ticket_snapshots: vec![TicketSnapshot { ticket_id: item.ticket_id.clone(), updated_at: snap_time.clone() }],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault_root(&dir), "dom", "proj", &ProposalEvent::Create(p)).unwrap();
 
@@ -623,6 +633,8 @@ fn proposal_cannot_apply_rejected() {
         created_at: "2026-01-01T00:00:00Z".into(),
         decided_at: None, applied_at: None, source: None,
         ticket_snapshots: vec![],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Create(p)).unwrap();
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Reject {
@@ -651,6 +663,8 @@ fn proposal_cannot_apply_pending() {
         created_at: "2026-01-01T00:00:00Z".into(),
         decided_at: None, applied_at: None, source: None,
         ticket_snapshots: vec![],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault, "d", "proj", &ProposalEvent::Create(p)).unwrap();
 
@@ -885,6 +899,8 @@ fn proposal_full_apply_flow_with_multiple_ops() {
             TicketSnapshot { ticket_id: a.ticket_id.clone(), updated_at: a.updated_at.clone() },
             TicketSnapshot { ticket_id: b.ticket_id.clone(), updated_at: b.updated_at.clone() },
         ],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
     };
     proposals::append_event(&vault_root(&dir), "dom", "proj", &ProposalEvent::Create(prop)).unwrap();
 
@@ -977,4 +993,274 @@ fn all_confidence_levels_roundtrip() {
         let parsed = Confidence::parse(name);
         assert!(parsed.is_some(), "failed to parse: {name}");
     }
+}
+
+// ===== Proposal intent types roundtrip =====
+
+#[test]
+fn all_proposal_intent_types_roundtrip() {
+    for name in ProposalIntent::all_names() {
+        let parsed = ProposalIntent::parse(name);
+        assert!(parsed.is_some(), "failed to parse intent: {name}");
+        assert_eq!(parsed.unwrap().as_str(), *name);
+    }
+}
+
+// ===== Proposal review: safe closure =====
+
+#[test]
+fn proposal_review_safe_closure() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("PCC Ingestion", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+    let consumer = store.create_item("TCM Detection", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // Create a relationship: item feeds consumer
+    let rel = Relationship {
+        id: "r-1".into(), project: "proj".into(),
+        from_ticket_id: item.ticket_id.clone(), to_ticket_id: consumer.ticket_id.clone(),
+        relationship_type: RelationshipType::Feeds, description: None,
+        created_at: "2026-01-01T00:00:00Z".into(), source: None,
+    };
+    relationships::append_event(&vault_root(&dir), "dom", "proj", &RelationshipEvent::Create(rel)).unwrap();
+
+    let p = Proposal {
+        id: "prop-safe".into(), project: "proj".into(),
+        title: "Close PCC after shipping".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: item.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+            ChangeOperation::AppendNote {
+                ticket_id: item.ticket_id.clone(),
+                text: "Shipped PCC ingestion — automated discharge detection live".into(),
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: Some("test".into()),
+        ticket_snapshots: vec![
+            TicketSnapshot { ticket_id: item.ticket_id.clone(), updated_at: item.updated_at.clone() },
+        ],
+        intent: Some(ProposalIntent::Closure),
+        rationale: Some("PCC ingestion shipped and verified in production".into()),
+        risk_flags: vec![],
+        context_transfers: vec![ContextTransfer {
+            from_ticket_id: item.ticket_id.clone(),
+            to_ticket_id: consumer.ticket_id.clone(),
+            description: Some("Remaining workflow context moves to TCM".into()),
+        }],
+        closure_summary: Some(ClosureSummary {
+            shipped_scope: Some("Automated discharge detection pipeline".into()),
+            not_shipped: Some("Manual override UI — deferred to TCM".into()),
+            context_destination: Some(consumer.ticket_id.clone()),
+        }),
+        reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let qs = questions::read_all(&vault_root(&dir), "dom", "proj");
+    let rels = relationships::read_all(&vault_root(&dir), "dom", "proj");
+
+    let review = proposals::review_proposal(&p, &items, &qs, &rels);
+
+    // Safe closure: no risk flags
+    assert!(review.risk_flags.is_empty(), "safe closure should have no risk flags, got: {:?}", review.risk_flags);
+    assert_eq!(review.summary.decision_requested, "Intent: closure; Close 1: ".to_string() + &item.ticket_id);
+    assert!(!review.summary.context_preserved.is_empty());
+    assert!(!review.summary.context_moves.is_empty());
+}
+
+// ===== Proposal review: unsafe closure (flagged) =====
+
+#[test]
+fn proposal_review_unsafe_closure_flagged() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let parent = store.create_item("Crisis Producer", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+    let _child = store.create_item("Subtask A", "proj", "dom", None, Some("todo"), None, None, None, None, None, Some(&parent.ticket_id), None, &pf).unwrap();
+
+    // Add an open question on the parent
+    let q = Question {
+        id: "q-unsf".into(), project: "proj".into(), ticket_id: Some(parent.ticket_id.clone()),
+        question: "Who owns the consumer workflow?".into(),
+        current_assumption: None, evidence: None, needed_for: Some("Closure safety".into()),
+        status: QuestionStatus::Open, answer: None,
+        created_at: "2026-01-01T00:00:00Z".into(), updated_at: "2026-01-01T00:00:00Z".into(),
+        resolved_at: None, source: None,
+    };
+    questions::append_event(&vault_root(&dir), "dom", "proj", &QuestionEvent::Create(q)).unwrap();
+
+    // Unsafe: close parent without context, with open child and open question
+    let p = Proposal {
+        id: "prop-unsafe".into(), project: "proj".into(),
+        title: "Close crisis producer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: parent.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![
+            TicketSnapshot { ticket_id: parent.ticket_id.clone(), updated_at: parent.updated_at.clone() },
+        ],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let qs = questions::read_all(&vault_root(&dir), "dom", "proj");
+    let rels = relationships::read_all(&vault_root(&dir), "dom", "proj");
+
+    let review = proposals::review_proposal(&p, &items, &qs, &rels);
+
+    // Should have multiple risk flags
+    let codes: Vec<&str> = review.risk_flags.iter().map(|f| f.code.as_str()).collect();
+    assert!(codes.contains(&"closure_without_context"), "should flag closure without context, got: {:?}", codes);
+    assert!(codes.contains(&"parent_closure_open_children"), "should flag parent with open children, got: {:?}", codes);
+    assert!(codes.contains(&"closure_unresolved_questions"), "should flag unresolved questions, got: {:?}", codes);
+    assert!(!review.summary.unresolved_questions.is_empty(), "unresolved questions should be listed");
+}
+
+// ===== Proposal review: priority change without rationale =====
+
+#[test]
+fn proposal_review_priority_change_no_rationale() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Task", "proj", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
+
+    let p = Proposal {
+        id: "prop-pri".into(), project: "proj".into(),
+        title: "Reprioritize task".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: item.ticket_id.clone(), status: None, priority: Some("urgent".into()),
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![
+            TicketSnapshot { ticket_id: item.ticket_id.clone(), updated_at: item.updated_at.clone() },
+        ],
+        intent: Some(ProposalIntent::PriorityChange),
+        rationale: None, // Missing rationale
+        risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = vec![store.get_item(&item.ticket_id).unwrap()];
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+
+    let codes: Vec<&str> = review.risk_flags.iter().map(|f| f.code.as_str()).collect();
+    assert!(codes.contains(&"priority_change_no_rationale"), "should flag priority change without rationale, got: {:?}", codes);
+
+    // Verify state change has "from" populated
+    let pri_change = review.summary.state_changes.iter().find(|sc| sc.field == "priority").unwrap();
+    assert_eq!(pri_change.from.as_deref(), Some("medium"));
+    assert_eq!(pri_change.to.as_deref(), Some("urgent"));
+}
+
+// ===== Proposal review: context migration (safe) =====
+
+#[test]
+fn proposal_review_context_migration() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let old_ticket = store.create_item("Old approach", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+    let new_ticket = store.create_item("New approach", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    let p = Proposal {
+        id: "prop-migrate".into(), project: "proj".into(),
+        title: "Migrate context from old to new approach".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: old_ticket.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+            ChangeOperation::AppendNote {
+                ticket_id: old_ticket.ticket_id.clone(),
+                text: "Superseded by new approach — context migrated".into(),
+            },
+            ChangeOperation::AppendNote {
+                ticket_id: new_ticket.ticket_id.clone(),
+                text: "Inherited context from old approach: key learnings about rate limiting".into(),
+            },
+            ChangeOperation::CreateRelationship {
+                from_ticket_id: new_ticket.ticket_id.clone(),
+                to_ticket_id: old_ticket.ticket_id.clone(),
+                relationship_type: "supersedes".into(),
+                description: Some("New approach supersedes old".into()),
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![
+            TicketSnapshot { ticket_id: old_ticket.ticket_id.clone(), updated_at: old_ticket.updated_at.clone() },
+            TicketSnapshot { ticket_id: new_ticket.ticket_id.clone(), updated_at: new_ticket.updated_at.clone() },
+        ],
+        intent: Some(ProposalIntent::ContextMigration),
+        rationale: Some("Old approach hit scaling limits — migrating context to new design".into()),
+        risk_flags: vec![],
+        context_transfers: vec![ContextTransfer {
+            from_ticket_id: old_ticket.ticket_id.clone(),
+            to_ticket_id: new_ticket.ticket_id.clone(),
+            description: Some("Rate limiting learnings and integration requirements".into()),
+        }],
+        closure_summary: Some(ClosureSummary {
+            shipped_scope: Some("Initial prototype validated concept".into()),
+            not_shipped: Some("Production deployment — moved to new approach".into()),
+            context_destination: Some(new_ticket.ticket_id.clone()),
+        }),
+        reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let rels = relationships::read_all(&vault_root(&dir), "dom", "proj");
+    let review = proposals::review_proposal(&p, &items, &[], &rels);
+
+    // Context migration with proper context: no closure_without_context flag
+    let codes: Vec<&str> = review.risk_flags.iter().map(|f| f.code.as_str()).collect();
+    assert!(!codes.contains(&"closure_without_context"), "well-documented closure should not be flagged, got: {:?}", codes);
+    assert_eq!(review.summary.decision_requested, format!("Intent: context_migration; Close 1: {}", old_ticket.ticket_id));
+    assert!(review.summary.context_preserved.len() >= 3, "should list notes and relationship as preserved context");
+}
+
+// ===== Backward compat: old proposals without new fields =====
+
+#[test]
+fn old_proposal_without_new_fields_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    let proj_dir = vault.join("d").join("proj");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+
+    // Write a proposal in the old format (no intent, rationale, risk_flags, etc.)
+    let old_json = r#"{"_schema":"proposals","_version":"1.0"}
+{"event":"create_proposal","id":"old-1","project":"proj","title":"Legacy proposal","status":"pending","changes":[{"op":"update_ticket","ticket_id":"T-1","epic":"old-epic"}],"created_at":"2025-01-01T00:00:00Z","ticket_snapshots":[]}"#;
+    std::fs::write(proj_dir.join("proposals.jsonl"), old_json).unwrap();
+
+    let props = proposals::read_all(&vault, "d", "proj");
+    assert_eq!(props.len(), 1);
+    assert_eq!(props[0].id, "old-1");
+    assert_eq!(props[0].title, "Legacy proposal");
+
+    // New fields should have their defaults
+    assert!(props[0].intent.is_none());
+    assert!(props[0].rationale.is_none());
+    assert!(props[0].risk_flags.is_empty());
+    assert!(props[0].context_transfers.is_empty());
+    assert!(props[0].closure_summary.is_none());
+    assert!(props[0].reviewer_questions.is_empty());
+
+    // Summary should still generate
+    let summary = proposals::summarize_proposal(&props[0]);
+    assert!(!summary.decision_requested.is_empty());
 }

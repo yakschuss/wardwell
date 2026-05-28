@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,52 @@ impl ProposalStatus {
             Self::Applied => "applied",
             Self::Cancelled => "cancelled",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalIntent {
+    ContextCapture,
+    ContextMigration,
+    Closure,
+    PriorityChange,
+    Split,
+    Merge,
+    Supersede,
+    DecisionRecord,
+}
+
+impl ProposalIntent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ContextCapture => "context_capture",
+            Self::ContextMigration => "context_migration",
+            Self::Closure => "closure",
+            Self::PriorityChange => "priority_change",
+            Self::Split => "split",
+            Self::Merge => "merge",
+            Self::Supersede => "supersede",
+            Self::DecisionRecord => "decision_record",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "context_capture" => Some(Self::ContextCapture),
+            "context_migration" => Some(Self::ContextMigration),
+            "closure" => Some(Self::Closure),
+            "priority_change" => Some(Self::PriorityChange),
+            "split" => Some(Self::Split),
+            "merge" => Some(Self::Merge),
+            "supersede" => Some(Self::Supersede),
+            "decision_record" => Some(Self::DecisionRecord),
+            _ => None,
+        }
+    }
+
+    pub fn all_names() -> &'static [&'static str] {
+        &["context_capture", "context_migration", "closure", "priority_change", "split", "merge", "supersede", "decision_record"]
     }
 }
 
@@ -86,6 +133,33 @@ pub enum ChangeOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskFlag {
+    pub code: String,
+    pub severity: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextTransfer {
+    pub from_ticket_id: String,
+    pub to_ticket_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosureSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shipped_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_shipped: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_destination: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Proposal {
     pub id: String,
     pub project: String,
@@ -103,12 +177,51 @@ pub struct Proposal {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ticket_snapshots: Vec<TicketSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<ProposalIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risk_flags: Vec<RiskFlag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_transfers: Vec<ContextTransfer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_summary: Option<ClosureSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewer_questions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TicketSnapshot {
     pub ticket_id: String,
     pub updated_at: String,
+}
+
+// ---- Review / risk analysis ----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposalReview {
+    pub summary: ProposalSummary,
+    pub risk_flags: Vec<RiskFlag>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposalSummary {
+    pub decision_requested: String,
+    pub context_preserved: Vec<String>,
+    pub context_moves: Vec<ContextTransfer>,
+    pub state_changes: Vec<StateChange>,
+    pub unresolved_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateChange {
+    pub ticket_id: String,
+    pub field: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +281,7 @@ pub fn read_all(vault_root: &Path, domain: &str, project: &str) -> Vec<Proposal>
         Ok(c) => c,
         Err(_) => return vec![],
     };
-    let mut proposals: std::collections::HashMap<String, Proposal> = std::collections::HashMap::new();
+    let mut proposals: HashMap<String, Proposal> = HashMap::new();
 
     for line in content.lines() {
         if line.is_empty() || line.contains("\"_schema\"") { continue; }
@@ -204,6 +317,273 @@ pub fn read_all(vault_root: &Path, domain: &str, project: &str) -> Vec<Proposal>
     }
 
     proposals.into_values().collect()
+}
+
+// ---- Review computation ----
+
+pub fn summarize_proposal(proposal: &Proposal) -> ProposalSummary {
+    let mut context_preserved = Vec::new();
+    let mut state_changes = Vec::new();
+    let mut closing_ids = Vec::new();
+    let mut priority_ids = Vec::new();
+
+    for change in &proposal.changes {
+        match change {
+            ChangeOperation::UpdateTicket { ticket_id, status, priority, epic, tags, parent, deadline, title, description } => {
+                if let Some(s) = status {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "status".into(), from: None, to: Some(s.clone()) });
+                    if s == "done" { closing_ids.push(ticket_id.as_str()); }
+                }
+                if let Some(p) = priority {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "priority".into(), from: None, to: Some(p.clone()) });
+                    priority_ids.push(ticket_id.as_str());
+                }
+                if let Some(e) = epic {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "epic".into(), from: None, to: Some(e.clone()) });
+                }
+                if tags.is_some() {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "tags".into(), from: None, to: Some("[updated]".into()) });
+                }
+                if let Some(p) = parent {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "parent".into(), from: None, to: Some(p.clone()) });
+                }
+                if let Some(d) = deadline {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "deadline".into(), from: None, to: Some(d.clone()) });
+                }
+                if let Some(t) = title {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "title".into(), from: None, to: Some(truncate_str(t, 60)) });
+                }
+                if description.is_some() {
+                    state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "description".into(), from: None, to: Some("[updated]".into()) });
+                }
+            }
+            ChangeOperation::AppendNote { ticket_id, text } => {
+                context_preserved.push(format!("Note on {}: {}", ticket_id, truncate_str(text, 60)));
+            }
+            ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, relationship_type, .. } => {
+                context_preserved.push(format!("{} → {} ({})", from_ticket_id, to_ticket_id, relationship_type));
+            }
+            ChangeOperation::CreateQuestion { question, ticket_id, .. } => {
+                let scope = ticket_id.as_deref().unwrap_or("project");
+                context_preserved.push(format!("Question for {}: {}", scope, truncate_str(question, 60)));
+            }
+            ChangeOperation::AnswerQuestion { question_id, .. } => {
+                context_preserved.push(format!("Answer for question {}", question_id));
+            }
+            ChangeOperation::InvalidateQuestion { question_id, .. } => {
+                context_preserved.push(format!("Invalidate question {}", question_id));
+            }
+        }
+    }
+
+    for ct in &proposal.context_transfers {
+        context_preserved.push(format!("Context transfer: {} → {}", ct.from_ticket_id, ct.to_ticket_id));
+    }
+
+    if let Some(ref cs) = proposal.closure_summary {
+        if let Some(ref scope) = cs.shipped_scope {
+            context_preserved.push(format!("Shipped: {}", truncate_str(scope, 80)));
+        }
+        if let Some(ref ns) = cs.not_shipped {
+            context_preserved.push(format!("Not shipped: {}", truncate_str(ns, 80)));
+        }
+    }
+
+    let decision_requested = build_decision_summary(proposal, &closing_ids, &priority_ids);
+    let unresolved_questions = proposal.reviewer_questions.clone();
+
+    ProposalSummary {
+        decision_requested,
+        context_preserved,
+        context_moves: proposal.context_transfers.clone(),
+        state_changes,
+        unresolved_questions,
+    }
+}
+
+pub fn review_proposal(
+    proposal: &Proposal,
+    items: &[crate::kanban::store::KanbanItem],
+    questions: &[crate::kanban::questions::Question],
+    relationships: &[crate::kanban::relationships::Relationship],
+) -> ProposalReview {
+    let mut summary = summarize_proposal(proposal);
+    let risk_flags = compute_risk_flags(proposal, items, questions, relationships, &mut summary);
+    ProposalReview { summary, risk_flags }
+}
+
+fn compute_risk_flags(
+    proposal: &Proposal,
+    items: &[crate::kanban::store::KanbanItem],
+    questions: &[crate::kanban::questions::Question],
+    relationships: &[crate::kanban::relationships::Relationship],
+    summary: &mut ProposalSummary,
+) -> Vec<RiskFlag> {
+    let mut flags = Vec::new();
+
+    let item_map: HashMap<&str, &crate::kanban::store::KanbanItem> = items.iter()
+        .map(|i| (i.ticket_id.as_str(), i))
+        .collect();
+
+    let mut closing_tickets: Vec<String> = Vec::new();
+    let mut priority_changes: Vec<String> = Vec::new();
+    let mut unique_tickets: HashSet<String> = HashSet::new();
+    let mut has_note_for: HashSet<String> = HashSet::new();
+
+    for change in &proposal.changes {
+        match change {
+            ChangeOperation::UpdateTicket { ticket_id, status, priority, .. } => {
+                unique_tickets.insert(ticket_id.clone());
+                if status.as_deref() == Some("done") {
+                    closing_tickets.push(ticket_id.clone());
+                }
+                if let Some(new_pri) = priority {
+                    if let Some(item) = item_map.get(ticket_id.as_str()) {
+                        if item.priority != *new_pri {
+                            priority_changes.push(ticket_id.clone());
+                            // Enrich state change with "from" value
+                            for sc in summary.state_changes.iter_mut() {
+                                if sc.ticket_id == *ticket_id && sc.field == "priority" {
+                                    sc.from = Some(item.priority.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(new_status) = status {
+                    if let Some(item) = item_map.get(ticket_id.as_str()) {
+                        for sc in summary.state_changes.iter_mut() {
+                            if sc.ticket_id == *ticket_id && sc.field == "status" && sc.to.as_deref() == Some(new_status.as_str()) {
+                                sc.from = Some(item.status.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            ChangeOperation::AppendNote { ticket_id, .. } => {
+                has_note_for.insert(ticket_id.clone());
+                unique_tickets.insert(ticket_id.clone());
+            }
+            ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, .. } => {
+                unique_tickets.insert(from_ticket_id.clone());
+                unique_tickets.insert(to_ticket_id.clone());
+            }
+            ChangeOperation::CreateQuestion { ticket_id, .. } => {
+                if let Some(tid) = ticket_id { unique_tickets.insert(tid.clone()); }
+            }
+            _ => {}
+        }
+    }
+
+    // Risk: closing without context
+    for tid in &closing_tickets {
+        let has_closure = proposal.closure_summary.is_some();
+        let has_transfer = proposal.context_transfers.iter().any(|ct| ct.from_ticket_id == *tid);
+        let has_note = has_note_for.contains(tid);
+        if !has_closure && !has_transfer && !has_note {
+            flags.push(RiskFlag {
+                code: "closure_without_context".into(),
+                severity: "warning".into(),
+                message: format!("Ticket '{}' closed without shipped_scope, context_destination, or closing note", tid),
+                ticket_id: Some(tid.clone()),
+            });
+        }
+    }
+
+    // Risk: closing parent with open children
+    for tid in &closing_tickets {
+        if let Some(item) = item_map.get(tid.as_str()) {
+            let open_children: Vec<&str> = item.children.iter()
+                .filter(|c| c.status != "done")
+                .map(|c| c.ticket_id.as_str())
+                .collect();
+            if !open_children.is_empty() {
+                flags.push(RiskFlag {
+                    code: "parent_closure_open_children".into(),
+                    severity: "warning".into(),
+                    message: format!("Ticket '{}' has open children: {}", tid, open_children.join(", ")),
+                    ticket_id: Some(tid.clone()),
+                });
+            }
+        }
+    }
+
+    // Risk: closing with unresolved questions
+    for tid in &closing_tickets {
+        let open_count = questions.iter()
+            .filter(|q| q.ticket_id.as_deref() == Some(tid.as_str()) && q.status == crate::kanban::questions::QuestionStatus::Open)
+            .count();
+        if open_count > 0 {
+            flags.push(RiskFlag {
+                code: "closure_unresolved_questions".into(),
+                severity: "warning".into(),
+                message: format!("Ticket '{}' has {} unresolved question(s)", tid, open_count),
+                ticket_id: Some(tid.clone()),
+            });
+            // Enrich summary with these questions
+            for q in questions.iter().filter(|q| q.ticket_id.as_deref() == Some(tid.as_str()) && q.status == crate::kanban::questions::QuestionStatus::Open) {
+                summary.unresolved_questions.push(format!("[{}] {}", tid, q.question));
+            }
+        }
+    }
+
+    // Risk: priority change without rationale
+    if !priority_changes.is_empty() && proposal.rationale.is_none() {
+        flags.push(RiskFlag {
+            code: "priority_change_no_rationale".into(),
+            severity: "warning".into(),
+            message: format!("Priority change on {} without rationale", priority_changes.join(", ")),
+            ticket_id: priority_changes.first().cloned(),
+        });
+    }
+
+    // Risk: unrelated batch (>3 tickets with no shared relationship or parent)
+    if unique_tickets.len() > 3 {
+        let connected = relationships.iter().any(|r| {
+            unique_tickets.contains(&r.from_ticket_id) && unique_tickets.contains(&r.to_ticket_id)
+        }) || unique_tickets.iter().any(|tid| {
+            item_map.get(tid.as_str())
+                .and_then(|item| item.parent.as_ref())
+                .is_some_and(|p| unique_tickets.contains(p))
+        });
+        if !connected {
+            flags.push(RiskFlag {
+                code: "unrelated_batch".into(),
+                severity: "warning".into(),
+                message: format!("Proposal touches {} tickets with no detected relationships — consider splitting", unique_tickets.len()),
+                ticket_id: None,
+            });
+        }
+    }
+
+    flags
+}
+
+fn build_decision_summary(proposal: &Proposal, closing: &[&str], priority: &[&str]) -> String {
+    let mut parts = Vec::new();
+    if let Some(ref intent) = proposal.intent {
+        parts.push(format!("Intent: {}", intent.as_str()));
+    }
+    if !closing.is_empty() {
+        parts.push(format!("Close {}: {}", closing.len(), closing.join(", ")));
+    }
+    if !priority.is_empty() {
+        parts.push(format!("Reprioritize: {}", priority.join(", ")));
+    }
+    if parts.is_empty() {
+        proposal.title.clone()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let end = s.floor_char_boundary(max);
+        format!("{}…", &s[..end])
+    }
 }
 
 #[cfg(test)]
@@ -245,6 +625,8 @@ mod tests {
             ticket_snapshots: vec![
                 TicketSnapshot { ticket_id: "T-1".into(), updated_at: "2026-05-26T00:00:00Z".into() },
             ],
+            intent: None, rationale: None, risk_flags: vec![],
+            context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
         };
         let json = serde_json::to_string(&p).unwrap();
         let parsed: Proposal = serde_json::from_str(&json).unwrap();
@@ -266,6 +648,8 @@ mod tests {
             applied_at: None,
             source: None,
             ticket_snapshots: vec![],
+            intent: None, rationale: None, risk_flags: vec![],
+            context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
         };
         append_event(dir.path(), "d", "proj", &ProposalEvent::Create(p)).unwrap();
         append_event(dir.path(), "d", "proj", &ProposalEvent::Approve {
@@ -296,6 +680,8 @@ mod tests {
             applied_at: None,
             source: None,
             ticket_snapshots: vec![],
+            intent: None, rationale: None, risk_flags: vec![],
+            context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
         };
         append_event(dir.path(), "d", "proj", &ProposalEvent::Create(p)).unwrap();
         append_event(dir.path(), "d", "proj", &ProposalEvent::Reject {
