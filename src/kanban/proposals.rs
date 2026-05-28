@@ -208,9 +208,12 @@ pub struct ProposalReview {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProposalSummary {
     pub decision_requested: String,
+    /// Notes, relationships, and decisions added to tickets (context kept in place).
     pub context_preserved: Vec<String>,
-    pub context_moves: Vec<ContextTransfer>,
+    /// Explicit source → destination custody moves to a successor ticket.
+    pub context_transfers: Vec<ContextTransfer>,
     pub state_changes: Vec<StateChange>,
+    /// Questions created by this proposal or still open and blocking a closure.
     pub unresolved_questions: Vec<String>,
 }
 
@@ -222,6 +225,26 @@ pub struct StateChange {
     pub from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+}
+
+/// Scannable, review-critical metadata for one proposal — no raw operations.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposalListEntry {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    pub affected_ticket_ids: Vec<String>,
+    pub state_change_count: usize,
+    pub context_preserved_count: usize,
+    pub context_transfer_count: usize,
+    pub risk_flag_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,6 +347,7 @@ pub fn read_all(vault_root: &Path, domain: &str, project: &str) -> Vec<Proposal>
 pub fn summarize_proposal(proposal: &Proposal) -> ProposalSummary {
     let mut context_preserved = Vec::new();
     let mut state_changes = Vec::new();
+    let mut unresolved_questions = proposal.reviewer_questions.clone();
     let mut closing_ids = Vec::new();
     let mut priority_ids = Vec::new();
 
@@ -357,29 +381,28 @@ pub fn summarize_proposal(proposal: &Proposal) -> ProposalSummary {
                     state_changes.push(StateChange { ticket_id: ticket_id.clone(), field: "description".into(), from: None, to: Some("[updated]".into()) });
                 }
             }
+            // A note stays on the same ticket — context preserved in place, NOT migrated.
             ChangeOperation::AppendNote { ticket_id, text } => {
                 context_preserved.push(format!("Note on {}: {}", ticket_id, truncate_str(text, 60)));
             }
             ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, relationship_type, .. } => {
-                context_preserved.push(format!("{} → {} ({})", from_ticket_id, to_ticket_id, relationship_type));
+                context_preserved.push(format!("Link {} → {} ({})", from_ticket_id, to_ticket_id, relationship_type));
             }
+            // A newly created question is an open thread, not preserved context.
             ChangeOperation::CreateQuestion { question, ticket_id, .. } => {
                 let scope = ticket_id.as_deref().unwrap_or("project");
-                context_preserved.push(format!("Question for {}: {}", scope, truncate_str(question, 60)));
+                unresolved_questions.push(format!("New question on {}: {}", scope, truncate_str(question, 60)));
             }
             ChangeOperation::AnswerQuestion { question_id, .. } => {
-                context_preserved.push(format!("Answer for question {}", question_id));
+                context_preserved.push(format!("Answer recorded for question {}", question_id));
             }
             ChangeOperation::InvalidateQuestion { question_id, .. } => {
-                context_preserved.push(format!("Invalidate question {}", question_id));
+                context_preserved.push(format!("Question {} marked obsolete", question_id));
             }
         }
     }
 
-    for ct in &proposal.context_transfers {
-        context_preserved.push(format!("Context transfer: {} → {}", ct.from_ticket_id, ct.to_ticket_id));
-    }
-
+    // closure_summary describes what shipped — knowledge kept, so it counts as preserved.
     if let Some(ref cs) = proposal.closure_summary {
         if let Some(ref scope) = cs.shipped_scope {
             context_preserved.push(format!("Shipped: {}", truncate_str(scope, 80)));
@@ -390,12 +413,11 @@ pub fn summarize_proposal(proposal: &Proposal) -> ProposalSummary {
     }
 
     let decision_requested = build_decision_summary(proposal, &closing_ids, &priority_ids);
-    let unresolved_questions = proposal.reviewer_questions.clone();
 
     ProposalSummary {
         decision_requested,
         context_preserved,
-        context_moves: proposal.context_transfers.clone(),
+        context_transfers: proposal.context_transfers.clone(),
         state_changes,
         unresolved_questions,
     }
@@ -410,6 +432,68 @@ pub fn review_proposal(
     let mut summary = summarize_proposal(proposal);
     let risk_flags = compute_risk_flags(proposal, items, questions, relationships, &mut summary);
     ProposalReview { summary, risk_flags }
+}
+
+/// Unique ticket IDs touched by a proposal's operations, sorted for stable output.
+pub fn affected_ticket_ids(proposal: &Proposal) -> Vec<String> {
+    let mut set: HashSet<String> = HashSet::new();
+    for change in &proposal.changes {
+        match change {
+            ChangeOperation::UpdateTicket { ticket_id, .. } | ChangeOperation::AppendNote { ticket_id, .. } => {
+                set.insert(ticket_id.clone());
+            }
+            ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, .. } => {
+                set.insert(from_ticket_id.clone());
+                set.insert(to_ticket_id.clone());
+            }
+            ChangeOperation::CreateQuestion { ticket_id, .. } => {
+                if let Some(tid) = ticket_id { set.insert(tid.clone()); }
+            }
+            ChangeOperation::AnswerQuestion { .. } | ChangeOperation::InvalidateQuestion { .. } => {}
+        }
+    }
+    let mut ids: Vec<String> = set.into_iter().collect();
+    ids.sort();
+    ids
+}
+
+/// Build a scannable list entry — review-critical metadata, no raw operations.
+/// Risk flags are recomputed fresh against current board state so a list reflects
+/// the board as it stands now, not as it was when the proposal was filed.
+pub fn list_entry(
+    proposal: &Proposal,
+    items: &[crate::kanban::store::KanbanItem],
+    questions: &[crate::kanban::questions::Question],
+    relationships: &[crate::kanban::relationships::Relationship],
+) -> ProposalListEntry {
+    let review = review_proposal(proposal, items, questions, relationships);
+    ProposalListEntry {
+        id: proposal.id.clone(),
+        title: proposal.title.clone(),
+        status: proposal.status.as_str().to_string(),
+        intent: proposal.intent.map(|i| i.as_str().to_string()),
+        created_at: proposal.created_at.clone(),
+        decided_at: proposal.decided_at.clone(),
+        affected_ticket_ids: affected_ticket_ids(proposal),
+        state_change_count: review.summary.state_changes.len(),
+        context_preserved_count: review.summary.context_preserved.len(),
+        context_transfer_count: review.summary.context_transfers.len(),
+        risk_flag_count: review.risk_flags.len(),
+        risk_summary: risk_summary_line(&review.risk_flags),
+    }
+}
+
+/// A one-line, human-scannable summary of a proposal's risk flags.
+pub fn risk_summary_line(flags: &[RiskFlag]) -> Option<String> {
+    if flags.is_empty() {
+        return None;
+    }
+    let joined = flags.iter()
+        .map(|f| f.message.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let prefix = format!("⚠ {} risk(s): ", flags.len());
+    Some(format!("{}{}", prefix, truncate_str(&joined, 240)))
 }
 
 fn compute_risk_flags(
@@ -429,6 +513,8 @@ fn compute_risk_flags(
     let mut priority_changes: Vec<String> = Vec::new();
     let mut unique_tickets: HashSet<String> = HashSet::new();
     let mut has_note_for: HashSet<String> = HashSet::new();
+    // Tickets that gain an outgoing or incoming link in *this* proposal.
+    let mut linked_in_proposal: HashSet<String> = HashSet::new();
 
     for change in &proposal.changes {
         match change {
@@ -448,6 +534,9 @@ fn compute_risk_flags(
                                 }
                             }
                         }
+                    } else {
+                        // No board snapshot to compare against — still a priority change.
+                        priority_changes.push(ticket_id.clone());
                     }
                 }
                 if let Some(new_status) = status {
@@ -467,6 +556,8 @@ fn compute_risk_flags(
             ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, .. } => {
                 unique_tickets.insert(from_ticket_id.clone());
                 unique_tickets.insert(to_ticket_id.clone());
+                linked_in_proposal.insert(from_ticket_id.clone());
+                linked_in_proposal.insert(to_ticket_id.clone());
             }
             ChangeOperation::CreateQuestion { ticket_id, .. } => {
                 if let Some(tid) = ticket_id { unique_tickets.insert(tid.clone()); }
@@ -475,22 +566,35 @@ fn compute_risk_flags(
         }
     }
 
-    // Risk: closing without context
+    // Treat an explicit rationale or an obsolete/supersede intent as a stated
+    // reason that context custody was considered for the whole proposal.
+    let has_rationale = proposal.rationale.as_deref().is_some_and(|r| !r.trim().is_empty());
+    let obsolete_intent = matches!(proposal.intent, Some(ProposalIntent::Supersede));
+
+    // Risk: closing a ticket without saying where its remaining context lives.
     for tid in &closing_tickets {
-        let has_closure = proposal.closure_summary.is_some();
+        let has_closure = proposal.closure_summary.as_ref().is_some_and(|cs| {
+            cs.shipped_scope.is_some() || cs.context_destination.is_some() || cs.not_shipped.is_some()
+        });
         let has_transfer = proposal.context_transfers.iter().any(|ct| ct.from_ticket_id == *tid);
         let has_note = has_note_for.contains(tid);
-        if !has_closure && !has_transfer && !has_note {
+        // A successor/relationship link — created here or already on the board — shows
+        // where the context continues.
+        let has_link = linked_in_proposal.contains(tid)
+            || relationships.iter().any(|r| r.from_ticket_id == *tid || r.to_ticket_id == *tid);
+        if !has_closure && !has_transfer && !has_note && !has_link && !has_rationale && !obsolete_intent {
             flags.push(RiskFlag {
                 code: "closure_without_context".into(),
                 severity: "warning".into(),
-                message: format!("Ticket '{}' closed without shipped_scope, context_destination, or closing note", tid),
+                message: format!(
+                    "Moves {tid} to done but does not say where remaining context lives — add a closure summary, context transfer, successor link, or rationale."
+                ),
                 ticket_id: Some(tid.clone()),
             });
         }
     }
 
-    // Risk: closing parent with open children
+    // Risk: closing a context-wrapper ticket while its children are still open.
     for tid in &closing_tickets {
         if let Some(item) = item_map.get(tid.as_str()) {
             let open_children: Vec<&str> = item.children.iter()
@@ -501,43 +605,67 @@ fn compute_risk_flags(
                 flags.push(RiskFlag {
                     code: "parent_closure_open_children".into(),
                     severity: "warning".into(),
-                    message: format!("Ticket '{}' has open children: {}", tid, open_children.join(", ")),
+                    message: format!(
+                        "Closes {tid} while {} child ticket(s) are still open ({}); their context would be orphaned.",
+                        open_children.len(), open_children.join(", ")
+                    ),
                     ticket_id: Some(tid.clone()),
                 });
             }
         }
     }
 
-    // Risk: closing with unresolved questions
+    // Risk: closing a ticket that still has unresolved questions.
     for tid in &closing_tickets {
-        let open_count = questions.iter()
+        let open: Vec<&crate::kanban::questions::Question> = questions.iter()
             .filter(|q| q.ticket_id.as_deref() == Some(tid.as_str()) && q.status == crate::kanban::questions::QuestionStatus::Open)
-            .count();
-        if open_count > 0 {
+            .collect();
+        if !open.is_empty() {
             flags.push(RiskFlag {
                 code: "closure_unresolved_questions".into(),
                 severity: "warning".into(),
-                message: format!("Ticket '{}' has {} unresolved question(s)", tid, open_count),
+                message: format!(
+                    "Closes {tid} with {} unresolved question(s) still open; resolve or migrate them before closing.",
+                    open.len()
+                ),
                 ticket_id: Some(tid.clone()),
             });
-            // Enrich summary with these questions
-            for q in questions.iter().filter(|q| q.ticket_id.as_deref() == Some(tid.as_str()) && q.status == crate::kanban::questions::QuestionStatus::Open) {
+            for q in open {
                 summary.unresolved_questions.push(format!("[{}] {}", tid, q.question));
             }
         }
     }
 
-    // Risk: priority change without rationale
-    if !priority_changes.is_empty() && proposal.rationale.is_none() {
+    // Risk: reprioritizing without explaining the milestone/sequencing impact.
+    if !priority_changes.is_empty() && !has_rationale {
         flags.push(RiskFlag {
             code: "priority_change_no_rationale".into(),
             severity: "warning".into(),
-            message: format!("Priority change on {} without rationale", priority_changes.join(", ")),
+            message: format!(
+                "Changes priority on {} without explaining milestone or sequencing impact.",
+                priority_changes.join(", ")
+            ),
             ticket_id: priority_changes.first().cloned(),
         });
     }
 
-    // Risk: unrelated batch (>3 tickets with no shared relationship or parent)
+    // Risk: a single proposal that both closes work and reshuffles priorities on
+    // tickets that aren't connected — two different decisions bundled together.
+    if !closing_tickets.is_empty() && !priority_changes.is_empty() {
+        let closing_set: HashSet<&str> = closing_tickets.iter().map(String::as_str).collect();
+        let priority_set: HashSet<&str> = priority_changes.iter().map(String::as_str).collect();
+        let overlap = closing_set.iter().any(|t| priority_set.contains(t));
+        if !overlap && !sets_connected(&closing_set, &priority_set, relationships, &item_map) {
+            flags.push(RiskFlag {
+                code: "mixed_intent_batch".into(),
+                severity: "warning".into(),
+                message: "Combines closure and priority changes across unrelated tickets; consider splitting by intent.".into(),
+                ticket_id: None,
+            });
+        }
+    }
+
+    // Risk: many unrelated tickets in one proposal.
     if unique_tickets.len() > 3 {
         let connected = relationships.iter().any(|r| {
             unique_tickets.contains(&r.from_ticket_id) && unique_tickets.contains(&r.to_ticket_id)
@@ -547,16 +675,47 @@ fn compute_risk_flags(
                 .is_some_and(|p| unique_tickets.contains(p))
         });
         if !connected {
+            let mut ids: Vec<&str> = unique_tickets.iter().map(String::as_str).collect();
+            ids.sort_unstable();
             flags.push(RiskFlag {
                 code: "unrelated_batch".into(),
                 severity: "warning".into(),
-                message: format!("Proposal touches {} tickets with no detected relationships — consider splitting", unique_tickets.len()),
+                message: format!(
+                    "Touches {} unrelated tickets ({}) in one proposal; consider splitting by intent.",
+                    unique_tickets.len(), ids.join(", ")
+                ),
                 ticket_id: None,
             });
         }
     }
 
     flags
+}
+
+/// True if any ticket in `a` is linked to any ticket in `b` via a relationship
+/// (either direction) or a parent/child edge.
+fn sets_connected(
+    a: &HashSet<&str>,
+    b: &HashSet<&str>,
+    relationships: &[crate::kanban::relationships::Relationship],
+    item_map: &HashMap<&str, &crate::kanban::store::KanbanItem>,
+) -> bool {
+    let rel_link = relationships.iter().any(|r| {
+        (a.contains(r.from_ticket_id.as_str()) && b.contains(r.to_ticket_id.as_str()))
+            || (b.contains(r.from_ticket_id.as_str()) && a.contains(r.to_ticket_id.as_str()))
+    });
+    if rel_link {
+        return true;
+    }
+    // parent/child across the two sets
+    let parent_link = |x: &HashSet<&str>, y: &HashSet<&str>| {
+        x.iter().any(|tid| {
+            item_map.get(tid)
+                .and_then(|item| item.parent.as_deref())
+                .is_some_and(|p| y.contains(p))
+        })
+    };
+    parent_link(a, b) || parent_link(b, a)
 }
 
 fn build_decision_summary(proposal: &Proposal, closing: &[&str], priority: &[&str]) -> String {

@@ -230,7 +230,7 @@ pub struct KanbanParams {
     pub stale_after_days: Option<u64>,
     #[schemars(description = "For question_list/reality_check: filter to show only open questions. Default true for question_list.")]
     pub open_only: Option<bool>,
-    #[schemars(description = "For reality_check: set true for full verbose output including tickets_by_status, no_deadline, relationship_graph. Default false (compact).")]
+    #[schemars(description = "For reality_check: set true for full verbose output including tickets_by_status, no_deadline, relationship_graph. For proposal_list: set true to return raw proposals with every operation instead of the scannable review summary. Default false (compact).")]
     pub full: Option<bool>,
     #[schemars(description = "For reality_check/hygiene_suggestions: max items per section. Default 10.")]
     pub limit: Option<usize>,
@@ -396,7 +396,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions.")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions.")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -424,8 +424,8 @@ impl WardwellServer {
             "question_answer" => self.kanban_question_answer(&p),
             "question_invalidate" => self.kanban_question_invalidate(&p),
             "proposal_create" => self.kanban_proposal_create(kanban, &p),
-            "proposal_get" => self.kanban_proposal_get(&p),
-            "proposal_list" => self.kanban_proposal_list(&p),
+            "proposal_get" => self.kanban_proposal_get(kanban, &p),
+            "proposal_list" => self.kanban_proposal_list(kanban, &p),
             "proposal_approve" => self.kanban_proposal_approve(&p),
             "proposal_reject" => self.kanban_proposal_reject(&p),
             "proposal_apply" => self.kanban_proposal_apply(kanban, &p),
@@ -2805,7 +2805,25 @@ impl WardwellServer {
         serde_json::to_string(&serde_json::json!({"created": true, "proposal": proposal, "review": review})).unwrap_or_default()
     }
 
-    fn kanban_proposal_get(&self, p: &KanbanParams) -> String {
+    /// Load the board context (project items, questions, relationships) used to
+    /// recompute proposal risk against current state. Read-only.
+    fn proposal_review_context(
+        &self,
+        kanban: &crate::kanban::store::KanbanStore,
+        domain: &str,
+        project: &str,
+    ) -> (
+        Vec<crate::kanban::store::KanbanItem>,
+        Vec<crate::kanban::questions::Question>,
+        Vec<crate::kanban::relationships::Relationship>,
+    ) {
+        let items = kanban.list(Some(project), None, None, None, None, None, true, None).unwrap_or_default();
+        let questions = crate::kanban::questions::read_all(&self.vault_root, domain, project);
+        let relationships = crate::kanban::relationships::read_all(&self.vault_root, domain, project);
+        (items, questions, relationships)
+    }
+
+    fn kanban_proposal_get(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
         let Some(ref target_id) = p.target_id else {
             return json_error("'target_id' (proposal ID) is required for proposal_get");
         };
@@ -2822,14 +2840,25 @@ impl WardwellServer {
         let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
         match proposals.into_iter().find(|prop| prop.id == *target_id) {
             Some(prop) => {
-                let summary = crate::kanban::proposals::summarize_proposal(&prop);
-                serde_json::to_string(&serde_json::json!({"proposal": prop, "summary": summary})).unwrap_or_default()
+                // Recompute risk against current board state so a pending proposal
+                // reflects the board as it stands now.
+                let (items, questions, relationships) = self.proposal_review_context(kanban, &domain, project);
+                let review = crate::kanban::proposals::review_proposal(&prop, &items, &questions, &relationships);
+                let risk_summary = crate::kanban::proposals::risk_summary_line(&review.risk_flags);
+                serde_json::to_string(&serde_json::json!({
+                    "proposal": prop,
+                    "summary": review.summary,
+                    "risk_flags": review.risk_flags,
+                    "risk_count": review.risk_flags.len(),
+                    "has_risks": !review.risk_flags.is_empty(),
+                    "risk_summary": risk_summary,
+                })).unwrap_or_default()
             }
             None => json_error(&format!("proposal '{}' not found", target_id)),
         }
     }
 
-    fn kanban_proposal_list(&self, p: &KanbanParams) -> String {
+    fn kanban_proposal_list(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
         let Some(ref project) = p.project else {
             return json_error("'project' is required for proposal_list");
         };
@@ -2841,15 +2870,33 @@ impl WardwellServer {
             },
         };
         let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
-        let filtered: Vec<_> = if let Some(ref status_str) = p.status {
+        let mut filtered: Vec<_> = if let Some(ref status_str) = p.status {
             proposals.into_iter().filter(|prop| {
                 prop.status.as_str() == status_str
             }).collect()
         } else {
             proposals
         };
+        // Newest first so a reviewer sees fresh proposals at the top.
+        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         let total = filtered.len();
-        serde_json::to_string(&serde_json::json!({"proposals": filtered, "total": total})).unwrap_or_default()
+
+        // full=true returns the raw proposals (every operation). Default is a
+        // scannable, review-critical view with no raw operations.
+        if p.full.unwrap_or(false) {
+            return serde_json::to_string(&serde_json::json!({"proposals": filtered, "total": total})).unwrap_or_default();
+        }
+
+        let (items, questions, relationships) = self.proposal_review_context(kanban, &domain, project);
+        let entries: Vec<_> = filtered.iter()
+            .map(|prop| crate::kanban::proposals::list_entry(prop, &items, &questions, &relationships))
+            .collect();
+        let flagged = entries.iter().filter(|e| e.risk_flag_count > 0).count();
+        serde_json::to_string(&serde_json::json!({
+            "proposals": entries,
+            "total": total,
+            "flagged": flagged,
+        })).unwrap_or_default()
     }
 
     fn kanban_proposal_approve(&self, p: &KanbanParams) -> String {

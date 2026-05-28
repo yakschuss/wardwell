@@ -1069,7 +1069,7 @@ fn proposal_review_safe_closure() {
     assert!(review.risk_flags.is_empty(), "safe closure should have no risk flags, got: {:?}", review.risk_flags);
     assert_eq!(review.summary.decision_requested, "Intent: closure; Close 1: ".to_string() + &item.ticket_id);
     assert!(!review.summary.context_preserved.is_empty());
-    assert!(!review.summary.context_moves.is_empty());
+    assert!(!review.summary.context_transfers.is_empty());
 }
 
 // ===== Proposal review: unsafe closure (flagged) =====
@@ -1263,4 +1263,250 @@ fn old_proposal_without_new_fields_loads() {
     // Summary should still generate
     let summary = proposals::summarize_proposal(&props[0]);
     assert!(!summary.decision_requested.is_empty());
+}
+
+// ===== v0.10.1: list entry surfaces risk for unsafe closure =====
+
+#[test]
+fn proposal_list_entry_surfaces_risk_for_unsafe_closure() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Crisis producer", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    let p = Proposal {
+        id: "prop-1".into(), project: "proj".into(),
+        title: "Close crisis producer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![ChangeOperation::UpdateTicket {
+            ticket_id: item.ticket_id.clone(), status: Some("done".into()), priority: None,
+            epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+        }],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![],
+        intent: Some(ProposalIntent::Closure),
+        rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let entry = proposals::list_entry(&p, &items, &[], &[]);
+
+    assert_eq!(entry.id, "prop-1");
+    assert_eq!(entry.status, "pending");
+    assert_eq!(entry.intent.as_deref(), Some("closure"));
+    assert_eq!(entry.affected_ticket_ids, vec![item.ticket_id.clone()]);
+    assert_eq!(entry.state_change_count, 1);
+    assert!(entry.risk_flag_count >= 1, "unsafe closure should carry a risk flag");
+    let summary = entry.risk_summary.expect("risk summary present");
+    assert!(summary.contains("risk(s)"), "summary should be human-scannable: {summary}");
+    assert!(summary.to_lowercase().contains("remaining context"), "should name the orphaned-context risk: {summary}");
+}
+
+// ===== v0.10.1: list entry for safe closure has no risk =====
+
+#[test]
+fn proposal_list_entry_safe_closure_no_risk() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let producer = store.create_item("Producer", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+    let consumer = store.create_item("Consumer", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    let p = Proposal {
+        id: "prop-safe".into(), project: "proj".into(),
+        title: "Close producer, hand off to consumer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![ChangeOperation::UpdateTicket {
+            ticket_id: producer.ticket_id.clone(), status: Some("done".into()), priority: None,
+            epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+        }],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: Some("test".into()),
+        ticket_snapshots: vec![],
+        intent: Some(ProposalIntent::Closure),
+        rationale: Some("Producer shipped; consumer owns the rest".into()),
+        risk_flags: vec![],
+        context_transfers: vec![ContextTransfer {
+            from_ticket_id: producer.ticket_id.clone(),
+            to_ticket_id: consumer.ticket_id.clone(),
+            description: Some("Remaining crisis-consumer context".into()),
+        }],
+        closure_summary: Some(ClosureSummary {
+            shipped_scope: Some("Producer pipeline".into()),
+            not_shipped: None,
+            context_destination: Some(consumer.ticket_id.clone()),
+        }),
+        reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let entry = proposals::list_entry(&p, &items, &[], &[]);
+
+    assert_eq!(entry.risk_flag_count, 0, "well-documented closure should not be flagged");
+    assert!(entry.risk_summary.is_none());
+    assert_eq!(entry.context_transfer_count, 1);
+    assert!(entry.context_preserved_count >= 1, "shipped_scope should count as preserved context");
+}
+
+// ===== v0.10.1: summary separates preserved-in-place from migrated =====
+
+#[test]
+fn proposal_summary_separates_preserved_from_transferred() {
+    let p = Proposal {
+        id: "prop-sep".into(), project: "proj".into(),
+        title: "Close with note and transfer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: "T-1".into(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+            // A note on the SAME ticket — preserved in place, not migrated.
+            ChangeOperation::AppendNote {
+                ticket_id: "T-1".into(),
+                text: "Final state of the crisis producer".into(),
+            },
+            // A question created here — an open thread, not preserved context.
+            ChangeOperation::CreateQuestion {
+                question: "Does the consumer need the raw feed?".into(),
+                ticket_id: Some("T-2".into()),
+                current_assumption: None, evidence: None, needed_for: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![],
+        intent: Some(ProposalIntent::Closure),
+        rationale: None, risk_flags: vec![],
+        // The actual custody move to a successor ticket.
+        context_transfers: vec![ContextTransfer {
+            from_ticket_id: "T-1".into(), to_ticket_id: "T-2".into(),
+            description: Some("Crisis-consumer context".into()),
+        }],
+        closure_summary: None,
+        reviewer_questions: vec!["Confirm consumer ownership".into()],
+    };
+
+    let summary = proposals::summarize_proposal(&p);
+
+    // The note is preserved context, NOT a transfer.
+    assert!(summary.context_preserved.iter().any(|s| s.contains("Note on T-1")));
+    assert!(!summary.context_preserved.iter().any(|s| s.contains("T-2")),
+        "a note on the same ticket must not appear as a custody move");
+
+    // The transfer is its own bucket: exactly the one custody move.
+    assert_eq!(summary.context_transfers.len(), 1);
+    assert_eq!(summary.context_transfers[0].to_ticket_id, "T-2");
+
+    // The created question + reviewer question are unresolved, not preserved.
+    assert!(summary.unresolved_questions.iter().any(|s| s.contains("Confirm consumer ownership")));
+    assert!(summary.unresolved_questions.iter().any(|s| s.contains("New question on T-2")));
+    assert!(!summary.context_preserved.iter().any(|s| s.contains("raw feed")),
+        "a newly created question is not preserved context");
+}
+
+// ===== v0.10.1: mixed-intent proposal warns about splitting =====
+
+#[test]
+fn proposal_mixed_intent_across_unrelated_tickets_flagged() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let a = store.create_item("Ship feature", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+    let b = store.create_item("Unrelated chore", "proj", "dom", Some("low"), Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // Closure on A + priority change on unrelated B, in one proposal.
+    let p = Proposal {
+        id: "prop-mixed".into(), project: "proj".into(),
+        title: "Close A and bump B".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: a.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+            ChangeOperation::UpdateTicket {
+                ticket_id: b.ticket_id.clone(), status: None, priority: Some("urgent".into()),
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![],
+        intent: None,
+        // Rationale present so the priority/closure-context flags don't fire —
+        // isolating the mixed-intent signal.
+        rationale: Some("Wrapping up A; B is now urgent for the next sprint".into()),
+        risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+    let codes: Vec<&str> = review.risk_flags.iter().map(|f| f.code.as_str()).collect();
+    assert!(codes.contains(&"mixed_intent_batch"),
+        "closure + priority across unrelated tickets should warn about splitting, got: {codes:?}");
+    let msg = review.risk_flags.iter().find(|f| f.code == "mixed_intent_batch").unwrap();
+    assert!(msg.message.to_lowercase().contains("split"), "message should suggest splitting: {}", msg.message);
+}
+
+// ===== v0.10.1: review recomputes against current board state =====
+
+#[test]
+fn review_recomputes_risk_against_current_board() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let parent = store.create_item("Wrapper", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // Proposal stored with NO risk flags (e.g. created before the child existed).
+    let p = Proposal {
+        id: "prop-stale".into(), project: "proj".into(),
+        title: "Close wrapper".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![ChangeOperation::UpdateTicket {
+            ticket_id: parent.ticket_id.clone(), status: Some("done".into()), priority: None,
+            epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+        }],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![],
+        intent: None, rationale: Some("done".into()), risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    // A child is added to the board AFTER the proposal was filed.
+    store.create_item("Late child", "proj", "dom", None, Some("todo"), None, None, None, None, None, Some(&parent.ticket_id), None, &pf).unwrap();
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+    let codes: Vec<&str> = review.risk_flags.iter().map(|f| f.code.as_str()).collect();
+    assert!(codes.contains(&"parent_closure_open_children"),
+        "fresh review should catch the late-added open child, got: {codes:?}");
+}
+
+// ===== v0.10.1: affected_ticket_ids is unique and sorted =====
+
+#[test]
+fn affected_ticket_ids_unique_sorted() {
+    let p = Proposal {
+        id: "prop-aff".into(), project: "proj".into(),
+        title: "Multi-touch".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: "T-3".into(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+            ChangeOperation::AppendNote { ticket_id: "T-3".into(), text: "note".into() },
+            ChangeOperation::CreateRelationship {
+                from_ticket_id: "T-1".into(), to_ticket_id: "T-3".into(),
+                relationship_type: "supersedes".into(), description: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        ticket_snapshots: vec![],
+        intent: None, rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+    assert_eq!(proposals::affected_ticket_ids(&p), vec!["T-1".to_string(), "T-3".to_string()]);
 }
