@@ -176,6 +176,50 @@ pub struct KanbanParams {
     pub position: Option<i64>,
     #[schemars(description = "For sequence bulk: ordered array of ticket IDs. Position assigned 1, 2, 3... in array order. Requires project.")]
     pub order: Option<Vec<String>>,
+
+    // -- relationship fields --
+    #[schemars(description = "For relationship_create: source ticket ID (the 'from' side of the relationship).")]
+    pub from_ticket_id: Option<String>,
+    #[schemars(description = "For relationship_create: target ticket ID (the 'to' side of the relationship).")]
+    pub to_ticket_id: Option<String>,
+    #[schemars(description = "For relationship_create: type of relationship. One of: blocks, depends_on, feeds, consumes_output_from, duplicates, supersedes, related.")]
+    pub relationship_type: Option<String>,
+    #[schemars(description = "For relationship_delete: relationship ID to remove.")]
+    pub relationship_id: Option<String>,
+
+    // -- question fields --
+    #[schemars(description = "For question_create: the question text. For question_update: updated question text.")]
+    pub question_text: Option<String>,
+    #[schemars(description = "For question_create/update: current assumption about the answer.")]
+    pub current_assumption: Option<String>,
+    #[schemars(description = "For question_create/update: evidence supporting the assumption.")]
+    pub evidence: Option<String>,
+    #[schemars(description = "For question_create/update: what decision/work this question blocks.")]
+    pub needed_for: Option<String>,
+    #[schemars(description = "For question_answer: the resolved answer. For question_invalidate: optional reason.")]
+    pub answer: Option<String>,
+    #[schemars(description = "For question_answer/invalidate/update, proposal_approve/reject/apply/get: the question or proposal ID.")]
+    pub target_id: Option<String>,
+    #[schemars(description = "For question_invalidate: reason it was invalidated.")]
+    pub reason: Option<String>,
+
+    // -- proposal fields --
+    #[schemars(description = "For proposal_create: array of change operations. Each is a JSON object with 'op' field (update_ticket, append_note, create_relationship, create_question, answer_question, invalidate_question) and relevant sub-fields.")]
+    pub changes: Option<Vec<serde_json::Value>>,
+
+    // -- verification fields --
+    #[schemars(description = "For verify: source of verification. One of: user, code, git, meeting, board, agent.")]
+    pub verification_source: Option<String>,
+    #[schemars(description = "For verify: confidence level. One of: verified, likely, stale, contradicted.")]
+    pub confidence: Option<String>,
+    #[schemars(description = "For verify: brief summary of what was verified.")]
+    pub summary: Option<String>,
+
+    // -- reality_check fields --
+    #[schemars(description = "For reality_check: number of days after which a ticket is considered stale. Default 14.")]
+    pub stale_after_days: Option<u64>,
+    #[schemars(description = "For question_list/reality_check: filter to show only open questions. Default true for question_list.")]
+    pub open_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -338,7 +382,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board. Create, update, move, and query work items across projects. Items have ticket IDs (e.g., SH-3), status (backlog->todo->in_progress->review->done), priority, assignee, deadline, notes, and file attachments.")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check.")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -357,7 +401,23 @@ impl WardwellServer {
             "search" => self.kanban_search(kanban, &p),
             "sequence" => self.kanban_sequence(kanban, &p),
             "export_roadmap" => self.kanban_export_roadmap(&p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap")),
+            "relationship_create" => self.kanban_relationship_create(kanban, &p),
+            "relationship_list" => self.kanban_relationship_list(kanban, &p),
+            "relationship_delete" => self.kanban_relationship_delete(kanban, &p),
+            "question_create" => self.kanban_question_create(kanban, &p),
+            "question_list" => self.kanban_question_list(&p),
+            "question_update" => self.kanban_question_update(&p),
+            "question_answer" => self.kanban_question_answer(&p),
+            "question_invalidate" => self.kanban_question_invalidate(&p),
+            "proposal_create" => self.kanban_proposal_create(kanban, &p),
+            "proposal_get" => self.kanban_proposal_get(&p),
+            "proposal_list" => self.kanban_proposal_list(&p),
+            "proposal_approve" => self.kanban_proposal_approve(&p),
+            "proposal_reject" => self.kanban_proposal_reject(&p),
+            "proposal_apply" => self.kanban_proposal_apply(kanban, &p),
+            "verify" => self.kanban_verify(kanban, &p),
+            "reality_check" => self.kanban_reality_check(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check")),
         }
     }
 
@@ -2308,6 +2368,738 @@ impl WardwellServer {
         }
     }
 
+    // ---- Relationship handlers ----
+
+    fn kanban_relationship_create(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref from_id) = p.from_ticket_id else {
+            return json_error("'from_ticket_id' is required for relationship_create");
+        };
+        let Some(ref to_id) = p.to_ticket_id else {
+            return json_error("'to_ticket_id' is required for relationship_create");
+        };
+        let Some(ref rel_type_str) = p.relationship_type else {
+            return json_error(&format!("'relationship_type' is required. One of: {}", crate::kanban::relationships::RelationshipType::all_names().join(", ")));
+        };
+        let Some(rel_type) = crate::kanban::relationships::RelationshipType::parse(rel_type_str) else {
+            return json_error(&format!("invalid relationship_type '{}'. Must be one of: {}", rel_type_str, crate::kanban::relationships::RelationshipType::all_names().join(", ")));
+        };
+
+        let Some((from_domain, from_project)) = self.lookup_item_domain(kanban, from_id) else {
+            return json_error(&format!("ticket '{}' not found", from_id));
+        };
+        let Some((to_domain, to_project)) = self.lookup_item_domain(kanban, to_id) else {
+            return json_error(&format!("ticket '{}' not found", to_id));
+        };
+        if from_project != to_project || from_domain != to_domain {
+            return json_error(&format!("tickets must be in the same project. '{}' is in {}/{}, '{}' is in {}/{}", from_id, from_domain, from_project, to_id, to_domain, to_project));
+        }
+        if let Err(e) = self.check_kanban_domain_access(&from_domain) {
+            return json_error(&e);
+        }
+
+        let existing = crate::kanban::relationships::read_all(&self.vault_root, &from_domain, &from_project);
+        if existing.iter().any(|r| r.from_ticket_id == *from_id && r.to_ticket_id == *to_id && r.relationship_type == rel_type) {
+            return json_error(&format!("duplicate relationship: {} {} {} already exists", from_id, rel_type_str, to_id));
+        }
+
+        let rel = crate::kanban::relationships::Relationship {
+            id: uuid::Uuid::new_v4().to_string(),
+            project: from_project.clone(),
+            from_ticket_id: from_id.clone(),
+            to_ticket_id: to_id.clone(),
+            relationship_type: rel_type,
+            description: p.description.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            source: p.source.clone(),
+        };
+
+        if let Err(e) = crate::kanban::relationships::append_event(&self.vault_root, &from_domain, &from_project, &crate::kanban::relationships::RelationshipEvent::Create(rel.clone())) {
+            return json_error(&format!("failed to write relationship: {e}"));
+        }
+        let audit_line = format!("{} → {} [{}]", from_id, to_id, rel_type_str);
+        let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &from_domain, &from_project, &audit_line);
+        serde_json::to_string(&serde_json::json!({"created": true, "relationship": rel})).unwrap_or_default()
+    }
+
+    fn kanban_relationship_list(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let (domain, project) = if let Some(ref tid) = p.ticket_id {
+            match self.lookup_item_domain(kanban, tid) {
+                Some(dp) => dp,
+                None => return json_error(&format!("ticket '{}' not found", tid)),
+            }
+        } else if let Some(ref proj) = p.project {
+            let domain = match &p.domain {
+                Some(d) => d.clone(),
+                None => match self.infer_domain_for_project(proj) {
+                    Some(d) => d,
+                    None => return json_error(&format!("cannot infer domain for project '{}'", proj)),
+                },
+            };
+            (domain, proj.clone())
+        } else {
+            return json_error("'ticket_id' or 'project' is required for relationship_list");
+        };
+
+        let rels = crate::kanban::relationships::read_all(&self.vault_root, &domain, &project);
+        let filtered: Vec<_> = if let Some(ref tid) = p.ticket_id {
+            rels.into_iter().filter(|r| r.from_ticket_id == *tid || r.to_ticket_id == *tid).collect()
+        } else {
+            rels
+        };
+
+        // Filter by epic if requested
+        let filtered: Vec<_> = if let Some(ref epic) = p.epic {
+            let items = match kanban.list(Some(&project), None, None, None, Some(epic), None, true, None) {
+                Ok(items) => items,
+                Err(_) => return serde_json::to_string(&serde_json::json!({"relationships": filtered, "total": filtered.len()})).unwrap_or_default(),
+            };
+            let epic_ids: std::collections::HashSet<String> = items.iter().map(|i| i.ticket_id.clone()).collect();
+            filtered.into_iter().filter(|r| epic_ids.contains(&r.from_ticket_id) || epic_ids.contains(&r.to_ticket_id)).collect()
+        } else {
+            filtered
+        };
+
+        let total = filtered.len();
+        serde_json::to_string(&serde_json::json!({"relationships": filtered, "total": total})).unwrap_or_default()
+    }
+
+    fn kanban_relationship_delete(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref rel_id) = p.relationship_id else {
+            return json_error("'relationship_id' is required for relationship_delete");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for relationship_delete");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        let existing = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
+        if !existing.iter().any(|r| r.id == *rel_id) {
+            return json_error(&format!("relationship '{}' not found in project '{}'", rel_id, project));
+        }
+        let _ = kanban; // already validated domain access
+        if let Err(e) = crate::kanban::relationships::append_event(&self.vault_root, &domain, project, &crate::kanban::relationships::RelationshipEvent::Delete {
+            id: rel_id.clone(), project: project.clone(), timestamp: chrono::Utc::now().to_rfc3339(),
+        }) {
+            return json_error(&format!("failed to delete relationship: {e}"));
+        }
+        serde_json::to_string(&serde_json::json!({"deleted": true, "relationship_id": rel_id})).unwrap_or_default()
+    }
+
+    // ---- Question handlers ----
+
+    fn kanban_question_create(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref question_text) = p.question_text else {
+            return json_error("'question_text' is required for question_create");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for question_create");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        if let Some(ref tid) = p.ticket_id {
+            if self.lookup_item_domain(kanban, tid).is_none() {
+                return json_error(&format!("ticket '{}' not found", tid));
+            }
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let q = crate::kanban::questions::Question {
+            id: uuid::Uuid::new_v4().to_string(),
+            project: project.clone(),
+            ticket_id: p.ticket_id.clone(),
+            question: question_text.clone(),
+            current_assumption: p.current_assumption.clone(),
+            evidence: p.evidence.clone(),
+            needed_for: p.needed_for.clone(),
+            status: crate::kanban::questions::QuestionStatus::Open,
+            answer: None,
+            created_at: now.clone(),
+            updated_at: now,
+            resolved_at: None,
+            source: p.source.clone(),
+        };
+        if let Err(e) = crate::kanban::questions::append_event(&self.vault_root, &domain, project, &crate::kanban::questions::QuestionEvent::Create(q.clone())) {
+            return json_error(&format!("failed to write question: {e}"));
+        }
+        let audit_line = format!("question created: {}", question_text);
+        let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
+        serde_json::to_string(&serde_json::json!({"created": true, "question": q})).unwrap_or_default()
+    }
+
+    fn kanban_question_list(&self, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for question_list");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        let questions = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+        let open_only = p.open_only.unwrap_or(true);
+        let filtered: Vec<_> = questions.into_iter()
+            .filter(|q| {
+                if open_only { q.status == crate::kanban::questions::QuestionStatus::Open } else { true }
+            })
+            .filter(|q| {
+                if let Some(ref tid) = p.ticket_id { q.ticket_id.as_deref() == Some(tid.as_str()) } else { true }
+            })
+            .filter(|q| {
+                if let Some(ref epic) = p.epic {
+                    // Project-level questions (no ticket_id) show for any epic
+                    q.ticket_id.is_none() || q.needed_for.as_deref() == Some(epic.as_str())
+                } else { true }
+            })
+            .collect();
+        let total = filtered.len();
+        serde_json::to_string(&serde_json::json!({"questions": filtered, "total": total})).unwrap_or_default()
+    }
+
+    fn kanban_question_update(&self, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (question ID) is required for question_update");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for question_update");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        let existing = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+        if !existing.iter().any(|q| q.id == *target_id) {
+            return json_error(&format!("question '{}' not found", target_id));
+        }
+        let event = crate::kanban::questions::QuestionEvent::Update {
+            id: target_id.clone(),
+            project: project.clone(),
+            question: p.question_text.clone(),
+            current_assumption: p.current_assumption.clone(),
+            evidence: p.evidence.clone(),
+            needed_for: p.needed_for.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = crate::kanban::questions::append_event(&self.vault_root, &domain, project, &event) {
+            return json_error(&format!("failed to update question: {e}"));
+        }
+        serde_json::to_string(&serde_json::json!({"updated": true, "question_id": target_id})).unwrap_or_default()
+    }
+
+    fn kanban_question_answer(&self, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (question ID) is required for question_answer");
+        };
+        let Some(ref answer) = p.answer else {
+            return json_error("'answer' is required for question_answer");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for question_answer");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        let existing = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+        let q = existing.iter().find(|q| q.id == *target_id);
+        match q {
+            None => return json_error(&format!("question '{}' not found", target_id)),
+            Some(q) if q.status != crate::kanban::questions::QuestionStatus::Open => {
+                return json_error(&format!("question '{}' is already {:?}", target_id, q.status));
+            }
+            _ => {}
+        }
+        let event = crate::kanban::questions::QuestionEvent::Answer {
+            id: target_id.clone(),
+            project: project.clone(),
+            answer: answer.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = crate::kanban::questions::append_event(&self.vault_root, &domain, project, &event) {
+            return json_error(&format!("failed to answer question: {e}"));
+        }
+        let audit_line = format!("question answered: {}", target_id);
+        let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
+        serde_json::to_string(&serde_json::json!({"answered": true, "question_id": target_id})).unwrap_or_default()
+    }
+
+    fn kanban_question_invalidate(&self, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (question ID) is required for question_invalidate");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for question_invalidate");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        let existing = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+        if !existing.iter().any(|q| q.id == *target_id && q.status == crate::kanban::questions::QuestionStatus::Open) {
+            return json_error(&format!("open question '{}' not found", target_id));
+        }
+        let event = crate::kanban::questions::QuestionEvent::Invalidate {
+            id: target_id.clone(),
+            project: project.clone(),
+            reason: p.reason.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = crate::kanban::questions::append_event(&self.vault_root, &domain, project, &event) {
+            return json_error(&format!("failed to invalidate question: {e}"));
+        }
+        serde_json::to_string(&serde_json::json!({"invalidated": true, "question_id": target_id})).unwrap_or_default()
+    }
+
+    // ---- Proposal handlers ----
+
+    fn kanban_proposal_create(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref title) = p.title else {
+            return json_error("'title' is required for proposal_create");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for proposal_create");
+        };
+        let Some(ref changes_json) = p.changes else {
+            return json_error("'changes' is required for proposal_create — array of change operations");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
+        let mut changes: Vec<crate::kanban::proposals::ChangeOperation> = vec![];
+        let mut ticket_snapshots: Vec<crate::kanban::proposals::TicketSnapshot> = vec![];
+        let mut snapshot_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (i, val) in changes_json.iter().enumerate() {
+            match serde_json::from_value::<crate::kanban::proposals::ChangeOperation>(val.clone()) {
+                Ok(op) => {
+                    // Validate ticket references and collect snapshots
+                    let referenced_tickets = extract_ticket_ids_from_op(&op);
+                    for tid in &referenced_tickets {
+                        if self.lookup_item_domain(kanban, tid).is_none() {
+                            return json_error(&format!("change[{}]: ticket '{}' not found", i, tid));
+                        }
+                        if !snapshot_ids.contains(tid) {
+                            if let Ok(item) = kanban.get_item(tid) {
+                                ticket_snapshots.push(crate::kanban::proposals::TicketSnapshot {
+                                    ticket_id: tid.clone(),
+                                    updated_at: item.updated_at.clone(),
+                                });
+                                snapshot_ids.insert(tid.clone());
+                            }
+                        }
+                    }
+                    changes.push(op);
+                }
+                Err(e) => return json_error(&format!("change[{}]: invalid operation: {}", i, e)),
+            }
+        }
+
+        if changes.is_empty() {
+            return json_error("'changes' must not be empty");
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let proposal = crate::kanban::proposals::Proposal {
+            id: uuid::Uuid::new_v4().to_string(),
+            project: project.clone(),
+            title: title.clone(),
+            description: p.description.clone(),
+            status: crate::kanban::proposals::ProposalStatus::Pending,
+            changes,
+            created_at: now,
+            decided_at: None,
+            applied_at: None,
+            source: p.source.clone(),
+            ticket_snapshots,
+        };
+
+        if let Err(e) = crate::kanban::proposals::append_event(&self.vault_root, &domain, project, &crate::kanban::proposals::ProposalEvent::Create(proposal.clone())) {
+            return json_error(&format!("failed to write proposal: {e}"));
+        }
+        let audit_line = format!("proposal created: {} ({} changes)", title, proposal.changes.len());
+        let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
+        serde_json::to_string(&serde_json::json!({"created": true, "proposal": proposal})).unwrap_or_default()
+    }
+
+    fn kanban_proposal_get(&self, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (proposal ID) is required for proposal_get");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for proposal_get");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
+        match proposals.into_iter().find(|prop| prop.id == *target_id) {
+            Some(prop) => serde_json::to_string(&serde_json::json!({"proposal": prop})).unwrap_or_default(),
+            None => json_error(&format!("proposal '{}' not found", target_id)),
+        }
+    }
+
+    fn kanban_proposal_list(&self, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for proposal_list");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
+        let filtered: Vec<_> = if let Some(ref status_str) = p.status {
+            proposals.into_iter().filter(|prop| {
+                prop.status.as_str() == status_str
+            }).collect()
+        } else {
+            proposals
+        };
+        let total = filtered.len();
+        serde_json::to_string(&serde_json::json!({"proposals": filtered, "total": total})).unwrap_or_default()
+    }
+
+    fn kanban_proposal_approve(&self, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (proposal ID) is required for proposal_approve");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for proposal_approve");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
+        match proposals.iter().find(|prop| prop.id == *target_id) {
+            None => return json_error(&format!("proposal '{}' not found", target_id)),
+            Some(prop) if prop.status != crate::kanban::proposals::ProposalStatus::Pending => {
+                return json_error(&format!("proposal '{}' is {:?}, cannot approve", target_id, prop.status));
+            }
+            _ => {}
+        }
+        if let Err(e) = crate::kanban::proposals::append_event(&self.vault_root, &domain, project, &crate::kanban::proposals::ProposalEvent::Approve {
+            id: target_id.clone(), project: project.clone(), timestamp: chrono::Utc::now().to_rfc3339(),
+        }) {
+            return json_error(&format!("failed to approve proposal: {e}"));
+        }
+        serde_json::to_string(&serde_json::json!({"approved": true, "proposal_id": target_id})).unwrap_or_default()
+    }
+
+    fn kanban_proposal_reject(&self, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (proposal ID) is required for proposal_reject");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for proposal_reject");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+        let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
+        match proposals.iter().find(|prop| prop.id == *target_id) {
+            None => return json_error(&format!("proposal '{}' not found", target_id)),
+            Some(prop) if prop.status != crate::kanban::proposals::ProposalStatus::Pending => {
+                return json_error(&format!("proposal '{}' is {:?}, cannot reject", target_id, prop.status));
+            }
+            _ => {}
+        }
+        if let Err(e) = crate::kanban::proposals::append_event(&self.vault_root, &domain, project, &crate::kanban::proposals::ProposalEvent::Reject {
+            id: target_id.clone(), project: project.clone(), reason: p.reason.clone(), timestamp: chrono::Utc::now().to_rfc3339(),
+        }) {
+            return json_error(&format!("failed to reject proposal: {e}"));
+        }
+        serde_json::to_string(&serde_json::json!({"rejected": true, "proposal_id": target_id})).unwrap_or_default()
+    }
+
+    fn kanban_proposal_apply(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref target_id) = p.target_id else {
+            return json_error("'target_id' (proposal ID) is required for proposal_apply");
+        };
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for proposal_apply");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
+        let proposals = crate::kanban::proposals::read_all(&self.vault_root, &domain, project);
+        let proposal = match proposals.into_iter().find(|prop| prop.id == *target_id) {
+            Some(prop) => prop,
+            None => return json_error(&format!("proposal '{}' not found", target_id)),
+        };
+
+        if proposal.status != crate::kanban::proposals::ProposalStatus::Approved {
+            return json_error(&format!("proposal '{}' is {:?}, must be approved before applying", target_id, proposal.status));
+        }
+
+        // Conflict detection: check if referenced tickets changed since proposal creation
+        for snap in &proposal.ticket_snapshots {
+            match kanban.get_item(&snap.ticket_id) {
+                Ok(current) => {
+                    if current.updated_at != snap.updated_at {
+                        return json_error(&format!(
+                            "conflict: ticket '{}' was updated since proposal creation (was {}, now {}). Re-create the proposal with current state.",
+                            snap.ticket_id, snap.updated_at, current.updated_at
+                        ));
+                    }
+                }
+                Err(_) => return json_error(&format!("ticket '{}' no longer exists", snap.ticket_id)),
+            }
+        }
+
+        // Apply each change operation
+        let mut results: Vec<serde_json::Value> = vec![];
+        for (i, change) in proposal.changes.iter().enumerate() {
+            match self.apply_change_operation(kanban, &domain, project, change) {
+                Ok(result) => results.push(result),
+                Err(e) => return json_error(&format!("change[{}] failed: {}. Partial apply — {} of {} operations succeeded.", i, e, i, proposal.changes.len())),
+            }
+        }
+
+        // Record the apply event
+        if let Err(e) = crate::kanban::proposals::append_event(&self.vault_root, &domain, project, &crate::kanban::proposals::ProposalEvent::Apply {
+            id: target_id.clone(), project: project.clone(), timestamp: chrono::Utc::now().to_rfc3339(),
+        }) {
+            return json_error(&format!("changes applied but failed to record apply event: {e}"));
+        }
+
+        let audit_line = format!("proposal applied: {} ({} changes)", proposal.title, results.len());
+        let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, project, &audit_line);
+        serde_json::to_string(&serde_json::json!({"applied": true, "proposal_id": target_id, "results": results})).unwrap_or_default()
+    }
+
+    fn apply_change_operation(
+        &self,
+        kanban: &crate::kanban::store::KanbanStore,
+        domain: &str,
+        project: &str,
+        op: &crate::kanban::proposals::ChangeOperation,
+    ) -> Result<serde_json::Value, String> {
+        use crate::kanban::proposals::ChangeOperation;
+        match op {
+            ChangeOperation::UpdateTicket { ticket_id, status, priority, epic, tags, parent, deadline, title, description } => {
+                kanban.update_item(
+                    ticket_id,
+                    title.as_deref(),
+                    description.as_deref(),
+                    status.as_deref(),
+                    priority.as_deref(),
+                    None, // assignee
+                    deadline.as_deref(),
+                    epic.as_deref(),
+                    parent.as_deref(),
+                    tags.as_deref(),
+                ).map_err(|e| e.to_string())?;
+                let audit_line = format!("{} updated via proposal", ticket_id);
+                let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, domain, project, &audit_line);
+                Ok(serde_json::json!({"op": "update_ticket", "ticket_id": ticket_id, "applied": true}))
+            }
+            ChangeOperation::AppendNote { ticket_id, text } => {
+                kanban.add_note(ticket_id, text, Some("proposal")).map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"op": "append_note", "ticket_id": ticket_id, "applied": true}))
+            }
+            ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, relationship_type, description } => {
+                let rel_type = crate::kanban::relationships::RelationshipType::parse(relationship_type)
+                    .ok_or_else(|| format!("invalid relationship_type '{}'", relationship_type))?;
+                let rel = crate::kanban::relationships::Relationship {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    project: project.to_string(),
+                    from_ticket_id: from_ticket_id.clone(),
+                    to_ticket_id: to_ticket_id.clone(),
+                    relationship_type: rel_type,
+                    description: description.clone(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    source: Some("proposal".into()),
+                };
+                crate::kanban::relationships::append_event(&self.vault_root, domain, project, &crate::kanban::relationships::RelationshipEvent::Create(rel))
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"op": "create_relationship", "from": from_ticket_id, "to": to_ticket_id, "applied": true}))
+            }
+            ChangeOperation::CreateQuestion { question, ticket_id, current_assumption, evidence, needed_for } => {
+                let now = chrono::Utc::now().to_rfc3339();
+                let q = crate::kanban::questions::Question {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    project: project.to_string(),
+                    ticket_id: ticket_id.clone(),
+                    question: question.clone(),
+                    current_assumption: current_assumption.clone(),
+                    evidence: evidence.clone(),
+                    needed_for: needed_for.clone(),
+                    status: crate::kanban::questions::QuestionStatus::Open,
+                    answer: None,
+                    created_at: now.clone(),
+                    updated_at: now,
+                    resolved_at: None,
+                    source: Some("proposal".into()),
+                };
+                crate::kanban::questions::append_event(&self.vault_root, domain, project, &crate::kanban::questions::QuestionEvent::Create(q))
+                    .map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"op": "create_question", "question": question, "applied": true}))
+            }
+            ChangeOperation::AnswerQuestion { question_id, answer } => {
+                crate::kanban::questions::append_event(&self.vault_root, domain, project, &crate::kanban::questions::QuestionEvent::Answer {
+                    id: question_id.clone(), project: project.to_string(), answer: answer.clone(), timestamp: chrono::Utc::now().to_rfc3339(),
+                }).map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"op": "answer_question", "question_id": question_id, "applied": true}))
+            }
+            ChangeOperation::InvalidateQuestion { question_id, reason } => {
+                crate::kanban::questions::append_event(&self.vault_root, domain, project, &crate::kanban::questions::QuestionEvent::Invalidate {
+                    id: question_id.clone(), project: project.to_string(), reason: reason.clone(), timestamp: chrono::Utc::now().to_rfc3339(),
+                }).map_err(|e| e.to_string())?;
+                Ok(serde_json::json!({"op": "invalidate_question", "question_id": question_id, "applied": true}))
+            }
+        }
+    }
+
+    // ---- Verification handler ----
+
+    fn kanban_verify(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref ticket_id) = p.ticket_id else {
+            return json_error("'ticket_id' is required for verify");
+        };
+        let Some(ref vs_str) = p.verification_source else {
+            return json_error(&format!("'verification_source' is required. One of: {}", crate::kanban::verification::VerificationSource::all_names().join(", ")));
+        };
+        let Some(vs) = crate::kanban::verification::VerificationSource::parse(vs_str) else {
+            return json_error(&format!("invalid verification_source '{}'. Must be one of: {}", vs_str, crate::kanban::verification::VerificationSource::all_names().join(", ")));
+        };
+        let Some(ref conf_str) = p.confidence else {
+            return json_error(&format!("'confidence' is required. One of: {}", crate::kanban::verification::Confidence::all_names().join(", ")));
+        };
+        let Some(confidence) = crate::kanban::verification::Confidence::parse(conf_str) else {
+            return json_error(&format!("invalid confidence '{}'. Must be one of: {}", conf_str, crate::kanban::verification::Confidence::all_names().join(", ")));
+        };
+
+        let Some((domain, project)) = self.lookup_item_domain(kanban, ticket_id) else {
+            return json_error(&format!("ticket '{}' not found", ticket_id));
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
+        let v = crate::kanban::verification::Verification {
+            id: uuid::Uuid::new_v4().to_string(),
+            ticket_id: ticket_id.clone(),
+            project: project.clone(),
+            verified_at: chrono::Utc::now().to_rfc3339(),
+            verification_source: vs,
+            confidence,
+            summary: p.summary.clone(),
+            source: p.source.clone(),
+        };
+        if let Err(e) = crate::kanban::verification::append_event(&self.vault_root, &domain, &project, &crate::kanban::verification::VerificationEvent::Verify(v.clone())) {
+            return json_error(&format!("failed to write verification: {e}"));
+        }
+        let audit_line = format!("{} verified: {} ({})", ticket_id, conf_str, vs_str);
+        let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, &domain, &project, &audit_line);
+        serde_json::to_string(&serde_json::json!({"verified": true, "verification": v})).unwrap_or_default()
+    }
+
+    // ---- Reality check handler ----
+
+    fn kanban_reality_check(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for reality_check");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+
+        let items = match kanban.list(Some(project), None, None, None, None, None, true, None) {
+            Ok(items) => items,
+            Err(e) => return json_error(&format!("failed to list tickets: {e}")),
+        };
+        let relationships = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
+        let questions = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+        let verifications = crate::kanban::verification::read_all(&self.vault_root, &domain, project);
+
+        let result = crate::kanban::reality_check::build_reality_check(
+            project,
+            p.epic.as_deref(),
+            &items,
+            &relationships,
+            &questions,
+            &verifications,
+            p.include_done.unwrap_or(false),
+            p.stale_after_days.unwrap_or(14),
+        );
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    }
+
     fn infer_domain_for_project(&self, project: &str) -> Option<String> {
         let registry = self.registry.try_read().ok()?;
         for domain in registry.all() {
@@ -2339,7 +3131,7 @@ impl ServerHandler for WardwellServer {
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
              wardwell_clipboard (copy to clipboard, ask first), \
-             wardwell_kanban (action: list|create|update|move|note|query — project kanban board with tickets, statuses, priorities, deadlines)."
+             wardwell_kanban (action: list|create|update|move|note|query|relationship_create|relationship_list|relationship_delete|question_create|question_list|question_update|question_answer|question_invalidate|proposal_create|proposal_get|proposal_list|proposal_approve|proposal_reject|proposal_apply|verify|reality_check — project kanban board with tickets, statuses, priorities, deadlines)."
                 .to_string()
         } else {
             "Wardwell: Personal AI knowledge vault. Three tools: \
@@ -2538,6 +3330,18 @@ impl WardwellServer {
 
 fn json_error(msg: &str) -> String {
     serde_json::to_string(&serde_json::json!({"error": msg})).unwrap_or_default()
+}
+
+fn extract_ticket_ids_from_op(op: &crate::kanban::proposals::ChangeOperation) -> Vec<String> {
+    use crate::kanban::proposals::ChangeOperation;
+    match op {
+        ChangeOperation::UpdateTicket { ticket_id, .. } => vec![ticket_id.clone()],
+        ChangeOperation::AppendNote { ticket_id, .. } => vec![ticket_id.clone()],
+        ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, .. } => vec![from_ticket_id.clone(), to_ticket_id.clone()],
+        ChangeOperation::CreateQuestion { ticket_id, .. } => ticket_id.iter().cloned().collect(),
+        ChangeOperation::AnswerQuestion { .. } => vec![],
+        ChangeOperation::InvalidateQuestion { .. } => vec![],
+    }
 }
 
 /// Resolve a vault path: only allow vault-relative paths.

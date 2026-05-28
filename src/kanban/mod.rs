@@ -1,4 +1,9 @@
 pub mod audit;
 pub mod events;
 pub mod prefix;
+pub mod proposals;
+pub mod questions;
+pub mod reality_check;
+pub mod relationships;
 pub mod store;
+pub mod verification;
