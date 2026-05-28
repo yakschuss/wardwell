@@ -627,6 +627,89 @@ impl KanbanStore {
         Ok(items)
     }
 
+    pub fn list_metadata(
+        &self, project: Option<&str>, include_done: bool,
+    ) -> Result<Vec<KanbanItem>, KanbanError> {
+        let conn = self.conn()?;
+        let mut conditions: Vec<String> = vec![];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
+        let mut idx = 1usize;
+
+        if !include_done { conditions.push(format!("status != ?{idx}")); params.push(Box::new("done".to_string())); idx += 1; }
+        if let Some(v) = project {
+            let group_members = self.resolve_group_members(v);
+            if group_members.is_empty() {
+                conditions.push(format!("project=?{idx}"));
+                params.push(Box::new(v.to_string()));
+                idx += 1;
+            } else {
+                let ph: Vec<String> = group_members.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
+                conditions.push(format!("project IN ({})", ph.join(",")));
+                for m in &group_members { params.push(Box::new(m.clone())); }
+            }
+        }
+        let _ = idx;
+
+        let wh = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
+        let sql = format!(
+            "SELECT ticket_id, project, epic, parent, position, tags, title, NULL, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items {wh} ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, updated_at DESC"
+        );
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let items: Vec<KanbanItem> = stmt.query_map(refs.as_slice(), |row| {
+            Ok(KanbanItem {
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
+                parent: row.get(3)?, position: row.get(4)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
+                assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
+                created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+            })
+        })?.collect::<Result<_, _>>()?;
+
+        let mut items: Vec<KanbanItem> = items.into_iter().map(|mut item| {
+            item.group = self.project_to_group.get(&item.project).cloned();
+            Ok(item)
+        }).collect::<Result<_, KanbanError>>()?;
+        self.populate_children(&conn, &mut items)?;
+        Ok(items)
+    }
+
+    pub fn list_with_notes(
+        &self, project: &str, ticket_ids: &[String],
+    ) -> Result<Vec<KanbanItem>, KanbanError> {
+        if ticket_ids.is_empty() { return Ok(vec![]); }
+        let conn = self.conn()?;
+        let ph: Vec<String> = (1..=ticket_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT ticket_id, project, epic, parent, position, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id IN ({}) ORDER BY updated_at DESC",
+            ph.join(",")
+        );
+        let params: Vec<&dyn rusqlite::types::ToSql> = ticket_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let items: Vec<KanbanItem> = stmt.query_map(params.as_slice(), |row| {
+            Ok(KanbanItem {
+                ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
+                parent: row.get(3)?, position: row.get(4)?, children: vec![],
+                tags: { let t: String = row.get::<_, String>(5).unwrap_or_else(|_| "[]".into()); serde_json::from_str(&t).unwrap_or_default() },
+                title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
+                assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
+                created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+            })
+        })?.collect::<Result<_, _>>()?;
+
+        let items: Vec<KanbanItem> = items.into_iter().map(|mut item| {
+            item.group = self.project_to_group.get(&item.project).cloned();
+            item.notes = self.load_notes(&conn, &item.ticket_id)?;
+            Ok(item)
+        }).collect::<Result<_, KanbanError>>()?;
+        let _ = project;
+        Ok(items)
+    }
+
     pub fn query(
         &self, question: &str, queries: &HashMap<String, String>,
         project: Option<&str>, domains: Option<&[String]>,

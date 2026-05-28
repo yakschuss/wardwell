@@ -220,6 +220,10 @@ pub struct KanbanParams {
     pub stale_after_days: Option<u64>,
     #[schemars(description = "For question_list/reality_check: filter to show only open questions. Default true for question_list.")]
     pub open_only: Option<bool>,
+    #[schemars(description = "For reality_check: set true for full verbose output including tickets_by_status, no_deadline, relationship_graph. Default false (compact).")]
+    pub full: Option<bool>,
+    #[schemars(description = "For reality_check/hygiene_suggestions: max items per section. Default 10.")]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -382,7 +386,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check.")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions.")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -417,7 +421,8 @@ impl WardwellServer {
             "proposal_apply" => self.kanban_proposal_apply(kanban, &p),
             "verify" => self.kanban_verify(kanban, &p),
             "reality_check" => self.kanban_reality_check(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check")),
+            "hygiene_suggestions" => self.kanban_hygiene_suggestions(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions")),
         }
     }
 
@@ -3079,13 +3084,20 @@ impl WardwellServer {
             },
         };
 
-        let items = match kanban.list(Some(project), None, None, None, None, None, true, None) {
+        let items = match kanban.list_metadata(Some(project), true) {
             Ok(items) => items,
             Err(e) => return json_error(&format!("failed to list tickets: {e}")),
         };
         let relationships = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
         let questions = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
         let verifications = crate::kanban::verification::read_all(&self.vault_root, &domain, project);
+
+        let opts = crate::kanban::reality_check::RealityCheckOptions {
+            compact: !p.full.unwrap_or(false),
+            limit: p.limit.unwrap_or(10),
+            include_done: p.include_done.unwrap_or(false),
+            stale_after_days: p.stale_after_days.unwrap_or(14),
+        };
 
         let result = crate::kanban::reality_check::build_reality_check(
             project,
@@ -3094,10 +3106,45 @@ impl WardwellServer {
             &relationships,
             &questions,
             &verifications,
-            p.include_done.unwrap_or(false),
-            p.stale_after_days.unwrap_or(14),
+            &opts,
         );
         serde_json::to_string_pretty(&result).unwrap_or_default()
+    }
+
+    fn kanban_hygiene_suggestions(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for hygiene_suggestions");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+
+        let limit = p.limit.unwrap_or(10);
+        let ticket_ids: Vec<String> = match kanban.list_metadata(Some(project), false) {
+            Ok(items) => items.iter()
+                .filter(|i| {
+                    if let Some(ref epic) = p.epic { i.epic.as_deref() == Some(epic.as_str()) } else { true }
+                })
+                .map(|i| i.ticket_id.clone())
+                .collect(),
+            Err(e) => return json_error(&format!("failed to list tickets: {e}")),
+        };
+
+        let items = match kanban.list_with_notes(project, &ticket_ids) {
+            Ok(items) => items,
+            Err(e) => return json_error(&format!("failed to load ticket details: {e}")),
+        };
+        let relationships = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
+
+        let suggestions = crate::kanban::reality_check::build_hygiene_suggestions(
+            &items, &relationships, p.epic.as_deref(), limit,
+        );
+        let total = suggestions.len();
+        serde_json::to_string(&serde_json::json!({"suggestions": suggestions, "total": total})).unwrap_or_default()
     }
 
     fn infer_domain_for_project(&self, project: &str) -> Option<String> {

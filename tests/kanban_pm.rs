@@ -6,7 +6,7 @@ use wardwell::kanban::relationships::{self, RelationshipType, RelationshipEvent,
 use wardwell::kanban::questions::{self, QuestionEvent, Question, QuestionStatus};
 use wardwell::kanban::proposals::{self, ProposalEvent, Proposal, ProposalStatus, ChangeOperation, TicketSnapshot};
 use wardwell::kanban::verification::{self, VerificationEvent, Verification, VerificationSource, Confidence};
-use wardwell::kanban::reality_check;
+use wardwell::kanban::reality_check::{self, RealityCheckOptions};
 
 fn make_store() -> (tempfile::TempDir, KanbanStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -472,9 +472,9 @@ fn reality_check_urgent_backlog() {
     store.create_item("High task", "proj", "dom", None, Some("backlog"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
 
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], false, 14);
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions::default());
     assert_eq!(rc.urgent_backlog.len(), 2); // urgent + high
-    assert!(rc.signals.iter().any(|s| s.signal_type == "urgent_not_started"));
+    assert!(rc.top_signals.iter().any(|s| s.signal_type == "urgent_not_started"));
 }
 
 #[test]
@@ -486,10 +486,11 @@ fn reality_check_epic_tickets_by_status() {
     store.create_item("Done 1", "proj", "dom", None, Some("done"), None, None, None, None, Some("epic-a"), None, None, &pf).unwrap();
 
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", Some("epic-a"), &items, &[], &[], &[], true, 14);
-    assert!(rc.epic_tickets_by_status.contains_key("todo"));
-    assert!(rc.epic_tickets_by_status.contains_key("in_progress"));
-    assert!(rc.epic_tickets_by_status.contains_key("done"));
+    let rc = reality_check::build_reality_check("proj", Some("epic-a"), &items, &[], &[], &[], &RealityCheckOptions { compact: false, include_done: true, ..RealityCheckOptions::default() });
+    let tbs = rc.tickets_by_status.as_ref().unwrap();
+    assert!(tbs.contains_key("todo"));
+    assert!(tbs.contains_key("in_progress"));
+    assert!(tbs.contains_key("done"));
 }
 
 #[test]
@@ -517,7 +518,7 @@ fn reality_check_open_questions() {
             resolved_at: Some("2026-01-02T00:00:00Z".into()), source: None,
         },
     ];
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &qs, &[], false, 14);
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &qs, &[], &RealityCheckOptions::default());
     assert_eq!(rc.open_questions.len(), 1);
     assert_eq!(rc.open_questions[0].id, "q-1");
 }
@@ -531,11 +532,11 @@ fn reality_check_stale_tickets() {
     // The item just created will have updated_at = now, so it won't be stale at 14 days.
     // But it would be stale at 0 days.
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc_not_stale = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], false, 14);
+    let rc_not_stale = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions::default());
     assert_eq!(rc_not_stale.stale_tickets.len(), 0);
 
     // With stale_after_days=0, everything is stale
-    let rc_stale = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], false, 0);
+    let rc_stale = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions { stale_after_days: 0, ..RealityCheckOptions::default() });
     // Items created just now won't be before the threshold with days=0 since threshold is now - 0 days = now
     // The item's updated_at is essentially "now", so it may or may not be < threshold depending on timing.
     // Use a more reliable test: check with done excluded
@@ -556,8 +557,8 @@ fn reality_check_relationship_graph() {
         relationship_type: RelationshipType::Blocks,
         description: None, created_at: "2026-01-01T00:00:00Z".into(), source: None,
     }];
-    let rc = reality_check::build_reality_check("proj", None, &items, &rels, &[], &[], false, 14);
-    assert_eq!(rc.relationship_graph.len(), 1);
+    let rc = reality_check::build_reality_check("proj", None, &items, &rels, &[], &[], &RealityCheckOptions { compact: false, ..RealityCheckOptions::default() });
+    assert_eq!(rc.relationship_graph.as_ref().unwrap().len(), 1);
 }
 
 #[test]
@@ -568,9 +569,9 @@ fn reality_check_done_excluded_by_default() {
     store.create_item("Active task", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
 
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], false, 14);
-    let all_statuses: Vec<_> = rc.epic_tickets_by_status.keys().collect();
-    assert!(!all_statuses.contains(&&"done".to_string()));
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions { compact: false, ..RealityCheckOptions::default() });
+    let tbs = rc.tickets_by_status.as_ref().unwrap();
+    assert!(!tbs.contains_key("done"));
 }
 
 #[test]
@@ -588,9 +589,9 @@ fn reality_check_stale_verification_in_signals() {
         confidence: Confidence::Stale,
         summary: Some("Needs re-verification".into()), source: None,
     }];
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &vs, false, 14);
-    assert!(!rc.stale_verifications.is_empty());
-    assert!(rc.signals.iter().any(|s| s.signal_type == "verification_stale"));
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &vs, &RealityCheckOptions { compact: false, ..RealityCheckOptions::default() });
+    assert!(rc.stale_verifications.as_ref().unwrap().len() > 0);
+    assert!(rc.top_signals.iter().any(|s| s.signal_type == "verification_stale"));
 }
 
 // ===== Boundary: Cross-project relationship rejection =====
@@ -755,9 +756,9 @@ fn reality_check_done_with_open_children() {
 
     // Need to re-fetch parent to get children populated
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], true, 14);
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions { include_done: true, ..RealityCheckOptions::default() });
     assert!(!rc.done_with_open_children.is_empty(), "should detect done parent with open child");
-    assert!(rc.signals.iter().any(|s| s.signal_type == "done_with_open_children"));
+    assert!(rc.top_signals.iter().any(|s| s.signal_type == "done_with_open_children"));
 }
 
 // ===== Boundary: Reality check no_deadline =====
@@ -770,9 +771,10 @@ fn reality_check_tickets_with_no_deadline() {
     store.create_item("Has deadline", "proj", "dom", None, Some("todo"), None, None, Some("2026-12-01"), None, None, None, None, &pf).unwrap();
 
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], false, 14);
-    assert_eq!(rc.tickets_with_no_deadline.len(), 1);
-    assert_eq!(rc.tickets_with_no_deadline[0].title, "No deadline");
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions { compact: false, ..RealityCheckOptions::default() });
+    let nod = rc.tickets_with_no_deadline.as_ref().unwrap();
+    assert_eq!(nod.len(), 1);
+    assert_eq!(nod[0].title, "No deadline");
 }
 
 // ===== Boundary: Reality check blocked_or_dependent =====
@@ -795,7 +797,7 @@ fn reality_check_blocked_items() {
         description: None, created_at: "2026-01-01T00:00:00Z".into(), source: None,
     }];
 
-    let rc = reality_check::build_reality_check("proj", None, &items, &rels, &[], &[], false, 14);
+    let rc = reality_check::build_reality_check("proj", None, &items, &rels, &[], &[], &RealityCheckOptions::default());
     assert!(!rc.blocked_or_dependent.is_empty());
     let blocker_signal = rc.blocked_or_dependent.iter().find(|d| d.ticket_id == blocker_id).unwrap();
     assert!(blocker_signal.blocks.contains(&blocked_id));
@@ -812,8 +814,8 @@ fn reality_check_duplicate_titles() {
     store.create_item("Unique name", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
 
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], false, 14);
-    assert!(rc.signals.iter().any(|s| s.signal_type == "possible_duplicate_title"), "should detect duplicate titles");
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &[], &RealityCheckOptions::default());
+    assert!(rc.top_signals.iter().any(|s| s.signal_type == "possible_duplicate_title"), "should detect duplicate titles");
 }
 
 // ===== Boundary: Contradicted verification appears in reality check =====
@@ -833,9 +835,9 @@ fn reality_check_contradicted_verification() {
         confidence: Confidence::Contradicted,
         summary: Some("Board decision changed".into()), source: None,
     }];
-    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &vs, false, 14);
-    assert!(!rc.stale_verifications.is_empty());
-    assert!(rc.signals.iter().any(|s| s.signal_type == "verification_contradicted"));
+    let rc = reality_check::build_reality_check("proj", None, &items, &[], &[], &vs, &RealityCheckOptions { compact: false, ..RealityCheckOptions::default() });
+    assert!(rc.stale_verifications.as_ref().unwrap().len() > 0);
+    assert!(rc.top_signals.iter().any(|s| s.signal_type == "verification_contradicted"));
 }
 
 // ===== Integration: Full proposal apply flow =====
@@ -943,11 +945,11 @@ fn proposal_full_apply_flow_with_multiple_ops() {
 
     // 6. Reality check shows everything
     let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
-    let rc = reality_check::build_reality_check("proj", Some("operational-loop-v1"), &items, &rels, &qs, &[], false, 14);
+    let rc = reality_check::build_reality_check("proj", Some("operational-loop-v1"), &items, &rels, &qs, &[], &RealityCheckOptions { compact: false, ..RealityCheckOptions::default() });
     assert_eq!(rc.epic.as_deref(), Some("operational-loop-v1"));
     assert!(!rc.open_questions.is_empty());
-    assert!(!rc.relationship_graph.is_empty());
-    assert!(rc.epic_tickets_by_status.values().any(|v| !v.is_empty()));
+    assert!(!rc.relationship_graph.as_ref().unwrap().is_empty());
+    assert!(rc.tickets_by_status.as_ref().unwrap().values().any(|v| !v.is_empty()));
 }
 
 // ===== All relationship types parse correctly =====
