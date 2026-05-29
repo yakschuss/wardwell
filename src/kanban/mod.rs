@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod events;
+pub mod plan;
 pub mod prefix;
 pub mod proposals;
 pub mod questions;

@@ -7,6 +7,7 @@ use wardwell::kanban::questions::{self, QuestionEvent, Question, QuestionStatus}
 use wardwell::kanban::proposals::{self, ProposalEvent, Proposal, ProposalStatus, ProposalIntent, ChangeOperation, TicketSnapshot, ContextTransfer, ClosureSummary};
 use wardwell::kanban::verification::{self, VerificationEvent, Verification, VerificationSource, Confidence};
 use wardwell::kanban::reality_check::{self, RealityCheckOptions};
+use wardwell::kanban::plan::{self, PlanOptions};
 
 fn make_store() -> (tempfile::TempDir, KanbanStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -1745,4 +1746,242 @@ fn closure_with_incoming_link_is_still_flagged() {
     let review = proposals::review_proposal(&p, &items, &[], &rels);
     assert!(has_orphaned_context_flag(&review, &producer.ticket_id),
         "an incoming link does not declare where this ticket's context lives");
+}
+
+// ===== v0.10.3: planning lens (read-only execution map) =====
+
+/// Build a corr-platform-like subtree under a CM-2-style root and return
+/// (dir, store, root_id, child_ids by role).
+struct PlanFixture {
+    dir: tempfile::TempDir,
+    store: KanbanStore,
+    root: String,
+    active: String,
+    shipping: String,
+    next: String,
+    safety: String,
+    gate: String,
+    parallel: String,
+    blocked: String,
+    later: String,
+}
+
+fn make_plan_fixture() -> PlanFixture {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    // Root container (in_progress parent with children).
+    let root = store.create_item("CM-2 billing platform", "proj", "dom", Some("Parent epic for billing"), Some("in_progress"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    let r = root.ticket_id.clone();
+
+    let active = store.create_item("Build billing core", "proj", "dom", Some("core engine"), Some("in_progress"), Some("high"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    let shipping = store.create_item("Charge calculation", "proj", "dom", Some("ready"), Some("review"), Some("high"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    let next = store.create_item("Wire up payment ledger", "proj", "dom", Some("next build step"), Some("todo"), Some("high"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    let safety = store.create_item("Reconciliation and anomaly monitoring", "proj", "dom", Some("guardrail against silent failure"), Some("todo"), Some("medium"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    let gate = store.create_item("Submit claims to Elation", "proj", "dom", Some("external API handoff for production billing"), Some("todo"), Some("medium"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    let parallel = store.create_item("Rate data collection", "proj", "dom", Some("research and confirm payer rates"), Some("backlog"), Some("medium"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    let blocked = store.create_item("Finalize payout contract", "proj", "dom", Some("needs signed contract"), Some("todo"), Some("high"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    store.add_note(&blocked.ticket_id, "Blocked on external party: awaiting signed payout contract and rate confirmation.", Some("test")).unwrap();
+    let later = store.create_item("Multi-currency expansion", "proj", "dom", Some("future expansion, nice to have later"), Some("backlog"), Some("low"), None, None, None, None, Some(&r), None, &pf).unwrap();
+
+    PlanFixture {
+        dir, store, root: r,
+        active: active.ticket_id, shipping: shipping.ticket_id, next: next.ticket_id,
+        safety: safety.ticket_id, gate: gate.ticket_id, parallel: parallel.ticket_id,
+        blocked: blocked.ticket_id, later: later.ticket_id,
+    }
+}
+
+fn all_items(f: &PlanFixture) -> Vec<wardwell::kanban::store::KanbanItem> {
+    f.store.list(Some("proj"), None, None, None, None, None, true, None).unwrap()
+}
+
+fn in_section<'a>(section: &'a [plan::PlanItem], tid: &str) -> Option<&'a plan::PlanItem> {
+    section.iter().find(|i| i.ticket_id == tid)
+}
+
+#[test]
+fn plan_root_with_children_builds_map() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    assert_eq!(map.root_ticket_id.as_deref(), Some(f.root.as_str()));
+    // The map should populate multiple distinct sections from one subtree.
+    assert!(!map.current_center.is_empty(), "expected active anchor work");
+    assert!(!map.next_recommended.is_empty(), "expected a next item");
+    assert!(!map.safety_companions.is_empty());
+    assert!(!map.gates_before_externalization.is_empty());
+    assert!(!map.blocked_or_parked.is_empty());
+
+    // The container root itself must not appear as a work item.
+    let appears = |s: &[plan::PlanItem]| s.iter().any(|i| i.ticket_id == f.root);
+    assert!(!appears(&map.current_center) && !appears(&map.next_recommended) && !appears(&map.later_expansion),
+        "root container should be excluded from work buckets");
+
+    // Every emitted item carries a reason and evidence.
+    for section in [&map.current_center, &map.next_recommended, &map.safety_companions, &map.gates_before_externalization, &map.blocked_or_parked] {
+        for item in section {
+            assert!(!item.why_here.is_empty(), "{} missing why_here", item.ticket_id);
+            assert!(!item.evidence.is_empty(), "{} missing evidence", item.ticket_id);
+        }
+    }
+}
+
+#[test]
+fn plan_active_review_is_current_center() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    assert!(in_section(&map.current_center, &f.active).is_some(), "in_progress ticket should be current_center");
+    assert!(in_section(&map.current_center, &f.shipping).is_some(), "review ticket should be current_center");
+    let it = in_section(&map.current_center, &f.shipping).unwrap();
+    assert!(it.why_here.to_lowercase().contains("review") || it.why_here.to_lowercase().contains("anchor"));
+}
+
+#[test]
+fn plan_reconciliation_is_safety_companion() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    let it = in_section(&map.safety_companions, &f.safety)
+        .unwrap_or_else(|| panic!("reconciliation/anomaly ticket should be a safety companion; sections did not contain it"));
+    assert!(it.evidence.iter().any(|e| e.to_lowercase().contains("reconciliation") || e.to_lowercase().contains("anomaly") || e.to_lowercase().contains("monitor")),
+        "evidence should cite the safety keyword: {:?}", it.evidence);
+}
+
+#[test]
+fn plan_external_handoff_is_gate() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    let it = in_section(&map.gates_before_externalization, &f.gate)
+        .unwrap_or_else(|| panic!("external/Elation/API ticket should be a gate"));
+    assert!(it.why_here.to_lowercase().contains("external") || it.evidence.iter().any(|e| {
+        let l = e.to_lowercase(); l.contains("elation") || l.contains("external") || l.contains("handoff")
+    }), "gate should explain externalization: why={:?} ev={:?}", it.why_here, it.evidence);
+}
+
+#[test]
+fn plan_blocked_note_is_blocked_or_parked() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    let it = in_section(&map.blocked_or_parked, &f.blocked)
+        .unwrap_or_else(|| panic!("ticket with blocked note should be blocked_or_parked"));
+    // Explicit blocked language must win even though the ticket is high priority + todo.
+    assert!(in_section(&map.next_recommended, &f.blocked).is_none(), "blocked ticket must not also be next_recommended");
+    assert!(it.evidence.iter().any(|e| e.to_lowercase().contains("blocked") || e.to_lowercase().contains("await")),
+        "evidence should cite the blocked note: {:?}", it.evidence);
+}
+
+#[test]
+fn plan_parallel_and_later_classified() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+    assert!(in_section(&map.parallel_tracks, &f.parallel).is_some(), "data collection/research should be a parallel track");
+    assert!(in_section(&map.later_expansion, &f.later).is_some(), "low-priority future expansion should be later");
+}
+
+#[test]
+fn plan_compact_excludes_noisy_notes() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions { full: false, limit: 10 });
+
+    // Compact: evidence is trimmed and never dumps the full "latest note:" block.
+    for section in [&map.current_center, &map.next_recommended, &map.safety_companions,
+                    &map.gates_before_externalization, &map.parallel_tracks, &map.later_expansion, &map.blocked_or_parked] {
+        for item in section {
+            assert!(item.evidence.len() <= 2, "compact evidence should be <=2 for {}: {:?}", item.ticket_id, item.evidence);
+            assert!(!item.evidence.iter().any(|e| e.starts_with("latest note:")),
+                "compact mode must not dump raw notes for {}", item.ticket_id);
+        }
+    }
+}
+
+#[test]
+fn plan_full_includes_expanded_evidence() {
+    let f = make_plan_fixture();
+    let items = all_items(&f);
+    let compact = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions { full: false, limit: 10 });
+    let full = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions { full: true, limit: 10 });
+
+    // The blocked ticket has a note; full mode should surface more evidence than compact.
+    let c = in_section(&compact.blocked_or_parked, &f.blocked).unwrap();
+    let fu = in_section(&full.blocked_or_parked, &f.blocked).unwrap();
+    assert!(fu.evidence.len() >= c.evidence.len(), "full evidence should be >= compact");
+    assert!(fu.evidence.iter().any(|e| e.starts_with("latest note:")),
+        "full mode should include the latest note excerpt: {:?}", fu.evidence);
+}
+
+#[test]
+fn plan_open_questions_and_relationships_surface() {
+    let f = make_plan_fixture();
+    // A question that governs sequencing, attached to the gate ticket.
+    let q = Question {
+        id: "q-seq".into(), project: "proj".into(), ticket_id: Some(f.gate.clone()),
+        question: "Which Elation endpoint handles batch claim submission?".into(),
+        current_assumption: None, evidence: None, needed_for: Some("Externalizing billing to Elation".into()),
+        status: QuestionStatus::Open, answer: None,
+        created_at: "2026-01-01T00:00:00Z".into(), updated_at: "2026-01-01T00:00:00Z".into(),
+        resolved_at: None, source: None,
+    };
+    questions::append_event(&vault_root(&f.dir), "dom", "proj", &QuestionEvent::Create(q)).unwrap();
+    let qs = questions::read_all(&vault_root(&f.dir), "dom", "proj");
+
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &qs, &PlanOptions::default());
+
+    assert!(map.open_questions.iter().any(|q| q.ticket_id.as_deref() == Some(f.gate.as_str())),
+        "open question on a relevant ticket should surface");
+    let pq = map.open_questions.iter().find(|q| q.id == "q-seq").unwrap();
+    assert!(pq.why_here.to_lowercase().contains("govern"), "question should explain sequencing impact: {}", pq.why_here);
+
+    // With a core (current_center) and a gate present, a depends_on edge should be suggested.
+    assert!(map.suggested_relationships.iter().any(|s| s.from_ticket_id == f.gate && s.relationship_type == "depends_on"),
+        "gate should be suggested to depend on the core build; got {:?}", map.suggested_relationships);
+}
+
+#[test]
+fn plan_is_read_only_no_writes() {
+    let f = make_plan_fixture();
+    let items_before = all_items(&f);
+    let count_before = items_before.len();
+    let rels_before = relationships::read_all(&vault_root(&f.dir), "dom", "proj").len();
+    let qs_before = questions::read_all(&vault_root(&f.dir), "dom", "proj").len();
+    let props_before = proposals::read_all(&vault_root(&f.dir), "dom", "proj").len();
+    let events_before = wardwell::kanban::events::read_events(&vault_root(&f.dir), "dom", "proj").len();
+
+    // Run the planner in both modes.
+    let _ = plan::build_plan("proj", Some(&f.root), None, &items_before, &[], &[], &PlanOptions::default());
+    let _ = plan::build_plan("proj", None, None, &items_before, &[], &[], &PlanOptions { full: true, limit: 50 });
+
+    assert_eq!(all_items(&f).len(), count_before, "plan must not create or delete tickets");
+    assert_eq!(relationships::read_all(&vault_root(&f.dir), "dom", "proj").len(), rels_before, "plan must not create relationships");
+    assert_eq!(questions::read_all(&vault_root(&f.dir), "dom", "proj").len(), qs_before, "plan must not create questions");
+    assert_eq!(proposals::read_all(&vault_root(&f.dir), "dom", "proj").len(), props_before, "plan must not create proposals");
+    assert_eq!(wardwell::kanban::events::read_events(&vault_root(&f.dir), "dom", "proj").len(), events_before, "plan must not append events");
+}
+
+#[test]
+fn plan_answers_what_is_next_after_ship() {
+    // The definition-of-done scenario: the shipping ticket is now done; a fresh
+    // plan should point at the next high-priority item under the root.
+    let f = make_plan_fixture();
+    f.store.update_item(&f.shipping, None, None, Some("done"), None, None, None, None, None, None).unwrap();
+    let items = all_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    // Done ticket drops out of every actionable bucket.
+    for section in [&map.current_center, &map.next_recommended, &map.safety_companions, &map.gates_before_externalization] {
+        assert!(in_section(section, &f.shipping).is_none(), "done ticket should not appear in actionable buckets");
+    }
+    // The next build step is recommended.
+    assert!(in_section(&map.next_recommended, &f.next).is_some(),
+        "after shipping, the high-priority todo should be next_recommended");
 }

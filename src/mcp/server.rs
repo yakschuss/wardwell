@@ -232,8 +232,12 @@ pub struct KanbanParams {
     pub open_only: Option<bool>,
     #[schemars(description = "For reality_check: set true for full verbose output including tickets_by_status, no_deadline, relationship_graph. For proposal_list: set true to return raw proposals with every operation instead of the scannable review summary. Default false (compact).")]
     pub full: Option<bool>,
-    #[schemars(description = "For reality_check/hygiene_suggestions: max items per section. Default 10.")]
+    #[schemars(description = "For reality_check/hygiene_suggestions/plan: max items per section. Default 10.")]
     pub limit: Option<usize>,
+
+    // -- plan fields --
+    #[schemars(description = "For plan: root parent/epic ticket ID to organize (e.g., 'CM-2'). Gathers its descendant subtree, relationship neighbors, and attached open questions.")]
+    pub root_ticket_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -396,7 +400,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions.")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions. Planning: plan (read-only execution map for a root_ticket_id, epic, or whole project — buckets work into current_center, next_recommended, safety_companions, gates_before_externalization, parallel_tracks, later_expansion, blocked_or_parked, with open_questions and suggested_relationships; mutates nothing).")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -432,7 +436,8 @@ impl WardwellServer {
             "verify" => self.kanban_verify(kanban, &p),
             "reality_check" => self.kanban_reality_check(kanban, &p),
             "hygiene_suggestions" => self.kanban_hygiene_suggestions(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions")),
+            "plan" => self.kanban_plan(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan")),
         }
     }
 
@@ -3231,6 +3236,53 @@ impl WardwellServer {
         );
         let total = suggestions.len();
         serde_json::to_string(&serde_json::json!({"suggestions": suggestions, "total": total})).unwrap_or_default()
+    }
+
+    /// Read-only planning lens — derives an execution map for a parent ticket,
+    /// epic, or project area. Mutates nothing.
+    fn kanban_plan(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for plan");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+
+        // Load all project tickets WITH notes and children so classification can
+        // cite descriptions/notes and walk the parent subtree.
+        let items = match kanban.list(Some(project), None, None, None, None, None, true, None) {
+            Ok(items) => items,
+            Err(e) => return json_error(&format!("failed to list tickets: {e}")),
+        };
+
+        if let Some(ref root) = p.root_ticket_id {
+            if !items.iter().any(|i| &i.ticket_id == root) {
+                return json_error(&format!("root_ticket_id '{}' not found in project '{}'", root, project));
+            }
+        }
+
+        let relationships = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
+        let questions = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
+
+        let opts = crate::kanban::plan::PlanOptions {
+            full: p.full.unwrap_or(false),
+            limit: p.limit.unwrap_or(10),
+        };
+
+        let map = crate::kanban::plan::build_plan(
+            project,
+            p.root_ticket_id.as_deref(),
+            p.epic.as_deref(),
+            &items,
+            &relationships,
+            &questions,
+            &opts,
+        );
+        serde_json::to_string_pretty(&map).unwrap_or_default()
     }
 
     fn infer_domain_for_project(&self, project: &str) -> Option<String> {
