@@ -1510,3 +1510,239 @@ fn affected_ticket_ids_unique_sorted() {
     };
     assert_eq!(proposals::affected_ticket_ids(&p), vec!["T-1".to_string(), "T-3".to_string()]);
 }
+
+// ===== v0.10.2: closure safety — notes are NOT custody transfer =====
+
+// Helper: does a review contain the orphaned-context flag for a given ticket?
+fn has_orphaned_context_flag(review: &wardwell::kanban::proposals::ProposalReview, tid: &str) -> bool {
+    review.risk_flags.iter().any(|f| f.code == "closure_without_context" && f.ticket_id.as_deref() == Some(tid))
+}
+
+#[test]
+fn closure_with_only_notes_is_still_flagged() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let producer = store.create_item("Crisis producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+    let other = store.create_item("Other ticket", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // The exact rejected-v3 shape (minus the unrelated batch): move to done and
+    // sprinkle notes on the producer and another ticket. No structured closure metadata.
+    let p = Proposal {
+        id: "p-notes".into(), project: "proj".into(),
+        title: "Close producer with notes".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::AppendNote { ticket_id: producer.ticket_id.clone(), text: "State modeling notes".into() },
+            ChangeOperation::AppendNote { ticket_id: other.ticket_id.clone(), text: "Instrumentation notes".into() },
+            ChangeOperation::UpdateTicket {
+                ticket_id: producer.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        intent: Some(ProposalIntent::Closure),
+        ticket_snapshots: vec![],
+        rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+
+    assert!(has_orphaned_context_flag(&review, &producer.ticket_id),
+        "a note on the closing ticket must NOT satisfy closure safety; got: {:?}",
+        review.risk_flags.iter().map(|f| &f.code).collect::<Vec<_>>());
+    // And it should be flagged as high severity, not a soft warning.
+    let flag = review.risk_flags.iter().find(|f| f.code == "closure_without_context").unwrap();
+    assert_eq!(flag.severity, "high");
+}
+
+#[test]
+fn crisis_v3_repro_flags_orphaned_context_not_just_unrelated_batch() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    // Five unrelated tickets; CM-75 is the producer, CM-86 gets a note too.
+    let cm75 = store.create_item("Crisis producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+    let cm86 = store.create_item("CM-86", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    let t3 = store.create_item("Unrelated 3", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    let t4 = store.create_item("Unrelated 4", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    let t5 = store.create_item("Unrelated 5", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    let p = Proposal {
+        id: "p-v3".into(), project: "proj".into(),
+        title: "Board cleanup".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::UpdateTicket {
+                ticket_id: cm75.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+            ChangeOperation::AppendNote { ticket_id: cm75.ticket_id.clone(), text: "state modeling".into() },
+            ChangeOperation::AppendNote { ticket_id: cm86.ticket_id.clone(), text: "instrumentation".into() },
+            ChangeOperation::AppendNote { ticket_id: t3.ticket_id.clone(), text: "n3".into() },
+            ChangeOperation::AppendNote { ticket_id: t4.ticket_id.clone(), text: "n4".into() },
+            ChangeOperation::AppendNote { ticket_id: t5.ticket_id.clone(), text: "n5".into() },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        intent: Some(ProposalIntent::Closure),
+        ticket_snapshots: vec![],
+        rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+    let codes: Vec<&str> = review.risk_flags.iter().map(|f| f.code.as_str()).collect();
+
+    // The core bug: this must fire, not just unrelated_batch.
+    assert!(codes.contains(&"closure_without_context"),
+        "v3 shape must raise the orphaned-context flag, got: {codes:?}");
+    assert!(has_orphaned_context_flag(&review, &cm75.ticket_id));
+    // unrelated_batch still fires too — they're independent signals.
+    assert!(codes.contains(&"unrelated_batch"), "unrelated batch should also fire, got: {codes:?}");
+}
+
+#[test]
+fn closure_with_context_transfer_is_not_flagged() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+    let consumer = store.create_item("Consumer", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // No closure_summary, no note — only a structured custody transfer.
+    let p = Proposal {
+        id: "p-xfer".into(), project: "proj".into(),
+        title: "Close producer, transfer custody".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![ChangeOperation::UpdateTicket {
+            ticket_id: producer.ticket_id.clone(), status: Some("done".into()), priority: None,
+            epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+        }],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        intent: Some(ProposalIntent::Closure),
+        ticket_snapshots: vec![],
+        rationale: None, risk_flags: vec![],
+        context_transfers: vec![ContextTransfer {
+            from_ticket_id: producer.ticket_id.clone(),
+            to_ticket_id: consumer.ticket_id.clone(),
+            description: Some("remaining context".into()),
+        }],
+        closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+    assert!(!has_orphaned_context_flag(&review, &producer.ticket_id),
+        "a context transfer from the ticket satisfies closure safety");
+}
+
+#[test]
+fn closure_with_outgoing_successor_link_is_not_flagged() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+    let consumer = store.create_item("Consumer", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // Declares an outgoing successor link (producer feeds consumer) IN this proposal.
+    let p = Proposal {
+        id: "p-link".into(), project: "proj".into(),
+        title: "Close producer, link to consumer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![
+            ChangeOperation::CreateRelationship {
+                from_ticket_id: producer.ticket_id.clone(), to_ticket_id: consumer.ticket_id.clone(),
+                relationship_type: "feeds".into(), description: Some("producer feeds consumer".into()),
+            },
+            ChangeOperation::UpdateTicket {
+                ticket_id: producer.ticket_id.clone(), status: Some("done".into()), priority: None,
+                epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+            },
+        ],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        intent: Some(ProposalIntent::Closure),
+        ticket_snapshots: vec![],
+        rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+    assert!(!has_orphaned_context_flag(&review, &producer.ticket_id),
+        "an outgoing successor link declared in the proposal satisfies closure safety");
+}
+
+#[test]
+fn closure_with_only_rationale_is_still_flagged() {
+    // A free-text rationale explains WHY, not WHERE context lives — so it is not
+    // structured closure metadata and must not suppress the orphaned-context flag.
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    let p = Proposal {
+        id: "p-rat".into(), project: "proj".into(),
+        title: "Close producer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![ChangeOperation::UpdateTicket {
+            ticket_id: producer.ticket_id.clone(), status: Some("done".into()), priority: None,
+            epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+        }],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        intent: Some(ProposalIntent::Closure),
+        ticket_snapshots: vec![],
+        rationale: Some("Shipped a while ago, cleaning up the board".into()),
+        risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let review = proposals::review_proposal(&p, &items, &[], &[]);
+    assert!(has_orphaned_context_flag(&review, &producer.ticket_id),
+        "rationale alone is not a declared context destination");
+}
+
+#[test]
+fn closure_with_incoming_link_is_still_flagged() {
+    // An incoming link (something else → the closing ticket) does not declare where
+    // THIS ticket's context goes, so it must not satisfy closure safety.
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
+    let upstream = store.create_item("Upstream", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+
+    // Pre-existing board relationship pointing AT the producer.
+    let rel = Relationship {
+        id: "r-in".into(), project: "proj".into(),
+        from_ticket_id: upstream.ticket_id.clone(), to_ticket_id: producer.ticket_id.clone(),
+        relationship_type: RelationshipType::Feeds, description: None,
+        created_at: "2026-01-01T00:00:00Z".into(), source: None,
+    };
+    relationships::append_event(&vault_root(&dir), "dom", "proj", &RelationshipEvent::Create(rel)).unwrap();
+
+    let p = Proposal {
+        id: "p-incoming".into(), project: "proj".into(),
+        title: "Close producer".into(), description: None,
+        status: ProposalStatus::Pending,
+        changes: vec![ChangeOperation::UpdateTicket {
+            ticket_id: producer.ticket_id.clone(), status: Some("done".into()), priority: None,
+            epic: None, tags: None, parent: None, deadline: None, title: None, description: None,
+        }],
+        created_at: "2026-01-01T00:00:00Z".into(),
+        decided_at: None, applied_at: None, source: None,
+        intent: Some(ProposalIntent::Closure),
+        ticket_snapshots: vec![],
+        rationale: None, risk_flags: vec![],
+        context_transfers: vec![], closure_summary: None, reviewer_questions: vec![],
+    };
+
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let rels = relationships::read_all(&vault_root(&dir), "dom", "proj");
+    let review = proposals::review_proposal(&p, &items, &[], &rels);
+    assert!(has_orphaned_context_flag(&review, &producer.ticket_id),
+        "an incoming link does not declare where this ticket's context lives");
+}

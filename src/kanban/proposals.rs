@@ -512,9 +512,9 @@ fn compute_risk_flags(
     let mut closing_tickets: Vec<String> = Vec::new();
     let mut priority_changes: Vec<String> = Vec::new();
     let mut unique_tickets: HashSet<String> = HashSet::new();
-    let mut has_note_for: HashSet<String> = HashSet::new();
-    // Tickets that gain an outgoing or incoming link in *this* proposal.
-    let mut linked_in_proposal: HashSet<String> = HashSet::new();
+    // Tickets that declare an *outgoing* successor link in *this* proposal —
+    // i.e. they point at where their context continues. Incoming links don't count.
+    let mut outgoing_link_in_proposal: HashSet<String> = HashSet::new();
 
     for change in &proposal.changes {
         match change {
@@ -550,14 +550,12 @@ fn compute_risk_flags(
                 }
             }
             ChangeOperation::AppendNote { ticket_id, .. } => {
-                has_note_for.insert(ticket_id.clone());
                 unique_tickets.insert(ticket_id.clone());
             }
             ChangeOperation::CreateRelationship { from_ticket_id, to_ticket_id, .. } => {
                 unique_tickets.insert(from_ticket_id.clone());
                 unique_tickets.insert(to_ticket_id.clone());
-                linked_in_proposal.insert(from_ticket_id.clone());
-                linked_in_proposal.insert(to_ticket_id.clone());
+                outgoing_link_in_proposal.insert(from_ticket_id.clone());
             }
             ChangeOperation::CreateQuestion { ticket_id, .. } => {
                 if let Some(tid) = ticket_id { unique_tickets.insert(tid.clone()); }
@@ -566,28 +564,31 @@ fn compute_risk_flags(
         }
     }
 
-    // Treat an explicit rationale or an obsolete/supersede intent as a stated
-    // reason that context custody was considered for the whole proposal.
     let has_rationale = proposal.rationale.as_deref().is_some_and(|r| !r.trim().is_empty());
-    let obsolete_intent = matches!(proposal.intent, Some(ProposalIntent::Supersede));
 
-    // Risk: closing a ticket without saying where its remaining context lives.
+    // Closure-safety rule (the headline 0.10.2 invariant):
+    // Any ticket moved to done MUST declare where its context lives via *structured*
+    // closure metadata, or it gets a specific orphaned-context flag. Notes, a
+    // free-text rationale, an obsolete-intent label, or an incoming link are NOT
+    // custody declarations — a note on the ticket preserves context in place, it
+    // does not say where the remaining work is tracked.
+    //
+    // Structured closure metadata, any one of:
+    //   1. a closure_summary block (with at least one field set),
+    //   2. a context_transfer whose source is this ticket,
+    //   3. an outgoing successor link declared in this proposal (this → elsewhere).
     for tid in &closing_tickets {
-        let has_closure = proposal.closure_summary.as_ref().is_some_and(|cs| {
+        let has_closure_summary = proposal.closure_summary.as_ref().is_some_and(|cs| {
             cs.shipped_scope.is_some() || cs.context_destination.is_some() || cs.not_shipped.is_some()
         });
         let has_transfer = proposal.context_transfers.iter().any(|ct| ct.from_ticket_id == *tid);
-        let has_note = has_note_for.contains(tid);
-        // A successor/relationship link — created here or already on the board — shows
-        // where the context continues.
-        let has_link = linked_in_proposal.contains(tid)
-            || relationships.iter().any(|r| r.from_ticket_id == *tid || r.to_ticket_id == *tid);
-        if !has_closure && !has_transfer && !has_note && !has_link && !has_rationale && !obsolete_intent {
+        let has_outgoing_link = outgoing_link_in_proposal.contains(tid);
+        if !has_closure_summary && !has_transfer && !has_outgoing_link {
             flags.push(RiskFlag {
                 code: "closure_without_context".into(),
-                severity: "warning".into(),
+                severity: "high".into(),
                 message: format!(
-                    "Moves {tid} to done but does not say where remaining context lives — add a closure summary, context transfer, successor link, or rationale."
+                    "Moves {tid} to done without a closure summary or declared context destination — record what shipped, what didn't, and where remaining context lives (a note on {tid} preserves context in place but does not transfer custody)."
                 ),
                 ticket_id: Some(tid.clone()),
             });
