@@ -1985,3 +1985,163 @@ fn plan_answers_what_is_next_after_ship() {
     assert!(in_section(&map.next_recommended, &f.next).is_some(),
         "after shipping, the high-priority todo should be next_recommended");
 }
+
+// ===== v0.10.4: planning lens polish (next inference + scope conflict) =====
+
+/// A CM-2-style billing subtree where CM-92 (engine) is the active center and
+/// CM-6 is a summary/review ticket whose note hides a much broader scope.
+struct BillingFixture {
+    dir: tempfile::TempDir,
+    store: KanbanStore,
+    root: String,
+    cm92: String,   // active engine — current center
+    cm6: String,    // summary/review surface w/ broad note — next + needs_clarification
+    recon: String,  // reconciliation — safety
+    blocked: String,
+}
+
+fn make_billing_fixture() -> BillingFixture {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let root = store.create_item("CM-2 Billing platform", "proj", "dom", Some("parent epic"), Some("in_progress"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    let r = root.ticket_id.clone();
+
+    // CM-92 analog: the active engine producing billing output.
+    let cm92 = store.create_item("Billing calculation engine", "proj", "dom", Some("compute charges per block"), Some("in_progress"), Some("high"), None, None, None, None, Some(&r), None, &pf).unwrap();
+
+    // CM-6 analog: a bounded summary/review surface — note hides broad scope.
+    let cm6 = store.create_item(
+        "Monthly Billing Block Summary generation",
+        "proj", "dom",
+        Some("Generate the monthly billing block summary for human review and approval"),
+        Some("todo"), Some("medium"), None, None, None, None, Some(&r), None, &pf,
+    ).unwrap();
+    store.add_note(&cm6.ticket_id, "Vision: full downstream billing pipeline from calculation to payer submission, including monitoring and anomaly detection.", Some("seed")).unwrap();
+
+    let recon = store.create_item("Reconciliation and anomaly audit", "proj", "dom", Some("guardrail against silent failure"), Some("todo"), Some("medium"), None, None, None, None, Some(&r), None, &pf).unwrap();
+
+    let blocked = store.create_item("Confirm payer rate table", "proj", "dom", Some("needs rates"), Some("todo"), Some("high"), None, None, None, None, Some(&r), None, &pf).unwrap();
+    store.add_note(&blocked.ticket_id, "Blocked on external party: awaiting signed rate confirmation.", Some("seed")).unwrap();
+
+    BillingFixture { dir, store, root: r, cm92: cm92.ticket_id, cm6: cm6.ticket_id, recon: recon.ticket_id, blocked: blocked.ticket_id }
+}
+
+fn bill_items(f: &BillingFixture) -> Vec<wardwell::kanban::store::KanbanItem> {
+    f.store.list(Some("proj"), None, None, None, None, None, true, None).unwrap()
+}
+
+#[test]
+fn plan_next_recommended_populated_from_summary_child() {
+    let f = make_billing_fixture();
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    assert!(in_section(&map.current_center, &f.cm92).is_some(), "engine should be the current center");
+    // CM-6 is a summary/review surface → must be a next item even though it's only medium priority.
+    assert!(in_section(&map.next_recommended, &f.cm6).is_some(),
+        "summary/review child should populate next_recommended; got next={:?}",
+        map.next_recommended.iter().map(|i| &i.ticket_id).collect::<Vec<_>>());
+    assert!(!map.next_recommended.is_empty(), "next_recommended must not be empty when a plausible next item exists");
+}
+
+#[test]
+fn plan_scope_conflict_detected_into_needs_clarification() {
+    let f = make_billing_fixture();
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    let nc = map.needs_clarification.iter().find(|n| n.ticket_id == f.cm6)
+        .unwrap_or_else(|| panic!("CM-6 (narrow title + broad note) should be flagged needs_clarification; got {:?}",
+            map.needs_clarification.iter().map(|n| &n.ticket_id).collect::<Vec<_>>()));
+
+    assert!(!nc.conflict_summary.is_empty());
+    assert!(!nc.narrow_reading.is_empty());
+    assert!(nc.broad_reading.to_lowercase().contains("pipeline"), "broad reading should quote the broad note: {}", nc.broad_reading);
+    assert!(!nc.why_it_blocks_planning.is_empty());
+    assert!(!nc.suggested_resolution_options.is_empty(), "should offer resolution options");
+    assert!(nc.suggested_resolution_options.iter().any(|o| o.to_lowercase().contains("split")));
+
+    // CM-6 should ALSO still be a next item, and carry an inline scope-conflict flag.
+    let item = in_section(&map.next_recommended, &f.cm6).unwrap();
+    assert!(item.evidence.iter().any(|e| e.contains("scope conflict")),
+        "next item with a scope conflict should be flagged inline: {:?}", item.evidence);
+}
+
+#[test]
+fn plan_broad_note_does_not_override_narrow_description() {
+    let f = make_billing_fixture();
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    // The CM-6 note mentions "monitoring and anomaly detection" — that must NOT
+    // pull it into safety_companions, nor bury it in later_expansion.
+    assert!(in_section(&map.safety_companions, &f.cm6).is_none(),
+        "a note mentioning monitoring must not classify the summary ticket as safety");
+    assert!(in_section(&map.later_expansion, &f.cm6).is_none(),
+        "scope-conflicted summary ticket must not be silently parked in later");
+    assert!(in_section(&map.next_recommended, &f.cm6).is_some(),
+        "literal summary/review description should drive classification → next");
+}
+
+#[test]
+fn plan_safety_still_catches_reconciliation_audit() {
+    let f = make_billing_fixture();
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+    let it = in_section(&map.safety_companions, &f.recon)
+        .unwrap_or_else(|| panic!("reconciliation/anomaly/audit ticket should still be a safety companion"));
+    assert!(it.evidence.iter().any(|e| {
+        let l = e.to_lowercase();
+        l.contains("reconciliation") || l.contains("anomaly") || l.contains("audit")
+    }), "safety classification should cite the title keyword: {:?}", it.evidence);
+}
+
+#[test]
+fn plan_blocked_does_not_become_next() {
+    let f = make_billing_fixture();
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+    // High-priority todo, but blocked note wins.
+    assert!(in_section(&map.blocked_or_parked, &f.blocked).is_some(), "blocked ticket should be parked");
+    assert!(in_section(&map.next_recommended, &f.blocked).is_none(), "blocked ticket must not appear in next_recommended");
+}
+
+#[test]
+fn plan_suggests_feeds_from_center_to_downstream_consumer() {
+    let f = make_billing_fixture();
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
+
+    // Execution-useful direction: CM-92 feeds CM-6 (not only CM-6 depends_on CM-92).
+    let feeds = map.suggested_relationships.iter().find(|s| {
+        s.from_ticket_id == f.cm92 && s.to_ticket_id == f.cm6 && s.relationship_type == "feeds"
+    });
+    assert!(feeds.is_some(),
+        "expected a feeds suggestion from the center to the downstream consumer; got {:?}",
+        map.suggested_relationships);
+    assert!(feeds.unwrap().rationale.to_lowercase().contains("feeds"), "rationale should explain the feeds direction");
+}
+
+#[test]
+fn plan_downstream_relationship_drives_next() {
+    // A plain todo with no keyword, but fed by the active center, should still be next.
+    let f = make_billing_fixture();
+    let pf = HashMap::new();
+    let plain = f.store.create_item("Ledger posting step", "proj", "dom", Some("post entries"), Some("todo"), Some("medium"), None, None, None, None, Some(&f.root), None, &pf).unwrap();
+    // CM-92 feeds the plain ledger step.
+    let rel = Relationship {
+        id: "r-feed".into(), project: "proj".into(),
+        from_ticket_id: f.cm92.clone(), to_ticket_id: plain.ticket_id.clone(),
+        relationship_type: RelationshipType::Feeds, description: None,
+        created_at: "2026-01-01T00:00:00Z".into(), source: None,
+    };
+    relationships::append_event(&vault_root(&f.dir), "dom", "proj", &RelationshipEvent::Create(rel)).unwrap();
+    let rels = relationships::read_all(&vault_root(&f.dir), "dom", "proj");
+
+    let items = bill_items(&f);
+    let map = plan::build_plan("proj", Some(&f.root), None, &items, &rels, &[], &PlanOptions::default());
+    let it = in_section(&map.next_recommended, &plain.ticket_id)
+        .unwrap_or_else(|| panic!("ticket fed by the active center should be next_recommended"));
+    assert!(it.why_here.to_lowercase().contains("downstream") || it.evidence.iter().any(|e| e.to_lowercase().contains("downstream")),
+        "should explain it is downstream of the center: why={} ev={:?}", it.why_here, it.evidence);
+}
