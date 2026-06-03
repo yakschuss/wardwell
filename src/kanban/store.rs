@@ -42,6 +42,12 @@ pub struct KanbanItem {
     /// `None` for tickets with no grooming history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grooming: Option<crate::kanban::events::Grooming>,
+    /// Vault-relative path to the latest grooming artifact on disk, resolved by
+    /// the `docs/grooming/<ticket>-grooming-*.md` convention. Populated even when
+    /// no receipt event exists, so an agent can read the artifact directly via
+    /// `wardwell_search action:read`. `None` when no artifact is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grooming_artifact: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -274,7 +280,7 @@ impl KanbanStore {
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), parent: parent.map(str::to_string), position: None, children: vec![],
             tags: tags_vec, created_at: now.clone(), updated_at: now,
-            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
         })
     }
 
@@ -485,6 +491,9 @@ impl KanbanStore {
 
             // Fold grooming provenance from groom_* events (metadata, not notes).
             item.grooming = events::grooming_for_ticket(&all_events, ticket_id);
+            // Resolve the latest grooming artifact on disk by convention, so an
+            // agent can pull it up even before (or without) a receipt event.
+            item.grooming_artifact = latest_grooming_artifact(&self.vault_root, &domain, &project, ticket_id);
 
             // Children activity: last 2 events per child
             if !item.children.is_empty() {
@@ -553,7 +562,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -620,7 +629,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -672,7 +681,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -704,7 +713,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -759,7 +768,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -998,7 +1007,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
             }),
         ).optional()?;
         let mut item = item.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
@@ -1118,6 +1127,27 @@ fn event_to_activity(event: &events::KanbanEvent, ticket_override: Option<&str>)
         timestamp: event.timestamp().into(),
         summary,
     }
+}
+
+/// Resolve the newest grooming artifact for a ticket by the
+/// `<domain>/<project>/docs/grooming/<ticket>-grooming-<ts>.md` convention.
+/// Returns a vault-relative path (readable via `wardwell_search action:read`),
+/// or `None` if no artifact exists. Read-only.
+fn latest_grooming_artifact(vault_root: &Path, domain: &str, project: &str, ticket_id: &str) -> Option<String> {
+    let dir = vault_root.join(domain).join(project).join("docs").join("grooming");
+    let prefix = format!("{ticket_id}-grooming-");
+    let mut newest: Option<String> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        // The dash after the full ticket id prevents CM-14 matching CM-140.
+        if name.starts_with(&prefix) && name.ends_with(".md") {
+            // Filenames embed a sortable timestamp, so lexicographic max = newest.
+            if newest.as_deref().is_none_or(|cur| name.as_str() > cur) {
+                newest = Some(name);
+            }
+        }
+    }
+    newest.map(|name| format!("{domain}/{project}/docs/grooming/{name}"))
 }
 
 fn mime_from_ext(filename: &str) -> String {

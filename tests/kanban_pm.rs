@@ -2325,3 +2325,53 @@ fn service_consumption_round_trip() {
     let evs = events::read_events(&vault_root(&dir), "dom", "proj");
     assert!(!events::has_pending_groom(&evs, &item.ticket_id), "request is now satisfied");
 }
+
+#[test]
+fn grooming_artifact_resolved_by_convention() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    // Ticket with a grooming artifact on disk but NO groom events (manual run).
+    let item = store.create_item("Compliance checklist", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    let groom_dir = vault_root(&dir).join("dom").join("proj").join("docs").join("grooming");
+    std::fs::create_dir_all(&groom_dir).unwrap();
+    // Two artifacts; the newer timestamp should win.
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603120000.md", item.ticket_id)), "# old").unwrap();
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182519.md", item.ticket_id)), "# new\n- readiness: audit_needed").unwrap();
+    // A decoy for a different ticket must not match.
+    std::fs::write(groom_dir.join("OTHER-1-grooming-20260603190000.md", ), "# decoy").unwrap();
+
+    let got = store.get_item(&item.ticket_id).unwrap();
+    assert!(got.grooming.is_none(), "no events → no event-sourced grooming");
+    assert_eq!(
+        got.grooming_artifact.as_deref(),
+        Some(format!("dom/proj/docs/grooming/{}-grooming-20260603182519.md", item.ticket_id).as_str()),
+        "should resolve the NEWEST artifact for this ticket, vault-relative",
+    );
+}
+
+#[test]
+fn grooming_artifact_alongside_requested_event() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("TCM detection", "proj", "dom", None, Some("todo"), Some("urgent"), None, None, None, None, None, None, &pf).unwrap();
+    // A request event (pending) AND a manual artifact on disk (the CM-14 situation).
+    request_groom(&dir, &item.ticket_id, "codex", "readiness");
+    let groom_dir = vault_root(&dir).join("dom").join("proj").join("docs").join("grooming");
+    std::fs::create_dir_all(&groom_dir).unwrap();
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182336.md", item.ticket_id)), "# CM-14\n- readiness: build_prompt_needed").unwrap();
+
+    let got = store.get_item(&item.ticket_id).unwrap();
+    // Event-sourced status is still "requested" (no receipt)...
+    assert_eq!(got.grooming.as_ref().unwrap().status, "requested");
+    // ...but the agent can still pull up the artifact by path, today.
+    assert!(got.grooming_artifact.as_deref().unwrap().ends_with("-grooming-20260603182336.md"));
+}
+
+#[test]
+fn no_grooming_artifact_when_none_on_disk() {
+    let (_dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Plain", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    let got = store.get_item(&item.ticket_id).unwrap();
+    assert!(got.grooming_artifact.is_none());
+}
