@@ -2327,30 +2327,34 @@ fn service_consumption_round_trip() {
 }
 
 #[test]
-fn grooming_artifact_resolved_by_convention() {
+fn grooming_artifact_surfaced_inline_when_no_events() {
     let (dir, store) = make_store();
     let pf = HashMap::new();
-    // Ticket with a grooming artifact on disk but NO groom events (manual run).
+    // Ticket with a grooming artifact on disk but NO groom events (manual run,
+    // e.g. CM-32/CM-107). get should synthesize a grooming block from the artifact.
     let item = store.create_item("Compliance checklist", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
     let groom_dir = vault_root(&dir).join("dom").join("proj").join("docs").join("grooming");
     std::fs::create_dir_all(&groom_dir).unwrap();
-    // Two artifacts; the newer timestamp should win.
-    std::fs::write(groom_dir.join(format!("{}-grooming-20260603120000.md", item.ticket_id)), "# old").unwrap();
-    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182519.md", item.ticket_id)), "# new\n- readiness: audit_needed").unwrap();
+    // Two artifacts; the newer timestamp wins. Header carries readiness + surface flag.
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603120000.md", item.ticket_id)), "# old\n- readiness: build_ready").unwrap();
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182519.md", item.ticket_id)), "# CM-32 Grooming\n\n## Readiness\n\n- readiness: audit_needed\n- surface_to_jack: true\n").unwrap();
     // A decoy for a different ticket must not match.
-    std::fs::write(groom_dir.join("OTHER-1-grooming-20260603190000.md", ), "# decoy").unwrap();
+    std::fs::write(groom_dir.join("OTHER-1-grooming-20260603190000.md"), "# decoy").unwrap();
 
-    let got = store.get_item(&item.ticket_id).unwrap();
-    assert!(got.grooming.is_none(), "no events → no event-sourced grooming");
+    let g = store.get_item(&item.ticket_id).unwrap().grooming.expect("grooming surfaced from artifact");
+    assert_eq!(g.status, "completed", "an artifact with no events reads as completed grooming");
+    assert_eq!(g.readiness.as_deref(), Some("audit_needed"), "readiness parsed from the newest artifact header");
+    assert_eq!(g.surfaced, Some(true));
     assert_eq!(
-        got.grooming_artifact.as_deref(),
+        g.artifact_path.as_deref(),
         Some(format!("dom/proj/docs/grooming/{}-grooming-20260603182519.md", item.ticket_id).as_str()),
-        "should resolve the NEWEST artifact for this ticket, vault-relative",
+        "newest artifact, vault-relative path, inline in the grooming block",
     );
+    assert!(g.requested_at.is_none(), "no request event → no requested_at");
 }
 
 #[test]
-fn grooming_artifact_alongside_requested_event() {
+fn grooming_artifact_inline_alongside_requested_event() {
     let (dir, store) = make_store();
     let pf = HashMap::new();
     let item = store.create_item("TCM detection", "proj", "dom", None, Some("todo"), Some("urgent"), None, None, None, None, None, None, &pf).unwrap();
@@ -2358,20 +2362,47 @@ fn grooming_artifact_alongside_requested_event() {
     request_groom(&dir, &item.ticket_id, "codex", "readiness");
     let groom_dir = vault_root(&dir).join("dom").join("proj").join("docs").join("grooming");
     std::fs::create_dir_all(&groom_dir).unwrap();
-    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182336.md", item.ticket_id)), "# CM-14\n- readiness: build_prompt_needed").unwrap();
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182336.md", item.ticket_id)), "## Readiness\n- readiness: build_prompt_needed\n- surface_to_jack: true\n").unwrap();
 
-    let got = store.get_item(&item.ticket_id).unwrap();
-    // Event-sourced status is still "requested" (no receipt)...
-    assert_eq!(got.grooming.as_ref().unwrap().status, "requested");
-    // ...but the agent can still pull up the artifact by path, today.
-    assert!(got.grooming_artifact.as_deref().unwrap().ends_with("-grooming-20260603182336.md"));
+    let g = store.get_item(&item.ticket_id).unwrap().grooming.unwrap();
+    // Protocol status stays truthful (request pending, no receipt)...
+    assert_eq!(g.status, "requested");
+    // ...and the artifact pointer + readiness are surfaced inline in the same block.
+    assert!(g.artifact_path.as_deref().unwrap().ends_with("-grooming-20260603182336.md"));
+    assert_eq!(g.readiness.as_deref(), Some("build_prompt_needed"));
+    assert_eq!(g.surfaced, Some(true));
 }
 
 #[test]
-fn no_grooming_artifact_when_none_on_disk() {
+fn receipt_fields_win_over_artifact_fallback() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    request_groom(&dir, &item.ticket_id, "codex", "readiness");
+    // Receipt carries authoritative readiness + path.
+    events::append_event(&vault_root(&dir), "dom", "proj", &KanbanEvent::GroomCompleted {
+        ticket_id: item.ticket_id.clone(),
+        artifact_path: Some("dom/proj/docs/grooming/receipt-path.md".into()),
+        readiness: Some("design_needed".into()), surfaced: Some(false),
+        work_item_id: Some(7), cost_usd: Some(0.42), timestamp: "2026-06-03T19:00:00Z".into(),
+    }).unwrap();
+    // A different on-disk artifact also exists — must NOT override the receipt.
+    let groom_dir = vault_root(&dir).join("dom").join("proj").join("docs").join("grooming");
+    std::fs::create_dir_all(&groom_dir).unwrap();
+    std::fs::write(groom_dir.join(format!("{}-grooming-20260603182519.md", item.ticket_id)), "- readiness: audit_needed\n- surface_to_jack: true\n").unwrap();
+
+    let g = store.get_item(&item.ticket_id).unwrap().grooming.unwrap();
+    assert_eq!(g.status, "completed");
+    assert_eq!(g.readiness.as_deref(), Some("design_needed"), "receipt readiness wins");
+    assert_eq!(g.artifact_path.as_deref(), Some("dom/proj/docs/grooming/receipt-path.md"), "receipt path wins");
+    assert_eq!(g.surfaced, Some(false));
+    assert_eq!(g.work_item_id, Some(7));
+}
+
+#[test]
+fn no_grooming_when_no_events_and_no_artifact() {
     let (_dir, store) = make_store();
     let pf = HashMap::new();
     let item = store.create_item("Plain", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
-    let got = store.get_item(&item.ticket_id).unwrap();
-    assert!(got.grooming_artifact.is_none());
+    assert!(store.get_item(&item.ticket_id).unwrap().grooming.is_none());
 }

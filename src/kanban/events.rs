@@ -453,7 +453,10 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
 pub struct Grooming {
     /// "requested" | "completed" | "failed"
     pub status: String,
-    pub requested_at: String,
+    /// When grooming was requested. `None` for a standalone artifact discovered on
+    /// disk with no request event (e.g. a manual groomer run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -489,7 +492,7 @@ pub fn grooming_for_ticket(events: &[KanbanEvent], ticket_id: &str) -> Option<Gr
             KanbanEvent::GroomRequested { ticket_id: t, requested_by, reason, timestamp } if t == ticket_id => {
                 g = Some(Grooming {
                     status: "requested".into(),
-                    requested_at: timestamp.clone(),
+                    requested_at: Some(timestamp.clone()),
                     requested_by: requested_by.clone(),
                     reason: reason.clone(),
                     completed_at: None,
@@ -758,7 +761,7 @@ mod tests {
         let g = grooming_for_ticket(&events, "CM-107").unwrap();
         assert_eq!(g.status, "completed");
         assert_eq!(g.requested_by.as_deref(), Some("codex"));
-        assert_eq!(g.requested_at, "2026-06-03T18:00:00Z");
+        assert_eq!(g.requested_at.as_deref(), Some("2026-06-03T18:00:00Z"));
         assert_eq!(g.completed_at.as_deref(), Some("2026-06-03T18:05:00Z"));
         assert_eq!(g.readiness.as_deref(), Some("design_needed"));
         assert_eq!(g.surfaced, Some(true));
@@ -809,7 +812,7 @@ mod tests {
         });
         let g = grooming_for_ticket(&events, "CM-9").unwrap();
         assert_eq!(g.status, "requested");
-        assert_eq!(g.requested_at, "2026-06-03T19:00:00Z");
+        assert_eq!(g.requested_at.as_deref(), Some("2026-06-03T19:00:00Z"));
         assert!(has_pending_groom(&events, "CM-9"));
     }
 

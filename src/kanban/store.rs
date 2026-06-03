@@ -38,16 +38,13 @@ pub struct KanbanItem {
     pub activity: Vec<ActivityEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children_activity: Vec<ActivityEntry>,
-    /// Async grooming provenance, folded from groom_* events at read time.
-    /// `None` for tickets with no grooming history.
+    /// Grooming readiness/status, surfaced inline at read time. Sourced from
+    /// receipt events when present, and otherwise resolved from the latest
+    /// on-disk artifact (`docs/grooming/<ticket>-grooming-*.md`) so the ticket
+    /// always carries a readable pointer (`artifact_path`) plus readiness.
+    /// `None` for tickets with no grooming at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grooming: Option<crate::kanban::events::Grooming>,
-    /// Vault-relative path to the latest grooming artifact on disk, resolved by
-    /// the `docs/grooming/<ticket>-grooming-*.md` convention. Populated even when
-    /// no receipt event exists, so an agent can read the artifact directly via
-    /// `wardwell_search action:read`. `None` when no artifact is present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grooming_artifact: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -280,7 +277,7 @@ impl KanbanStore {
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), parent: parent.map(str::to_string), position: None, children: vec![],
             tags: tags_vec, created_at: now.clone(), updated_at: now,
-            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
         })
     }
 
@@ -491,9 +488,39 @@ impl KanbanStore {
 
             // Fold grooming provenance from groom_* events (metadata, not notes).
             item.grooming = events::grooming_for_ticket(&all_events, ticket_id);
-            // Resolve the latest grooming artifact on disk by convention, so an
-            // agent can pull it up even before (or without) a receipt event.
-            item.grooming_artifact = latest_grooming_artifact(&self.vault_root, &domain, &project, ticket_id);
+            // Surface a readable pointer inline: prefer the receipt's fields, but
+            // fall back to the latest on-disk artifact (path by convention, plus
+            // readiness/surfaced parsed from its header) so a manually-groomed
+            // ticket — or one whose receipt hasn't landed — still shows readiness
+            // and a path on the ticket.
+            if let Some(path) = latest_grooming_artifact(&self.vault_root, &domain, &project, ticket_id) {
+                let (readiness, surfaced) = parse_grooming_header(&self.vault_root, &path);
+                match item.grooming.as_mut() {
+                    Some(g) => {
+                        if g.artifact_path.is_none() { g.artifact_path = Some(path); }
+                        if g.readiness.is_none() { g.readiness = readiness; }
+                        if g.surfaced.is_none() { g.surfaced = surfaced; }
+                    }
+                    None => {
+                        // Artifact on disk with no groom events at all (manual run):
+                        // grooming clearly happened and produced output.
+                        item.grooming = Some(crate::kanban::events::Grooming {
+                            status: "completed".into(),
+                            requested_at: None,
+                            requested_by: None,
+                            reason: None,
+                            completed_at: None,
+                            failed_at: None,
+                            readiness,
+                            artifact_path: Some(path),
+                            surfaced,
+                            work_item_id: None,
+                            cost_usd: None,
+                            error: None,
+                        });
+                    }
+                }
+            }
 
             // Children activity: last 2 events per child
             if !item.children.is_empty() {
@@ -562,7 +589,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -629,7 +656,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -681,7 +708,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -713,7 +740,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -768,7 +795,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -1007,7 +1034,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None, grooming_artifact: None,
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             }),
         ).optional()?;
         let mut item = item.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
@@ -1148,6 +1175,37 @@ fn latest_grooming_artifact(vault_root: &Path, domain: &str, project: &str, tick
         }
     }
     newest.map(|name| format!("{domain}/{project}/docs/grooming/{name}"))
+}
+
+/// Parse `readiness` and `surface_to_jack` from a grooming artifact's header.
+/// The groomer writes a stable preamble:
+///   - readiness: build_prompt_needed
+///   - surface_to_jack: true
+/// Returns `(readiness, surfaced)`; either may be `None` if absent/unreadable.
+fn parse_grooming_header(vault_root: &Path, rel_path: &str) -> (Option<String>, Option<bool>) {
+    let full = vault_root.join(rel_path);
+    let content = match std::fs::read_to_string(&full) {
+        Ok(c) => c,
+        Err(_) => return (None, None),
+    };
+    let mut readiness = None;
+    let mut surfaced = None;
+    // Only scan the header region; stop once findings/prose begin.
+    for line in content.lines().take(40) {
+        let l = line.trim_start_matches(['-', ' ', '*']).trim();
+        if let Some(rest) = l.strip_prefix("readiness:") {
+            if readiness.is_none() { readiness = Some(rest.trim().to_string()); }
+        } else if let Some(rest) = l.strip_prefix("surface_to_jack:") {
+            if surfaced.is_none() {
+                surfaced = match rest.trim() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                };
+            }
+        }
+    }
+    (readiness, surfaced)
 }
 
 fn mime_from_ext(filename: &str) -> String {
