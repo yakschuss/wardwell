@@ -238,6 +238,10 @@ pub struct KanbanParams {
     // -- plan fields --
     #[schemars(description = "For plan: root parent/epic ticket ID to organize (e.g., 'CM-2'). Gathers its descendant subtree, relationship neighbors, and attached open questions.")]
     pub root_ticket_id: Option<String>,
+
+    // -- groom fields --
+    #[schemars(description = "For groom: agent/source requesting grooming (e.g., 'codex'). Optional provenance.")]
+    pub requested_by: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -400,7 +404,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions. Planning: plan (read-only execution map for a root_ticket_id, epic, or whole project — buckets work into current_center, next_recommended, safety_companions, gates_before_externalization, parallel_tracks, later_expansion, blocked_or_parked, with open_questions and suggested_relationships; mutates nothing).")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions. Planning: plan (read-only execution map for a root_ticket_id, epic, or whole project — buckets work into current_center, next_recommended, safety_companions, gates_before_externalization, parallel_tracks, later_expansion, blocked_or_parked, with open_questions and suggested_relationships; mutates nothing). Grooming: groom (async request — appends a groom_requested event for a ticket_id, or up to `limit` tickets in a project; does NOT run Claude, call the service, wait, or mutate the ticket; the always-on vault service processes it later and the receipt shows on the ticket's `grooming` field).")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -437,7 +441,8 @@ impl WardwellServer {
             "reality_check" => self.kanban_reality_check(kanban, &p),
             "hygiene_suggestions" => self.kanban_hygiene_suggestions(kanban, &p),
             "plan" => self.kanban_plan(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan")),
+            "groom" => self.kanban_groom(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan, groom")),
         }
     }
 
@@ -3283,6 +3288,115 @@ impl WardwellServer {
             &opts,
         );
         serde_json::to_string_pretty(&map).unwrap_or_default()
+    }
+
+    /// Request asynchronous grooming. This is a durable kanban request, NOT an RPC:
+    /// it appends a `groom_requested` event and returns immediately. It does not run
+    /// Claude, does not call the vault service, and does not mutate the ticket. The
+    /// always-on service consumes the request later and appends a receipt.
+    fn kanban_groom(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        // Single-ticket form: ticket_id provided.
+        if let Some(ref ticket_id) = p.ticket_id {
+            let Some((domain, project)) = self.lookup_item_domain(kanban, ticket_id) else {
+                return json_error(&format!("ticket '{}' not found", ticket_id));
+            };
+            if let Err(e) = self.check_kanban_domain_access(&domain) {
+                return json_error(&e);
+            }
+            return self.request_groom_one(&domain, &project, ticket_id, p);
+        }
+
+        // Batch form: project provided, request grooming for up to `limit` tickets.
+        let Some(ref project) = p.project else {
+            return json_error("'ticket_id' or 'project' is required for groom");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
+        let limit = p.limit.unwrap_or(3);
+        // Candidates: open (non-done) tickets, most-recently-updated first, that
+        // don't already have a pending grooming request.
+        let items = match kanban.list(Some(project), None, None, None, None, None, false, None) {
+            Ok(items) => items,
+            Err(e) => return json_error(&format!("failed to list tickets: {e}")),
+        };
+        let existing = crate::kanban::events::read_events(&self.vault_root, &domain, project);
+
+        let mut requested: Vec<String> = Vec::new();
+        let mut skipped_pending: Vec<String> = Vec::new();
+        for item in &items {
+            if requested.len() >= limit { break; }
+            if crate::kanban::events::has_pending_groom(&existing, &item.ticket_id) {
+                skipped_pending.push(item.ticket_id.clone());
+                continue;
+            }
+            let event = crate::kanban::events::KanbanEvent::GroomRequested {
+                ticket_id: item.ticket_id.clone(),
+                requested_by: p.requested_by.clone().or_else(|| p.source.clone()),
+                reason: p.reason.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = crate::kanban::events::append_event(&self.vault_root, &domain, project, &event) {
+                return json_error(&format!("failed to write groom_requested for {}: {e}", item.ticket_id));
+            }
+            let _ = crate::kanban::audit::append_ticket_log(
+                &self.vault_root, &domain, project, &format!("{} groom_requested", item.ticket_id),
+            );
+            requested.push(item.ticket_id.clone());
+        }
+
+        serde_json::to_string(&serde_json::json!({
+            "requested": true,
+            "project": project,
+            "event": "groom_requested",
+            "count": requested.len(),
+            "ticket_ids": requested,
+            "skipped_already_pending": skipped_pending,
+            "mutated_ticket": false,
+            "message": "Grooming requested. The vault service will process these asynchronously.",
+        })).unwrap_or_default()
+    }
+
+    fn request_groom_one(&self, domain: &str, project: &str, ticket_id: &str, p: &KanbanParams) -> String {
+        let existing = crate::kanban::events::read_events(&self.vault_root, domain, project);
+        // Dedupe: don't stack a second pending request on the same ticket.
+        if crate::kanban::events::has_pending_groom(&existing, ticket_id) {
+            return serde_json::to_string(&serde_json::json!({
+                "requested": true,
+                "ticket_id": ticket_id,
+                "event": "groom_requested",
+                "already_pending": true,
+                "mutated_ticket": false,
+                "message": "Grooming already requested for this ticket and not yet processed; not duplicated.",
+            })).unwrap_or_default();
+        }
+        let event = crate::kanban::events::KanbanEvent::GroomRequested {
+            ticket_id: ticket_id.to_string(),
+            requested_by: p.requested_by.clone().or_else(|| p.source.clone()),
+            reason: p.reason.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = crate::kanban::events::append_event(&self.vault_root, domain, project, &event) {
+            return json_error(&format!("failed to write groom_requested: {e}"));
+        }
+        let _ = crate::kanban::audit::append_ticket_log(
+            &self.vault_root, domain, project, &format!("{ticket_id} groom_requested"),
+        );
+        serde_json::to_string(&serde_json::json!({
+            "requested": true,
+            "ticket_id": ticket_id,
+            "event": "groom_requested",
+            "mutated_ticket": false,
+            "message": "Grooming requested. The vault service will process this asynchronously.",
+        })).unwrap_or_default()
     }
 
     fn infer_domain_for_project(&self, project: &str) -> Option<String> {

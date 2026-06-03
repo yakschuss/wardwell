@@ -38,6 +38,10 @@ pub struct KanbanItem {
     pub activity: Vec<ActivityEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children_activity: Vec<ActivityEntry>,
+    /// Async grooming provenance, folded from groom_* events at read time.
+    /// `None` for tickets with no grooming history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grooming: Option<crate::kanban::events::Grooming>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -270,7 +274,7 @@ impl KanbanStore {
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), parent: parent.map(str::to_string), position: None, children: vec![],
             tags: tags_vec, created_at: now.clone(), updated_at: now,
-            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
         })
     }
 
@@ -479,6 +483,9 @@ impl KanbanStore {
                 .map(|e| event_to_activity(e, None))
                 .collect();
 
+            // Fold grooming provenance from groom_* events (metadata, not notes).
+            item.grooming = events::grooming_for_ticket(&all_events, ticket_id);
+
             // Children activity: last 2 events per child
             if !item.children.is_empty() {
                 let child_ids: Vec<&str> = item.children.iter().map(|c| c.ticket_id.as_str()).collect();
@@ -546,7 +553,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -613,7 +620,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -665,7 +672,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -697,7 +704,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -752,7 +759,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
 
@@ -991,7 +998,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
-                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![],
+                notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             }),
         ).optional()?;
         let mut item = item.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))?;
@@ -1095,6 +1102,15 @@ fn event_to_activity(event: &events::KanbanEvent, ticket_override: Option<&str>)
         events::KanbanEvent::Attach { filename, .. } => ("attach", filename.clone()),
         events::KanbanEvent::Detach { attachment_id, .. } => ("detach", attachment_id.clone()),
         events::KanbanEvent::Reorder { data, .. } => ("reorder", format!("position {}", data.position)),
+        events::KanbanEvent::GroomRequested { reason, .. } => {
+            ("groom_requested", reason.clone().unwrap_or_else(|| "grooming requested".into()))
+        }
+        events::KanbanEvent::GroomCompleted { readiness, .. } => {
+            ("groom_completed", readiness.clone().unwrap_or_else(|| "grooming completed".into()))
+        }
+        events::KanbanEvent::GroomFailed { error, .. } => {
+            ("groom_failed", error.clone().unwrap_or_else(|| "grooming failed".into()))
+        }
     };
     ActivityEntry {
         ticket_id: ticket_override.map(String::from),

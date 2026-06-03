@@ -8,6 +8,7 @@ use wardwell::kanban::proposals::{self, ProposalEvent, Proposal, ProposalStatus,
 use wardwell::kanban::verification::{self, VerificationEvent, Verification, VerificationSource, Confidence};
 use wardwell::kanban::reality_check::{self, RealityCheckOptions};
 use wardwell::kanban::plan::{self, PlanOptions};
+use wardwell::kanban::events::{self, KanbanEvent};
 
 fn make_store() -> (tempfile::TempDir, KanbanStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -2144,4 +2145,183 @@ fn plan_downstream_relationship_drives_next() {
         .unwrap_or_else(|| panic!("ticket fed by the active center should be next_recommended"));
     assert!(it.why_here.to_lowercase().contains("downstream") || it.evidence.iter().any(|e| e.to_lowercase().contains("downstream")),
         "should explain it is downstream of the center: why={} ev={:?}", it.why_here, it.evidence);
+}
+
+// ===== v0.10.5: async grooming requests + receipts =====
+
+/// What the Wardwell `groom` handler does internally: append a groom_requested
+/// event. Mirrored here so we test the durable protocol end-to-end via the store.
+fn request_groom(dir: &tempfile::TempDir, ticket_id: &str, by: &str, reason: &str) {
+    let ev = KanbanEvent::GroomRequested {
+        ticket_id: ticket_id.into(),
+        requested_by: Some(by.into()),
+        reason: Some(reason.into()),
+        timestamp: "2026-06-03T18:00:00Z".into(),
+    };
+    events::append_event(&vault_root(dir), "dom", "proj", &ev).unwrap();
+}
+
+#[test]
+fn groom_request_appends_event_and_get_shows_requested() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing accumulator", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+
+    // No grooming yet.
+    assert!(store.get_item(&item.ticket_id).unwrap().grooming.is_none());
+
+    request_groom(&dir, &item.ticket_id, "codex", "Check build readiness after new note");
+
+    // The event landed in the kanban.jsonl event log.
+    let evs = events::read_events(&vault_root(&dir), "dom", "proj");
+    assert!(evs.iter().any(|e| matches!(e, KanbanEvent::GroomRequested { ticket_id, .. } if ticket_id == &item.ticket_id)));
+
+    // get exposes grooming.status = requested with provenance.
+    let got = store.get_item(&item.ticket_id).unwrap();
+    let g = got.grooming.expect("grooming metadata present");
+    assert_eq!(g.status, "requested");
+    assert_eq!(g.requested_by.as_deref(), Some("codex"));
+    assert_eq!(g.reason.as_deref(), Some("Check build readiness after new note"));
+    assert!(g.completed_at.is_none() && g.failed_at.is_none());
+}
+
+#[test]
+fn groom_completed_receipt_replays_on_get() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing accumulator", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    request_groom(&dir, &item.ticket_id, "codex", "readiness");
+
+    // The vault service appends a completion receipt (simulated here).
+    events::append_event(&vault_root(&dir), "dom", "proj", &KanbanEvent::GroomCompleted {
+        ticket_id: item.ticket_id.clone(),
+        artifact_path: Some("personal/corr-platform/docs/grooming/CM-107-grooming-20260603.md".into()),
+        readiness: Some("design_needed".into()),
+        surfaced: Some(true),
+        work_item_id: Some(123),
+        cost_usd: Some(0.27),
+        timestamp: "2026-06-03T18:05:00Z".into(),
+    }).unwrap();
+
+    let g = store.get_item(&item.ticket_id).unwrap().grooming.expect("grooming present");
+    assert_eq!(g.status, "completed");
+    assert_eq!(g.readiness.as_deref(), Some("design_needed"));
+    assert_eq!(g.artifact_path.as_deref(), Some("personal/corr-platform/docs/grooming/CM-107-grooming-20260603.md"));
+    assert_eq!(g.surfaced, Some(true));
+    assert_eq!(g.work_item_id, Some(123));
+    assert_eq!(g.cost_usd, Some(0.27));
+}
+
+#[test]
+fn groom_failed_receipt_replays_on_get() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing accumulator", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    request_groom(&dir, &item.ticket_id, "codex", "readiness");
+    events::append_event(&vault_root(&dir), "dom", "proj", &KanbanEvent::GroomFailed {
+        ticket_id: item.ticket_id.clone(),
+        error: Some("invalid grooming JSON".into()),
+        timestamp: "2026-06-03T18:05:00Z".into(),
+    }).unwrap();
+
+    let g = store.get_item(&item.ticket_id).unwrap().grooming.expect("grooming present");
+    assert_eq!(g.status, "failed");
+    assert_eq!(g.error.as_deref(), Some("invalid grooming JSON"));
+    assert!(g.completed_at.is_none());
+}
+
+#[test]
+fn groom_metadata_does_not_appear_as_note() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing accumulator", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    let notes_before = store.get_item(&item.ticket_id).unwrap().notes.len();
+
+    request_groom(&dir, &item.ticket_id, "codex", "readiness");
+    events::append_event(&vault_root(&dir), "dom", "proj", &KanbanEvent::GroomCompleted {
+        ticket_id: item.ticket_id.clone(), artifact_path: None, readiness: Some("ready".into()),
+        surfaced: None, work_item_id: None, cost_usd: None, timestamp: "2026-06-03T18:05:00Z".into(),
+    }).unwrap();
+
+    let got = store.get_item(&item.ticket_id).unwrap();
+    assert_eq!(got.notes.len(), notes_before, "grooming events must not add notes");
+    assert!(!got.notes.iter().any(|n| n.text.to_lowercase().contains("groom")), "no grooming text in notes");
+    // It IS surfaced as grooming metadata though.
+    assert!(got.grooming.is_some());
+}
+
+#[test]
+fn groom_request_is_deduped_while_pending() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing accumulator", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+    request_groom(&dir, &item.ticket_id, "codex", "first");
+
+    // The handler checks has_pending_groom before appending — simulate that guard.
+    let evs = events::read_events(&vault_root(&dir), "dom", "proj");
+    assert!(events::has_pending_groom(&evs, &item.ticket_id), "a request with no receipt is pending → second request should be skipped");
+
+    // After a receipt, a new request is allowed again.
+    events::append_event(&vault_root(&dir), "dom", "proj", &KanbanEvent::GroomCompleted {
+        ticket_id: item.ticket_id.clone(), artifact_path: None, readiness: Some("ready".into()),
+        surfaced: None, work_item_id: None, cost_usd: None, timestamp: "2026-06-03T18:05:00Z".into(),
+    }).unwrap();
+    let evs = events::read_events(&vault_root(&dir), "dom", "proj");
+    assert!(!events::has_pending_groom(&evs, &item.ticket_id));
+}
+
+#[test]
+fn existing_tickets_without_grooming_replay_unchanged() {
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Plain ticket", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    // Rebuild from JSONL (the path that re-parses every event) must still work and
+    // produce no grooming for a ticket that never had a groom event.
+    store.rebuild_from_jsonl().unwrap();
+    let got = store.get_item(&item.ticket_id).unwrap();
+    assert!(got.grooming.is_none());
+    assert_eq!(got.status, "todo");
+    let _ = &dir;
+}
+
+#[test]
+fn service_consumption_round_trip() {
+    // Simulates the full async protocol from Wardwell's side: an agent requests
+    // grooming; the always-on service later consumes the pending request and
+    // appends a receipt; a fresh get reflects the receipt. (The actual
+    // KanbanGroomer/TickRunner consumer lives in the vault-claude-sync repo.)
+    let (dir, store) = make_store();
+    let pf = HashMap::new();
+    let item = store.create_item("Billing accumulator", "proj", "dom", None, Some("todo"), Some("high"), None, None, None, None, None, None, &pf).unwrap();
+
+    // 1. Agent requests grooming.
+    request_groom(&dir, &item.ticket_id, "codex", "readiness");
+    assert_eq!(store.get_item(&item.ticket_id).unwrap().grooming.unwrap().status, "requested");
+
+    // 2. Service scans for pending requests with no later receipt.
+    let evs = events::read_events(&vault_root(&dir), "dom", "proj");
+    let pending: Vec<&str> = ["proj"].iter()
+        .flat_map(|_| evs.iter())
+        .filter_map(|e| match e {
+            KanbanEvent::GroomRequested { ticket_id, .. } if events::has_pending_groom(&evs, ticket_id) => Some(ticket_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(pending.contains(&item.ticket_id.as_str()), "service should see the pending request");
+
+    // 3. Service appends a completion receipt (no ticket mutation).
+    let status_before = store.get_item(&item.ticket_id).unwrap().status.clone();
+    events::append_event(&vault_root(&dir), "dom", "proj", &KanbanEvent::GroomCompleted {
+        ticket_id: item.ticket_id.clone(),
+        artifact_path: Some("personal/corr-platform/docs/grooming/g.md".into()),
+        readiness: Some("design_needed".into()), surfaced: Some(true),
+        work_item_id: Some(123), cost_usd: Some(0.27), timestamp: "2026-06-03T18:05:00Z".into(),
+    }).unwrap();
+
+    // 4. Fresh get reflects the receipt; ticket status is untouched.
+    let got = store.get_item(&item.ticket_id).unwrap();
+    assert_eq!(got.grooming.unwrap().status, "completed");
+    assert_eq!(got.status, status_before, "grooming must not change ticket status");
+    let evs = events::read_events(&vault_root(&dir), "dom", "proj");
+    assert!(!events::has_pending_groom(&evs, &item.ticket_id), "request is now satisfied");
 }

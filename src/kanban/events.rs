@@ -82,6 +82,41 @@ pub enum KanbanEvent {
         data: ReorderData,
         timestamp: String,
     },
+    /// Async grooming request — appended by any agent via `wardwell_kanban groom`.
+    /// Does NOT mutate the ticket; the always-on vault service consumes it later.
+    #[serde(rename = "groom_requested")]
+    GroomRequested {
+        ticket_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        requested_by: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        timestamp: String,
+    },
+    /// Grooming receipt — appended by the vault service after a successful run.
+    #[serde(rename = "groom_completed")]
+    GroomCompleted {
+        ticket_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifact_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        readiness: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        surfaced: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        work_item_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        timestamp: String,
+    },
+    /// Grooming receipt — appended by the vault service after a failed run.
+    #[serde(rename = "groom_failed")]
+    GroomFailed {
+        ticket_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        timestamp: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,7 +137,10 @@ impl KanbanEvent {
             | Self::Archive { ticket_id, .. }
             | Self::Attach { ticket_id, .. }
             | Self::Detach { ticket_id, .. }
-            | Self::Reorder { ticket_id, .. } => ticket_id,
+            | Self::Reorder { ticket_id, .. }
+            | Self::GroomRequested { ticket_id, .. }
+            | Self::GroomCompleted { ticket_id, .. }
+            | Self::GroomFailed { ticket_id, .. } => ticket_id,
         }
     }
 
@@ -115,7 +153,10 @@ impl KanbanEvent {
             | Self::Archive { timestamp, .. }
             | Self::Attach { timestamp, .. }
             | Self::Detach { timestamp, .. }
-            | Self::Reorder { timestamp, .. } => timestamp,
+            | Self::Reorder { timestamp, .. }
+            | Self::GroomRequested { timestamp, .. }
+            | Self::GroomCompleted { timestamp, .. }
+            | Self::GroomFailed { timestamp, .. } => timestamp,
         }
     }
 }
@@ -394,10 +435,105 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     item.updated_at = timestamp.clone();
                 }
             }
+            // Grooming events are provenance/metadata only — they never mutate
+            // ticket state and must NOT become notes. Replay exposes them via
+            // `grooming_for_ticket`, not through the materialized item.
+            KanbanEvent::GroomRequested { .. }
+            | KanbanEvent::GroomCompleted { .. }
+            | KanbanEvent::GroomFailed { .. } => {}
         }
     }
 
     items.into_values().collect()
+}
+
+/// Grooming provenance for a single ticket, folded from its groom_* events.
+/// This is metadata, not a note — it is surfaced on the ticket's `grooming` field.
+#[derive(Debug, Clone, Serialize)]
+pub struct Grooming {
+    /// "requested" | "completed" | "failed"
+    pub status: String,
+    pub requested_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub surfaced: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_item_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Fold a ticket's grooming events into its current grooming state.
+///
+/// The latest `groom_requested` defines the active request; a `groom_completed`
+/// or `groom_failed` appended after it becomes the receipt. A fresh request after
+/// a receipt re-opens grooming (status back to "requested"). Returns `None` for
+/// tickets with no grooming history, so existing tickets replay unchanged.
+pub fn grooming_for_ticket(events: &[KanbanEvent], ticket_id: &str) -> Option<Grooming> {
+    let mut g: Option<Grooming> = None;
+    for event in events {
+        match event {
+            KanbanEvent::GroomRequested { ticket_id: t, requested_by, reason, timestamp } if t == ticket_id => {
+                g = Some(Grooming {
+                    status: "requested".into(),
+                    requested_at: timestamp.clone(),
+                    requested_by: requested_by.clone(),
+                    reason: reason.clone(),
+                    completed_at: None,
+                    failed_at: None,
+                    readiness: None,
+                    artifact_path: None,
+                    surfaced: None,
+                    work_item_id: None,
+                    cost_usd: None,
+                    error: None,
+                });
+            }
+            KanbanEvent::GroomCompleted { ticket_id: t, artifact_path, readiness, surfaced, work_item_id, cost_usd, timestamp } if t == ticket_id => {
+                if let Some(g) = g.as_mut() {
+                    g.status = "completed".into();
+                    g.completed_at = Some(timestamp.clone());
+                    g.failed_at = None;
+                    g.error = None;
+                    g.artifact_path = artifact_path.clone();
+                    g.readiness = readiness.clone();
+                    g.surfaced = *surfaced;
+                    g.work_item_id = *work_item_id;
+                    g.cost_usd = *cost_usd;
+                }
+                // An orphan receipt with no prior request is ignored.
+            }
+            KanbanEvent::GroomFailed { ticket_id: t, error, timestamp } if t == ticket_id => {
+                if let Some(g) = g.as_mut() {
+                    g.status = "failed".into();
+                    g.failed_at = Some(timestamp.clone());
+                    g.completed_at = None;
+                    g.error = error.clone();
+                }
+            }
+            _ => {}
+        }
+    }
+    g
+}
+
+/// True if the ticket has an outstanding grooming request (no receipt yet).
+/// Used to dedupe repeated requests so the queue can't grow unbounded.
+pub fn has_pending_groom(events: &[KanbanEvent], ticket_id: &str) -> bool {
+    matches!(grooming_for_ticket(events, ticket_id), Some(g) if g.status == "requested")
 }
 
 #[cfg(test)]
@@ -573,5 +709,132 @@ mod tests {
         assert_eq!(item.assignee.as_deref(), Some("jack"));
         assert!(item.completed_at.is_some());
         assert_eq!(item.notes.len(), 3); // 2 move notes + 1 manual note
+    }
+
+    // ---- v0.10.5: grooming events ----
+
+    #[test]
+    fn groom_requested_roundtrips() {
+        let e = KanbanEvent::GroomRequested {
+            ticket_id: "CM-107".into(),
+            requested_by: Some("codex".into()),
+            reason: Some("Check build readiness after new note".into()),
+            timestamp: "2026-06-03T18:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(json.contains("\"event\":\"groom_requested\""));
+        let parsed: KanbanEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.ticket_id(), "CM-107");
+    }
+
+    #[test]
+    fn grooming_none_without_events() {
+        let events = vec![KanbanEvent::Create {
+            group: None, epic: None, parent: None, tags: vec![],
+            ticket_id: "CM-1".into(), title: "X".into(), project: "corr".into(),
+            status: "todo".into(), priority: "medium".into(),
+            description: None, deadline: None, assignee: None, source: None,
+            timestamp: "2026-06-03T00:00:00Z".into(),
+        }];
+        assert!(grooming_for_ticket(&events, "CM-1").is_none());
+        assert!(!has_pending_groom(&events, "CM-1"));
+    }
+
+    #[test]
+    fn grooming_fold_requested_then_completed() {
+        let events = vec![
+            KanbanEvent::GroomRequested {
+                ticket_id: "CM-107".into(), requested_by: Some("codex".into()),
+                reason: Some("readiness".into()), timestamp: "2026-06-03T18:00:00Z".into(),
+            },
+            KanbanEvent::GroomCompleted {
+                ticket_id: "CM-107".into(),
+                artifact_path: Some("personal/corr-platform/docs/grooming/CM-107.md".into()),
+                readiness: Some("design_needed".into()),
+                surfaced: Some(true), work_item_id: Some(123), cost_usd: Some(0.27),
+                timestamp: "2026-06-03T18:05:00Z".into(),
+            },
+        ];
+        let g = grooming_for_ticket(&events, "CM-107").unwrap();
+        assert_eq!(g.status, "completed");
+        assert_eq!(g.requested_by.as_deref(), Some("codex"));
+        assert_eq!(g.requested_at, "2026-06-03T18:00:00Z");
+        assert_eq!(g.completed_at.as_deref(), Some("2026-06-03T18:05:00Z"));
+        assert_eq!(g.readiness.as_deref(), Some("design_needed"));
+        assert_eq!(g.surfaced, Some(true));
+        assert_eq!(g.work_item_id, Some(123));
+        assert_eq!(g.cost_usd, Some(0.27));
+        assert!(g.error.is_none());
+        assert!(!has_pending_groom(&events, "CM-107"));
+    }
+
+    #[test]
+    fn grooming_fold_failed() {
+        let events = vec![
+            KanbanEvent::GroomRequested {
+                ticket_id: "CM-107".into(), requested_by: None, reason: None,
+                timestamp: "2026-06-03T18:00:00Z".into(),
+            },
+            KanbanEvent::GroomFailed {
+                ticket_id: "CM-107".into(), error: Some("invalid grooming JSON".into()),
+                timestamp: "2026-06-03T18:05:00Z".into(),
+            },
+        ];
+        let g = grooming_for_ticket(&events, "CM-107").unwrap();
+        assert_eq!(g.status, "failed");
+        assert_eq!(g.failed_at.as_deref(), Some("2026-06-03T18:05:00Z"));
+        assert_eq!(g.error.as_deref(), Some("invalid grooming JSON"));
+        assert!(g.completed_at.is_none());
+    }
+
+    #[test]
+    fn grooming_pending_until_receipt_then_reopens() {
+        let mut events = vec![KanbanEvent::GroomRequested {
+            ticket_id: "CM-9".into(), requested_by: None, reason: None,
+            timestamp: "2026-06-03T18:00:00Z".into(),
+        }];
+        assert!(has_pending_groom(&events, "CM-9"), "request with no receipt is pending");
+
+        events.push(KanbanEvent::GroomCompleted {
+            ticket_id: "CM-9".into(), artifact_path: None, readiness: Some("ready".into()),
+            surfaced: None, work_item_id: None, cost_usd: None,
+            timestamp: "2026-06-03T18:05:00Z".into(),
+        });
+        assert!(!has_pending_groom(&events, "CM-9"), "completed → not pending");
+
+        // A fresh request after a receipt re-opens grooming.
+        events.push(KanbanEvent::GroomRequested {
+            ticket_id: "CM-9".into(), requested_by: None, reason: Some("re-groom".into()),
+            timestamp: "2026-06-03T19:00:00Z".into(),
+        });
+        let g = grooming_for_ticket(&events, "CM-9").unwrap();
+        assert_eq!(g.status, "requested");
+        assert_eq!(g.requested_at, "2026-06-03T19:00:00Z");
+        assert!(has_pending_groom(&events, "CM-9"));
+    }
+
+    #[test]
+    fn grooming_events_never_become_notes() {
+        let events = vec![
+            KanbanEvent::Create {
+                group: None, epic: None, parent: None, tags: vec![],
+                ticket_id: "CM-107".into(), title: "Billing".into(), project: "corr".into(),
+                status: "todo".into(), priority: "high".into(),
+                description: None, deadline: None, assignee: None, source: None,
+                timestamp: "2026-06-03T00:00:00Z".into(),
+            },
+            KanbanEvent::GroomRequested {
+                ticket_id: "CM-107".into(), requested_by: Some("codex".into()),
+                reason: Some("readiness".into()), timestamp: "2026-06-03T18:00:00Z".into(),
+            },
+            KanbanEvent::GroomCompleted {
+                ticket_id: "CM-107".into(), artifact_path: None, readiness: Some("ready".into()),
+                surfaced: Some(false), work_item_id: None, cost_usd: None,
+                timestamp: "2026-06-03T18:05:00Z".into(),
+            },
+        ];
+        let items = materialize("personal", &events);
+        assert_eq!(items.len(), 1, "groom events must not create phantom tickets");
+        assert!(items[0].notes.is_empty(), "grooming must not appear as notes");
     }
 }
