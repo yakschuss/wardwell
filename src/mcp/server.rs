@@ -3430,7 +3430,8 @@ impl ServerHandler for WardwellServer {
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
              wardwell_clipboard (copy to clipboard, ask first), \
-             wardwell_kanban (action: list|create|update|move|note|query|relationship_create|relationship_list|relationship_delete|question_create|question_list|question_update|question_answer|question_invalidate|proposal_create|proposal_get|proposal_list|proposal_approve|proposal_reject|proposal_apply|verify|reality_check — project kanban board with tickets, statuses, priorities, deadlines)."
+             wardwell_kanban (action: list|create|update|move|note|query|relationship_create|relationship_list|relationship_delete|question_create|question_list|question_update|question_answer|question_invalidate|proposal_create|proposal_get|proposal_list|proposal_approve|proposal_reject|proposal_apply|verify|reality_check|plan|groom — project kanban board with tickets, statuses, priorities, deadlines). \
+             GROOMING RULE: when you read a ticket (get), check item.grooming. If item.grooming.artifact_path is present, READ that artifact (wardwell_search action:read path:<artifact_path>) BEFORE planning or building — it is the latest readiness/DDD assessment for the ticket. Treat item.grooming.readiness (e.g. build_prompt_needed, design_needed, audit_needed, blocker) and item.grooming.surfaced as primary signals."
                 .to_string()
         } else {
             "Wardwell: Personal AI knowledge vault. Three tools: \
