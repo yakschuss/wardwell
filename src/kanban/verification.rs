@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,17 +81,9 @@ pub fn jsonl_path(vault_root: &Path, domain: &str, project: &str) -> PathBuf {
 }
 
 pub fn append_event(vault_root: &Path, domain: &str, project: &str, event: &VerificationEvent) -> Result<(), std::io::Error> {
-    let dir = vault_root.join(domain).join(project);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("verifications.jsonl");
-    let needs_schema = !path.exists() || path.metadata()?.len() == 0;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    if needs_schema {
-        writeln!(file, r#"{{"_schema":"verifications","_version":"1.0"}}"#)?;
-    }
+    let path = vault_root.join(domain).join(project).join("verifications.jsonl");
     let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    crate::kanban::jsonl::append_line(&path, Some(r#"{"_schema":"verifications","_version":"1.0"}"#), &line)
 }
 
 pub fn read_all(vault_root: &Path, domain: &str, project: &str) -> Vec<Verification> {

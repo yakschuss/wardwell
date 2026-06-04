@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,18 +165,9 @@ pub fn jsonl_path(vault_root: &Path, domain: &str, project: &str) -> PathBuf {
 }
 
 pub fn append_event(vault_root: &Path, domain: &str, project: &str, event: &KanbanEvent) -> Result<(), std::io::Error> {
-    let dir = vault_root.join(domain).join(project);
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("kanban.jsonl");
-
-    let needs_schema = !path.exists() || path.metadata()?.len() == 0;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    if needs_schema {
-        writeln!(file, r#"{{"_schema":"kanban","_version":"1.0"}}"#)?;
-    }
-    let line = serde_json::to_string(event).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    let path = vault_root.join(domain).join(project).join("kanban.jsonl");
+    let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
+    crate::kanban::jsonl::append_line(&path, Some(r#"{"_schema":"kanban","_version":"1.0"}"#), &line)
 }
 
 pub fn read_events(vault_root: &Path, domain: &str, project: &str) -> Vec<KanbanEvent> {
@@ -238,11 +228,9 @@ pub fn next_ticket_number(vault_root: &Path, domain: &str, project: &str, prefix
 
 /// Append a meta line with the current next_id for fast lookup.
 pub fn append_meta(vault_root: &Path, domain: &str, project: &str, prefix: &str, next_id: i64) -> Result<(), std::io::Error> {
-    let dir = vault_root.join(domain).join(project);
-    let path = dir.join("kanban.jsonl");
-    let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
-    writeln!(file, r#"{{"_meta":true,"prefix":"{prefix}","next_id":{next_id}}}"#)?;
-    Ok(())
+    let path = jsonl_path(vault_root, domain, project);
+    let line = format!(r#"{{"_meta":true,"prefix":"{prefix}","next_id":{next_id}}}"#);
+    crate::kanban::jsonl::append_line(&path, None, &line)
 }
 
 pub fn scan_all_jsonl(vault_root: &Path) -> Vec<(String, String, Vec<KanbanEvent>)> {
