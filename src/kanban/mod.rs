@@ -7,5 +7,6 @@ pub mod proposals;
 pub mod questions;
 pub mod reality_check;
 pub mod relationships;
+pub mod status;
 pub mod store;
 pub mod verification;

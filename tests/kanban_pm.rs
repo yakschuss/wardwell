@@ -9,6 +9,7 @@ use wardwell::kanban::verification::{self, VerificationEvent, Verification, Veri
 use wardwell::kanban::reality_check::{self, RealityCheckOptions};
 use wardwell::kanban::plan::{self, PlanOptions};
 use wardwell::kanban::events::{self, KanbanEvent};
+use wardwell::kanban::status::{self, StatusOptions};
 
 fn make_store() -> (tempfile::TempDir, KanbanStore) {
     let dir = tempfile::tempdir().unwrap();
@@ -2405,4 +2406,130 @@ fn no_grooming_when_no_events_and_no_artifact() {
     let pf = HashMap::new();
     let item = store.create_item("Plain", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
     assert!(store.get_item(&item.ticket_id).unwrap().grooming.is_none());
+}
+
+// ===== CR-18: macro status snapshot =====
+
+fn ws(tags: &[&str]) -> Vec<String> { tags.iter().map(|s| s.to_string()).collect() }
+
+/// A corr-platform-like board exercising every status section.
+fn make_status_fixture() -> (tempfile::TempDir, KanbanStore, std::collections::HashMap<String, String>) {
+    let (dir, store) = make_store();
+    let mut ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mk = |store: &KanbanStore, title: &str, status: &str, tags: Vec<String>| {
+        store.create_item(title, "proj", "dom", None, Some(status), Some("high"),
+            None, None, None, None, None, Some(tags.as_slice()), &HashMap::new()).unwrap().ticket_id
+    };
+    ids.insert("done".into(),    mk(&store, "Billing pulse", "done", ws(&["workstream:billing"])));
+    ids.insert("ip".into(),      mk(&store, "Notifications", "in_progress", ws(&["workstream:platform-core"])));
+    ids.insert("review".into(),  mk(&store, "Charge calc", "review", ws(&["workstream:platform-core"])));
+    ids.insert("todo".into(),    mk(&store, "Pilot backfill", "todo", ws(&["workstream:pilot"])));
+    ids.insert("uncat".into(),   mk(&store, "Mystery task", "in_progress", ws(&[])));
+    ids.insert("blocked".into(), mk(&store, "PCC access", "todo", ws(&["external-blocked", "workstream:integrations"])));
+    ids.insert("bk".into(),      mk(&store, "Someday thing", "backlog", ws(&[])));
+    ids.insert("parked".into(),  mk(&store, "Parked thing", "todo", ws(&["parked"])));
+    (dir, store, ids)
+}
+
+fn snapshot(store: &KanbanStore) -> status::StatusSnapshot {
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    status::build_snapshot("proj", "corrtex", &items, &now, &StatusOptions::default())
+}
+
+#[test]
+fn status_shipped_recently_selects_recent_done() {
+    let (_d, store, ids) = make_status_fixture();
+    let s = snapshot(&store);
+    assert_eq!(s.recently_shipped_count(), 1);
+    assert!(s.shipped_recently.iter().any(|t| t.ticket_id == ids["done"]));
+}
+
+#[test]
+fn status_building_now_grouped_by_workstream() {
+    let (_d, store, ids) = make_status_fixture();
+    let s = snapshot(&store);
+    let pc = s.building_now.iter().find(|g| g.workstream == "platform-core")
+        .expect("platform-core group present");
+    let pc_ids: Vec<&str> = pc.tickets.iter().map(|t| t.ticket_id.as_str()).collect();
+    assert!(pc_ids.contains(&ids["ip"].as_str()) && pc_ids.contains(&ids["review"].as_str()),
+        "in_progress + review grouped under platform-core: {pc_ids:?}");
+    // todo is not "building"; it shows under uncategorized/health, not building_now.
+    assert!(!s.building_now.iter().any(|g| g.tickets.iter().any(|t| t.ticket_id == ids["todo"])));
+}
+
+#[test]
+fn status_uncategorized_is_active_without_workstream_tag() {
+    let (_d, store, ids) = make_status_fixture();
+    let s = snapshot(&store);
+    let unc: Vec<&str> = s.uncategorized.iter().map(|t| t.ticket_id.as_str()).collect();
+    assert_eq!(unc, vec![ids["uncat"].as_str()], "only the untagged active ticket is uncategorized: {unc:?}");
+}
+
+#[test]
+fn status_blocked_from_tags() {
+    let (_d, store, ids) = make_status_fixture();
+    let s = snapshot(&store);
+    assert_eq!(s.blocked_count(), 1);
+    assert!(s.blocked.iter().any(|t| t.ticket_id == ids["blocked"]));
+}
+
+#[test]
+fn status_workstream_health_words() {
+    let (_d, store, _ids) = make_status_fixture();
+    let s = snapshot(&store);
+    assert_eq!(s.workstream_count(), 4, "billing, platform-core, pilot, integrations");
+    let word = |ws: &str| s.workstream_health.iter().find(|h| h.workstream == ws).map(|h| h.status_word.clone());
+    assert_eq!(word("billing").as_deref(), Some("Shipped"));
+    assert_eq!(word("platform-core").as_deref(), Some("Building"));
+    assert_eq!(word("pilot").as_deref(), Some("Mostly shaped"));
+    assert_eq!(word("integrations").as_deref(), Some("Blocked externally"));
+}
+
+#[test]
+fn status_scope_excludes_untagged_backlog_and_parked() {
+    let (_d, store, ids) = make_status_fixture();
+    let s = snapshot(&store);
+    let everywhere: Vec<&str> = s.shipped_recently.iter()
+        .chain(s.blocked.iter()).chain(s.uncategorized.iter())
+        .chain(s.building_now.iter().flat_map(|g| g.tickets.iter()))
+        .map(|t| t.ticket_id.as_str()).collect();
+    assert!(!everywhere.contains(&ids["bk"].as_str()), "untagged backlog is out of scope");
+    assert!(!everywhere.contains(&ids["parked"].as_str()), "parked work is excluded");
+    assert!(!s.workstream_health.iter().any(|h| h.workstream == "parked"));
+}
+
+#[test]
+fn status_render_has_all_sections_and_writes_artifact() {
+    let (dir, store, _ids) = make_status_fixture();
+    let s = snapshot(&store);
+    let md = status::render_markdown(&s);
+    for section in ["# CORRTEX Status", "## Executive Summary", "## Shipped Recently",
+                    "## Building Now", "## Blocked / Needs Help", "## Workstream Health",
+                    "## Uncategorized", "## Copy-Ready Slack Version"] {
+        assert!(md.contains(section), "rendered markdown missing section: {section}");
+    }
+    // No fake percentages.
+    assert!(!md.contains('%'), "status must not contain percentages");
+
+    // Artifact write path + round-trip.
+    let rel = status::artifact_relative_path("dom", "proj", "corrtex", &s.generated_at);
+    assert!(rel.starts_with("dom/proj/status/corrtex-status-") && rel.ends_with(".md"), "rel={rel}");
+    let abs = vault_root(&dir).join(&rel);
+    wardwell::kanban::jsonl::write_file(&abs, &md).unwrap();
+    let read_back = std::fs::read_to_string(&abs).unwrap();
+    assert!(read_back.contains("## Workstream Health"));
+}
+
+#[test]
+fn status_empty_project_is_safe() {
+    let (_d, store) = make_store();
+    let items = store.list(Some("proj"), None, None, None, None, None, true, None).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let s = status::build_snapshot("proj", "corrtex", &items, &now, &StatusOptions::default());
+    assert_eq!(s.recently_shipped_count(), 0);
+    assert_eq!(s.workstream_count(), 0);
+    assert!(s.executive_summary.iter().any(|b| b.contains("No active work")));
+    // renders without panicking
+    let _ = status::render_markdown(&s);
 }

@@ -40,6 +40,35 @@ pub fn append_line(path: &Path, schema_header: Option<&str>, line: &str) -> io::
     }
 }
 
+/// Write (overwrite) `contents` to `path`, creating parent dirs, with the same
+/// materialize+retry-on-EPERM resilience as `append_line`. Used for full-file
+/// artifacts (e.g. the status snapshot markdown) on the iCloud vault.
+pub fn write_file(path: &Path, contents: &str) -> io::Result<()> {
+    let mut backoff = INITIAL_BACKOFF;
+    let mut attempt = 0u32;
+    loop {
+        match try_write(path, contents) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                if !is_transient(&e) || attempt >= MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                materialize(path);
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
+fn try_write(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
+}
+
 fn try_append(path: &Path, schema_header: Option<&str>, line: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -101,6 +130,16 @@ mod tests {
         append_line(&path, None, r#"{"i":1}"#).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "{\"i\":1}\n");
+    }
+
+    #[test]
+    fn write_file_creates_dirs_and_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("status/corrtex-status-2026-06-10.md");
+        write_file(&p, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "first");
+        write_file(&p, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "second");
     }
 
     #[test]

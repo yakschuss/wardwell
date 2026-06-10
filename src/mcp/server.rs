@@ -242,6 +242,14 @@ pub struct KanbanParams {
     // -- groom fields --
     #[schemars(description = "For groom: agent/source requesting grooming (e.g., 'codex'). Optional provenance.")]
     pub requested_by: Option<String>,
+
+    // -- status fields --
+    #[schemars(description = "For status: platform/product name for the report title and filename (e.g., 'corrtex'). Defaults to the project slug.")]
+    pub platform: Option<String>,
+    #[schemars(description = "For status: window in days for the 'Shipped Recently' section. Default 7.")]
+    pub recent_days: Option<u64>,
+    #[schemars(description = "For status: include backlog tickets that aren't launch-scoped/blocked/workstream-tagged. Default false.")]
+    pub include_backlog: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -404,7 +412,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions. Planning: plan (read-only execution map for a root_ticket_id, epic, or whole project — buckets work into current_center, next_recommended, safety_companions, gates_before_externalization, parallel_tracks, later_expansion, blocked_or_parked, with open_questions and suggested_relationships; mutates nothing). Grooming: groom (async request — appends a groom_requested event for a ticket_id, or up to `limit` tickets in a project; does NOT run Claude, call the service, wait, or mutate the ticket; the always-on vault service processes it later and the receipt shows on the ticket's `grooming` field).")]
+    #[tool(description = "Project kanban board with structured PM primitives. Core: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap. Relationships: relationship_create, relationship_list, relationship_delete. Questions: question_create, question_list, question_update, question_answer, question_invalidate. Proposals: proposal_create (supports intent, rationale, context_transfers, closure_summary, reviewer_questions — returns risk_flags and review summary), proposal_get (returns proposal + summary + freshly-recomputed risk_flags), proposal_list (scannable per-proposal review metadata with risk counts and a short risk summary; set full=true for raw operations), proposal_approve, proposal_reject, proposal_apply. Verification: verify. Audit: reality_check (compact by default, set full=true for verbose), hygiene_suggestions. Planning: plan (read-only execution map for a root_ticket_id, epic, or whole project — buckets work into current_center, next_recommended, safety_companions, gates_before_externalization, parallel_tracks, later_expansion, blocked_or_parked, with open_questions and suggested_relationships; mutates nothing). Grooming: groom (async request — appends a groom_requested event for a ticket_id, or up to `limit` tickets in a project; does NOT run Claude, call the service, wait, or mutate the ticket; the always-on vault service processes it later and the receipt shows on the ticket's `grooming` field). Reporting: status (read-only macro snapshot — renders kanban state to a stakeholder markdown artifact under <project>/status/ grouped by workstream:* tags, with shipped-recently/building/blocked/uncategorized/workstream-health + a Slack version; returns a receipt with artifact_path and counts; mutates no tickets).")]
     async fn wardwell_kanban(&self, params: Parameters<KanbanParams>) -> String {
         let Some(ref kanban) = self.kanban else {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
@@ -442,7 +450,8 @@ impl WardwellServer {
             "hygiene_suggestions" => self.kanban_hygiene_suggestions(kanban, &p),
             "plan" => self.kanban_plan(kanban, &p),
             "groom" => self.kanban_groom(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan, groom")),
+            "status" => self.kanban_status(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan, groom, status")),
         }
     }
 
@@ -3290,6 +3299,62 @@ impl WardwellServer {
         serde_json::to_string_pretty(&map).unwrap_or_default()
     }
 
+    /// Generate a read-only macro status snapshot (CR-18): render kanban state to
+    /// a stakeholder-facing markdown artifact and return a receipt. Mutates no
+    /// tickets — it only writes the snapshot file.
+    fn kanban_status(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let Some(ref project) = p.project else {
+            return json_error("'project' is required for status");
+        };
+        let domain = match &p.domain {
+            Some(d) => d.clone(),
+            None => match self.infer_domain_for_project(project) {
+                Some(d) => d,
+                None => return json_error(&format!("cannot infer domain for project '{}'", project)),
+            },
+        };
+        if let Err(e) = self.check_kanban_domain_access(&domain) {
+            return json_error(&e);
+        }
+
+        let platform = p.platform.clone().unwrap_or_else(|| project.clone());
+        let opts = crate::kanban::status::StatusOptions {
+            recent_days: p.recent_days.unwrap_or(7),
+            include_backlog: p.include_backlog.unwrap_or(false),
+        };
+
+        // include_done so "Shipped Recently" can see completed tickets.
+        let items = match kanban.list(Some(project), None, None, None, None, None, true, None) {
+            Ok(items) => items,
+            Err(e) => return json_error(&format!("failed to list tickets: {e}")),
+        };
+
+        let generated_at = chrono::Utc::now().to_rfc3339();
+        let snapshot = crate::kanban::status::build_snapshot(project, &platform, &items, &generated_at, &opts);
+        let markdown = crate::kanban::status::render_markdown(&snapshot);
+
+        let rel_path = crate::kanban::status::artifact_relative_path(&domain, project, &platform, &generated_at);
+        let abs_path = self.vault_root.join(&rel_path);
+        if let Err(e) = crate::kanban::jsonl::write_file(&abs_path, &markdown) {
+            return json_error(&format!("failed to write status artifact: {e}"));
+        }
+        let _ = crate::kanban::audit::append_ticket_log(
+            &self.vault_root, &domain, project, &format!("status snapshot generated: {rel_path}"),
+        );
+
+        serde_json::to_string(&serde_json::json!({
+            "generated": true,
+            "artifact_path": rel_path,
+            "generated_at": generated_at,
+            "project": project,
+            "platform": platform,
+            "workstream_count": snapshot.workstream_count(),
+            "uncategorized_count": snapshot.uncategorized_count(),
+            "blocked_count": snapshot.blocked_count(),
+            "recently_shipped_count": snapshot.recently_shipped_count(),
+        })).unwrap_or_default()
+    }
+
     /// Request asynchronous grooming. This is a durable kanban request, NOT an RPC:
     /// it appends a `groom_requested` event and returns immediately. It does not run
     /// Claude, does not call the vault service, and does not mutate the ticket. The
@@ -3430,7 +3495,7 @@ impl ServerHandler for WardwellServer {
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
              wardwell_clipboard (copy to clipboard, ask first), \
-             wardwell_kanban (action: list|create|update|move|note|query|relationship_create|relationship_list|relationship_delete|question_create|question_list|question_update|question_answer|question_invalidate|proposal_create|proposal_get|proposal_list|proposal_approve|proposal_reject|proposal_apply|verify|reality_check|plan|groom — project kanban board with tickets, statuses, priorities, deadlines). \
+             wardwell_kanban (action: list|create|update|move|note|query|relationship_create|relationship_list|relationship_delete|question_create|question_list|question_update|question_answer|question_invalidate|proposal_create|proposal_get|proposal_list|proposal_approve|proposal_reject|proposal_apply|verify|reality_check|plan|groom|status — project kanban board with tickets, statuses, priorities, deadlines). \
              GROOMING RULE: when you read a ticket (get), check item.grooming. If item.grooming.artifact_path is present, READ that artifact (wardwell_search action:read path:<artifact_path>) BEFORE planning or building — it is the latest readiness/DDD assessment for the ticket. Treat item.grooming.readiness (e.g. build_prompt_needed, design_needed, audit_needed, blocker) and item.grooming.surfaced as primary signals."
                 .to_string()
         } else {
