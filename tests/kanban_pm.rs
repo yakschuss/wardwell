@@ -2587,6 +2587,33 @@ fn wa5_nullable_opt_in_untouched() {
     assert!(!json.contains("\"stage\""));
 }
 
+// Spec real-time-push flow: advance stage AND re-establish a wait (with the
+// constrained ask) in a SINGLE call. The stage advance clears the prior ask,
+// then the caller-supplied waiting_on re-establishes it and the caller-supplied
+// waiting_summary must survive. This is the canonical agent flow (spec §3).
+#[test]
+fn wa5_combined_stage_and_wait_in_one_call_keeps_summary() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    let item = store
+        .update_item(
+            &id, None, None, None, None, None, None, None, None, None,
+            Some("post_design_audit"),
+            Some("human:design_decisions"),
+            Some("2 decisions: grouping (recommend per-category), delivery (recommend in-app)"),
+        )
+        .unwrap();
+    assert_eq!(item.stage.as_deref(), Some("post_design_audit"));
+    assert_eq!(item.waiting_on.as_deref(), Some("human:design_decisions"));
+    assert!(item.waiting_since.is_some(), "wait re-established → since stamped");
+    assert_eq!(item.status, "review", "human:* → review even alongside a stage change");
+    assert_eq!(
+        item.waiting_summary.as_deref(),
+        Some("2 decisions: grouping (recommend per-category), delivery (recommend in-app)"),
+        "caller summary survives the stage-clear when the wait is re-set in the same call"
+    );
+}
+
 // waiting_summary is only applied when a wait is set (a stage advance clears it).
 #[test]
 fn wa5_waiting_summary_ignored_without_wait() {
