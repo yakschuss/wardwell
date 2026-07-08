@@ -200,7 +200,7 @@ fn update_no_fields() {
         .unwrap();
 
     // Update with no fields changed — should just bump updated_at
-    let item = store.update_item("PR-1", None, None, None, None, None, None, None, None, None).unwrap();
+    let item = store.update_item("PR-1", None, None, None, None, None, None, None, None, None, None, None, None).unwrap();
     assert_eq!(item.title, "Task");
 }
 
@@ -213,12 +213,12 @@ fn update_status_to_done_and_back() {
         .unwrap();
 
     let item = store
-        .update_item("PR-1", None, None, Some("done"), None, None, None, None, None, None)
+        .update_item("PR-1", None, None, Some("done"), None, None, None, None, None, None, None, None, None)
         .unwrap();
     assert!(item.completed_at.is_some());
 
     let item = store
-        .update_item("PR-1", None, None, Some("todo"), None, None, None, None, None, None)
+        .update_item("PR-1", None, None, Some("todo"), None, None, None, None, None, None, None, None, None)
         .unwrap();
     assert!(item.completed_at.is_none());
 }
@@ -226,7 +226,7 @@ fn update_status_to_done_and_back() {
 #[test]
 fn update_nonexistent_ticket() {
     let (_dir, store) = make_store();
-    let result = store.update_item("XX-999", Some("New title"), None, None, None, None, None, None, None, None);
+    let result = store.update_item("XX-999", Some("New title"), None, None, None, None, None, None, None, None, None, None, None);
     assert!(result.is_err());
 }
 

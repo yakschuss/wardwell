@@ -23,6 +23,19 @@ pub struct KanbanItem {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    /// Loop stage (WA-5): idea|grill|spec|design_audit|post_design_audit|audit_gate|build|pr|complete.
+    /// `None` for tickets not using the loop system.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// Loop wait target (WA-5): `human:*` or `blocker:*`. `None` when not waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
+    /// Constrained ask surfaced in briefings. `None` unless waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_summary: Option<String>,
+    /// When the current wait started. Stamped by the tool, never set directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,7 +123,7 @@ pub struct KanbanStore {
 }
 
 impl KanbanStore {
-    const SCHEMA_VERSION: i64 = 7;
+    const SCHEMA_VERSION: i64 = 8;
 
     pub fn open(db_path: &Path, vault_root: PathBuf) -> Result<Self, KanbanError> {
         let groups = load_kanban_yml(&vault_root);
@@ -169,6 +182,10 @@ impl KanbanStore {
                 parent       TEXT,
                 position     INTEGER,
                 tags         TEXT DEFAULT '[]',
+                stage           TEXT,
+                waiting_on      TEXT,
+                waiting_summary TEXT,
+                waiting_since   TEXT,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL,
                 completed_at TEXT
@@ -277,7 +294,8 @@ impl KanbanStore {
             assignee: assignee.map(str::to_string), deadline: deadline.map(str::to_string),
             source: source.map(str::to_string), parent: parent.map(str::to_string), position: None, children: vec![],
             tags: tags_vec, created_at: now.clone(), updated_at: now,
-            completed_at, notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
+            completed_at, stage: None, waiting_on: None, waiting_summary: None, waiting_since: None,
+            notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
         })
     }
 
@@ -313,6 +331,12 @@ impl KanbanStore {
         Ok((item, transition))
     }
 
+    /// Sentinel for `waiting_on` meaning "clear it". The tool accepts an empty
+    /// string or the literal "null" from callers; both map to this.
+    fn is_waiting_clear(v: &str) -> bool {
+        v.is_empty() || v.eq_ignore_ascii_case("null")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn update_item(
         &self,
@@ -326,16 +350,31 @@ impl KanbanStore {
         epic: Option<&str>,
         parent: Option<&str>,
         tags: Option<&[String]>,
+        stage: Option<&str>,
+        waiting_on: Option<&str>,
+        waiting_summary: Option<&str>,
     ) -> Result<KanbanItem, KanbanError> {
-        if let Some(s) = status { validate_status(s)?; }
         if let Some(p) = priority { validate_priority(p)?; }
+        if let Some(s) = stage { validate_stage(s)?; }
+        if let Some(w) = waiting_on
+            && !Self::is_waiting_clear(w)
+        {
+            validate_waiting_on(w)?;
+        }
+        // Explicit status validation is deferred until after loop invariants may
+        // override it — but a caller-supplied status must still be legal.
+        if let Some(s) = status { validate_status(s)?; }
 
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
         let (current_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
 
-        let mut fields = HashMap::new();
+        // Build the resolved field set. This is the single choke point for the
+        // WA-5 loop invariants (loop-system-spec.md "Tool-enforced invariants").
+        // Every downstream write — the JSONL update event AND the SQLite cache —
+        // is derived from `fields`, so they can never disagree.
+        let mut fields: HashMap<String, serde_json::Value> = HashMap::new();
         if let Some(v) = title { fields.insert("title".into(), serde_json::Value::String(v.into())); }
         if let Some(v) = description { fields.insert("description".into(), serde_json::Value::String(v.into())); }
         if let Some(v) = status { fields.insert("status".into(), serde_json::Value::String(v.into())); }
@@ -348,43 +387,119 @@ impl KanbanStore {
             fields.insert("tags".into(), serde_json::Value::Array(t.iter().map(|s| serde_json::Value::String(s.clone())).collect()));
         }
 
+        // ---- WA-5 loop invariants ----
+        // Note: stage and waiting_on are mutually resolved. A stage change wins
+        // over an explicit waiting_on in the same call (advancing means the prior
+        // ask is moot), so stage is applied first and clears the wait, then a
+        // waiting_on set (if still present after clearing) re-establishes it.
+        if let Some(s) = stage {
+            // (6) enum-validated above. Set the stage.
+            fields.insert("stage".into(), serde_json::Value::String(s.into()));
+            // (2) ANY stage change auto-clears the wait (forward or backward).
+            fields.insert("waiting_on".into(), serde_json::Value::Null);
+            fields.insert("waiting_summary".into(), serde_json::Value::Null);
+            fields.insert("waiting_since".into(), serde_json::Value::Null);
+            // (4) clearing waiting_on returns activity to in_progress …
+            fields.insert("status".into(), serde_json::Value::String("in_progress".into()));
+            // (5) … unless we're completing, which supersedes.
+            if s == "complete" {
+                fields.insert("status".into(), serde_json::Value::String("done".into()));
+            }
+        }
+        if let Some(w) = waiting_on {
+            if Self::is_waiting_clear(w) {
+                // (4) explicit clear → in_progress + drop summary/since.
+                fields.insert("waiting_on".into(), serde_json::Value::Null);
+                fields.insert("waiting_summary".into(), serde_json::Value::Null);
+                fields.insert("waiting_since".into(), serde_json::Value::Null);
+                fields.insert("status".into(), serde_json::Value::String("in_progress".into()));
+            } else {
+                // (7) prefix-validated above. Set it and …
+                fields.insert("waiting_on".into(), serde_json::Value::String(w.into()));
+                // (1) auto-stamp waiting_since = now.
+                fields.insert("waiting_since".into(), serde_json::Value::String(now.clone()));
+                // (3) human:* → review, blocker:* → blocked.
+                let derived_status = if w.starts_with("human:") { "review" } else { "blocked" };
+                fields.insert("status".into(), serde_json::Value::String(derived_status.into()));
+            }
+        }
+        // waiting_summary is caller-provided free text; only honor it when a wait
+        // is (or remains) set — a stage advance/clear already nulled it above.
+        if let Some(v) = waiting_summary {
+            let waiting_set = matches!(fields.get("waiting_on"), Some(serde_json::Value::String(_)));
+            if waiting_set {
+                fields.insert("waiting_summary".into(), serde_json::Value::String(v.into()));
+            }
+        }
+
         if !fields.is_empty() {
             let event = KanbanEvent::Update {
                 ticket_id: ticket_id.into(),
-                fields,
+                fields: fields.clone(),
                 timestamp: now.clone(),
             };
             events::append_event(&self.vault_root, &domain, &project, &event)?;
         }
 
-        // Update SQLite cache
+        // Update SQLite cache from the SAME resolved `fields` map.
+        self.apply_update_to_cache(&conn, ticket_id, &fields, &current_status, &now)?;
+
+        self.get_item_with_conn(&conn, ticket_id)
+    }
+
+    /// Apply a resolved update-field map to the SQLite cache. Column values are
+    /// taken verbatim from `fields`; a JSON Null clears the column. Mirrors the
+    /// JSONL update event so the cache stays byte-for-byte consistent with replay.
+    fn apply_update_to_cache(
+        &self,
+        conn: &Connection,
+        ticket_id: &str,
+        fields: &HashMap<String, serde_json::Value>,
+        current_status: &str,
+        now: &str,
+    ) -> Result<(), KanbanError> {
         let mut sets = vec!["updated_at = ?1".to_string()];
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now)];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.to_string())];
         let mut idx = 2;
 
-        if let Some(v) = title { sets.push(format!("title=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = description { sets.push(format!("description=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = status {
-            sets.push(format!("status=?{idx}")); params.push(Box::new(v.to_string())); idx += 1;
+        // Columns that map 1:1 to a field key and take a nullable TEXT value.
+        // `tags` is stored as a JSON string; `status` drives completed_at.
+        let text_cols = [
+            "title", "description", "priority", "assignee", "deadline", "epic",
+            "parent", "stage", "waiting_on", "waiting_summary", "waiting_since",
+        ];
+        for col in text_cols {
+            if let Some(v) = fields.get(col) {
+                sets.push(format!("{col}=?{idx}"));
+                let val: Option<String> = match v {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Null => None,
+                    other => Some(other.to_string()),
+                };
+                params.push(Box::new(val));
+                idx += 1;
+            }
+        }
+        if let Some(serde_json::Value::String(v)) = fields.get("status") {
+            sets.push(format!("status=?{idx}")); params.push(Box::new(v.clone())); idx += 1;
             if v == "done" && current_status != "done" {
                 sets.push(format!("completed_at=?{idx}")); params.push(Box::new(chrono::Utc::now().to_rfc3339())); idx += 1;
             } else if v != "done" && current_status == "done" {
                 sets.push(format!("completed_at=?{idx}")); params.push(Box::new(Option::<String>::None)); idx += 1;
             }
         }
-        if let Some(v) = priority { sets.push(format!("priority=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = assignee { sets.push(format!("assignee=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = deadline { sets.push(format!("deadline=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = epic { sets.push(format!("epic=?{idx}")); params.push(Box::new(v.to_string())); idx += 1; }
-        if let Some(v) = parent { sets.push(format!("parent=?{idx}")); params.push(Box::new(if v.is_empty() { None } else { Some(v.to_string()) })); idx += 1; }
-        if let Some(t) = tags { let tj = serde_json::to_string(t).unwrap_or_else(|_| "[]".into()); sets.push(format!("tags=?{idx}")); params.push(Box::new(tj)); let _ = idx; }
+        if let Some(serde_json::Value::Array(arr)) = fields.get("tags") {
+            let strs: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            let tj = serde_json::to_string(&strs).unwrap_or_else(|_| "[]".into());
+            sets.push(format!("tags=?{idx}")); params.push(Box::new(tj)); idx += 1;
+        }
+        let _ = idx;
 
         params.push(Box::new(ticket_id.to_string()));
         let sql = format!("UPDATE kanban_items SET {} WHERE ticket_id=?{}", sets.join(", "), params.len());
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
         conn.execute(&sql, refs.as_slice())?;
-
-        self.get_item_with_conn(&conn, ticket_id)
+        Ok(())
     }
 
     pub fn add_note(&self, ticket_id: &str, text: &str, author: Option<&str>) -> Result<KanbanItem, KanbanError> {
@@ -576,7 +691,7 @@ impl KanbanStore {
 
         let wh = format!("WHERE {}", conditions.join(" AND "));
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC LIMIT 20"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at, kanban_items.stage, kanban_items.waiting_on, kanban_items.waiting_summary, kanban_items.waiting_since {from} {wh} ORDER BY kanban_items.updated_at DESC LIMIT 20"
         );
 
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -589,6 +704,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                stage: row.get(16)?, waiting_on: row.get(17)?, waiting_summary: row.get(18)?, waiting_since: row.get(19)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
@@ -643,7 +759,7 @@ impl KanbanStore {
 
         let wh = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at, kanban_items.stage, kanban_items.waiting_on, kanban_items.waiting_summary, kanban_items.waiting_since {from} {wh} ORDER BY CASE kanban_items.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, kanban_items.updated_at DESC"
         );
 
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -656,6 +772,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                stage: row.get(16)?, waiting_on: row.get(17)?, waiting_summary: row.get(18)?, waiting_since: row.get(19)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
@@ -695,7 +812,7 @@ impl KanbanStore {
 
         let wh = if conditions.is_empty() { String::new() } else { format!("WHERE {}", conditions.join(" AND ")) };
         let sql = format!(
-            "SELECT ticket_id, project, epic, parent, position, tags, title, NULL, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items {wh} ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, updated_at DESC"
+            "SELECT ticket_id, project, epic, parent, position, tags, title, NULL, status, priority, assignee, deadline, source, created_at, updated_at, completed_at, stage, waiting_on, waiting_summary, waiting_since FROM kanban_items {wh} ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END, updated_at DESC"
         );
 
         let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -708,6 +825,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                stage: row.get(16)?, waiting_on: row.get(17)?, waiting_summary: row.get(18)?, waiting_since: row.get(19)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
@@ -727,7 +845,7 @@ impl KanbanStore {
         let conn = self.conn()?;
         let ph: Vec<String> = (1..=ticket_ids.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
-            "SELECT ticket_id, project, epic, parent, position, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id IN ({}) ORDER BY updated_at DESC",
+            "SELECT ticket_id, project, epic, parent, position, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at, stage, waiting_on, waiting_summary, waiting_since FROM kanban_items WHERE ticket_id IN ({}) ORDER BY updated_at DESC",
             ph.join(",")
         );
         let params: Vec<&dyn rusqlite::types::ToSql> = ticket_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
@@ -740,6 +858,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                stage: row.get(16)?, waiting_on: row.get(17)?, waiting_summary: row.get(18)?, waiting_since: row.get(19)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
@@ -781,7 +900,7 @@ impl KanbanStore {
 
         let wh = if extra.is_empty() { format!("WHERE {named_where}") } else { format!("WHERE ({named_where}) AND {}", extra.join(" AND ")) };
         let sql = format!(
-            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at {from} {wh} ORDER BY kanban_items.updated_at DESC"
+            "SELECT kanban_items.ticket_id, kanban_items.project, kanban_items.epic, kanban_items.parent, kanban_items.position, kanban_items.tags, kanban_items.title, kanban_items.description, kanban_items.status, kanban_items.priority, kanban_items.assignee, kanban_items.deadline, kanban_items.source, kanban_items.created_at, kanban_items.updated_at, kanban_items.completed_at, kanban_items.stage, kanban_items.waiting_on, kanban_items.waiting_summary, kanban_items.waiting_since {from} {wh} ORDER BY kanban_items.updated_at DESC"
         );
 
         let conn = self.conn()?;
@@ -795,6 +914,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                stage: row.get(16)?, waiting_on: row.get(17)?, waiting_summary: row.get(18)?, waiting_since: row.get(19)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             })
         })?.collect::<Result<_, _>>()?;
@@ -841,7 +961,9 @@ impl KanbanStore {
                 ticket_id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL,
                 description TEXT, status TEXT NOT NULL DEFAULT 'backlog',
                 priority TEXT NOT NULL DEFAULT 'medium', assignee TEXT, deadline TEXT,
-                source TEXT, epic TEXT, parent TEXT, position INTEGER, tags TEXT DEFAULT '[]', created_at TEXT NOT NULL,
+                source TEXT, epic TEXT, parent TEXT, position INTEGER, tags TEXT DEFAULT '[]',
+                stage TEXT, waiting_on TEXT, waiting_summary TEXT, waiting_since TEXT,
+                created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL, completed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS kanban_notes (
@@ -871,8 +993,8 @@ impl KanbanStore {
 
                 let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
                 conn.execute(
-                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, position, tags, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.parent, item.position, tags_json, item.created_at, item.updated_at, item.completed_at],
+                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, position, tags, stage, waiting_on, waiting_summary, waiting_since, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.parent, item.position, tags_json, item.stage, item.waiting_on, item.waiting_summary, item.waiting_since, item.created_at, item.updated_at, item.completed_at],
                 )?;
 
                 for note in &item.notes {
@@ -1025,7 +1147,7 @@ impl KanbanStore {
 
     fn get_item_with_conn(&self, conn: &Connection, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
         let item: Option<KanbanItem> = conn.query_row(
-            "SELECT ticket_id, project, epic, parent, position, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at FROM kanban_items WHERE ticket_id=?1",
+            "SELECT ticket_id, project, epic, parent, position, tags, title, description, status, priority, assignee, deadline, source, created_at, updated_at, completed_at, stage, waiting_on, waiting_summary, waiting_since FROM kanban_items WHERE ticket_id=?1",
             rusqlite::params![ticket_id],
             |row| Ok(KanbanItem {
                 ticket_id: row.get(0)?, project: row.get(1)?, group: None, epic: row.get(2)?,
@@ -1034,6 +1156,7 @@ impl KanbanStore {
                 title: row.get(6)?, description: row.get(7)?, status: row.get(8)?, priority: row.get(9)?,
                 assignee: row.get(10)?, deadline: row.get(11)?, source: row.get(12)?,
                 created_at: row.get(13)?, updated_at: row.get(14)?, completed_at: row.get(15)?,
+                stage: row.get(16)?, waiting_on: row.get(17)?, waiting_summary: row.get(18)?, waiting_since: row.get(19)?,
                 notes: vec![], attachments: vec![], activity: vec![], children_activity: vec![], grooming: None,
             }),
         ).optional()?;
@@ -1226,8 +1349,32 @@ fn mime_from_ext(filename: &str) -> String {
 
 fn validate_status(s: &str) -> Result<&str, KanbanError> {
     match s {
-        "backlog" | "todo" | "in_progress" | "review" | "done" => Ok(s),
-        other => Err(KanbanError::InvalidInput(format!("invalid status '{other}'; must be one of: backlog, todo, in_progress, review, done"))),
+        "backlog" | "todo" | "in_progress" | "review" | "blocked" | "done" => Ok(s),
+        other => Err(KanbanError::InvalidInput(format!("invalid status '{other}'; must be one of: backlog, todo, in_progress, review, blocked, done"))),
+    }
+}
+
+/// WA-5: loop stages. Enum-validated; free text is rejected.
+fn validate_stage(s: &str) -> Result<&str, KanbanError> {
+    match s {
+        "idea" | "grill" | "spec" | "design_audit" | "post_design_audit"
+        | "audit_gate" | "build" | "pr" | "complete" => Ok(s),
+        other => Err(KanbanError::InvalidInput(format!(
+            "invalid stage '{other}'; must be one of: idea, grill, spec, design_audit, post_design_audit, audit_gate, build, pr, complete"
+        ))),
+    }
+}
+
+/// WA-5: `waiting_on` is prefix-validated. Must be null (handled by the caller)
+/// or start with `human:` or `blocker:`. Free text like "waiting on Jack" is
+/// rejected so briefings can rely on the structured form.
+fn validate_waiting_on(w: &str) -> Result<&str, KanbanError> {
+    if w.starts_with("human:") || w.starts_with("blocker:") {
+        Ok(w)
+    } else {
+        Err(KanbanError::InvalidInput(format!(
+            "invalid waiting_on '{w}'; must be null (empty or \"null\" to clear), or start with 'human:' or 'blocker:'"
+        )))
     }
 }
 
@@ -1339,7 +1486,7 @@ mod tests {
         let (dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("Old", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
-        let item = store.update_item("SH-1", Some("New"), None, None, None, None, None, None, None, None).unwrap();
+        let item = store.update_item("SH-1", Some("New"), None, None, None, None, None, None, None, None, None, None, None).unwrap();
         assert_eq!(item.title, "New");
 
         let content = std::fs::read_to_string(dir.path().join("vault/work/shulops/kanban.jsonl")).unwrap();

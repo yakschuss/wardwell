@@ -295,6 +295,14 @@ pub struct MaterializedItem {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    /// Loop stage (WA-5). `None` for tickets not using the loop system.
+    pub stage: Option<String>,
+    /// Loop wait target (WA-5): `human:*` or `blocker:*`, else `None`.
+    pub waiting_on: Option<String>,
+    /// Human-readable constrained ask, surfaced in briefings. `None` unless waiting.
+    pub waiting_summary: Option<String>,
+    /// When the current wait started. Stamped by the tool, never set directly.
+    pub waiting_since: Option<String>,
     pub archived: bool,
     pub notes: Vec<MaterializedNote>,
     pub attachments: Vec<MaterializedAttachment>,
@@ -346,6 +354,10 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     created_at: timestamp.clone(),
                     updated_at: timestamp.clone(),
                     completed_at,
+                    stage: None,
+                    waiting_on: None,
+                    waiting_summary: None,
+                    waiting_since: None,
                     archived: false,
                     notes: vec![],
                     attachments: vec![],
@@ -390,6 +402,37 @@ pub fn materialize(domain: &str, events: &[KanbanEvent]) -> Vec<MaterializedItem
                     }
                     if let Some(serde_json::Value::Array(arr)) = fields.get("tags") {
                         item.tags = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    }
+                    // WA-5 loop fields. A String sets, a Null clears. The write
+                    // path (store::update_item) resolves invariants before emitting,
+                    // so replay just applies the resolved values.
+                    if let Some(v) = fields.get("stage") {
+                        match v {
+                            serde_json::Value::String(s) => item.stage = Some(s.clone()),
+                            serde_json::Value::Null => item.stage = None,
+                            _ => {}
+                        }
+                    }
+                    if let Some(v) = fields.get("waiting_on") {
+                        match v {
+                            serde_json::Value::String(s) => item.waiting_on = Some(s.clone()),
+                            serde_json::Value::Null => item.waiting_on = None,
+                            _ => {}
+                        }
+                    }
+                    if let Some(v) = fields.get("waiting_summary") {
+                        match v {
+                            serde_json::Value::String(s) => item.waiting_summary = Some(s.clone()),
+                            serde_json::Value::Null => item.waiting_summary = None,
+                            _ => {}
+                        }
+                    }
+                    if let Some(v) = fields.get("waiting_since") {
+                        match v {
+                            serde_json::Value::String(s) => item.waiting_since = Some(s.clone()),
+                            serde_json::Value::Null => item.waiting_since = None,
+                            _ => {}
+                        }
                     }
                     item.updated_at = timestamp.clone();
                 }

@@ -140,7 +140,7 @@ pub struct KanbanParams {
     pub title: Option<String>,
     #[schemars(description = "Item description/details.")]
     pub description: Option<String>,
-    #[schemars(description = "Status: backlog, todo, in_progress, review, done. For move: target status. For list: filter.")]
+    #[schemars(description = "Status: backlog, todo, in_progress, review, blocked, done. For move: target status. For list: filter.")]
     pub status: Option<String>,
     #[schemars(description = "Priority: low, medium, high, urgent.")]
     pub priority: Option<String>,
@@ -242,6 +242,14 @@ pub struct KanbanParams {
     // -- groom fields --
     #[schemars(description = "For groom: agent/source requesting grooming (e.g., 'codex'). Optional provenance.")]
     pub requested_by: Option<String>,
+
+    // -- loop / stage fields (WA-5) --
+    #[schemars(description = "For update: loop stage. One of: idea, grill, spec, design_audit, post_design_audit, audit_gate, build, pr, complete. Nullable/opt-in — most tickets have no stage. Any stage change auto-clears waiting_on/summary/since and sets status=in_progress; stage=complete sets status=done. Stages can move backward.")]
+    pub stage: Option<String>,
+    #[schemars(description = "For update: who/what the ticket is waiting on. Must start with 'human:' (e.g. 'human:design_decisions' → status=review) or 'blocker:' (e.g. 'blocker:external' → status=blocked). Setting it auto-stamps waiting_since=now. Pass empty string or 'null' to clear (→ status=in_progress). Never set waiting_since directly.")]
+    pub waiting_on: Option<String>,
+    #[schemars(description = "For update: the constrained ask, human-readable (options + recommendation, not open-ended). Surfaced in briefings. Only applied when a wait is set; a stage advance clears it.")]
+    pub waiting_summary: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2244,6 +2252,7 @@ impl WardwellServer {
             ticket_id, p.title.as_deref(), p.description.as_deref(),
             p.status.as_deref(), p.priority.as_deref(), p.assignee.as_deref(), p.deadline.as_deref(),
             p.epic.as_deref(), p.parent.as_deref(), p.tags.as_deref(),
+            p.stage.as_deref(), p.waiting_on.as_deref(), p.waiting_summary.as_deref(),
         ) {
             Ok(item) => {
                 let mut changes = Vec::new();
@@ -3060,6 +3069,9 @@ impl WardwellServer {
                     epic.as_deref(),
                     parent.as_deref(),
                     tags.as_deref(),
+                    None, // stage
+                    None, // waiting_on
+                    None, // waiting_summary
                 ).map_err(|e| e.to_string())?;
                 let audit_line = format!("{} updated via proposal", ticket_id);
                 let _ = crate::kanban::audit::append_ticket_log(&self.vault_root, domain, project, &audit_line);

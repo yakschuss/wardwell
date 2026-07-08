@@ -346,7 +346,7 @@ fn proposal_apply_approved() {
     assert_eq!(prop.status, ProposalStatus::Approved);
 
     // Apply the update
-    store.update_item(&item.ticket_id, None, None, None, None, None, None, Some("my-epic"), None, None).unwrap();
+    store.update_item(&item.ticket_id, None, None, None, None, None, None, Some("my-epic"), None, None, None, None, None).unwrap();
 
     let updated = store.get_item(&item.ticket_id).unwrap();
     assert_eq!(updated.epic.as_deref(), Some("my-epic"));
@@ -409,7 +409,7 @@ fn proposal_detects_conflict() {
     proposals::append_event(&vault_root(&dir), "dom", "proj", &ProposalEvent::Create(p)).unwrap();
 
     // Modify ticket between create and apply
-    store.update_item(&item.ticket_id, Some("Updated title"), None, None, None, None, None, None, None, None).unwrap();
+    store.update_item(&item.ticket_id, Some("Updated title"), None, None, None, None, None, None, None, None, None, None, None).unwrap();
     let current = store.get_item(&item.ticket_id).unwrap();
     assert_ne!(current.updated_at, snap_time, "ticket should have been updated");
 
@@ -717,7 +717,7 @@ fn proposal_apply_writes_history_via_kanban_events() {
     let count_before = events_before.len();
 
     // Simulate proposal apply: update the ticket (same path MCP handler uses)
-    store.update_item(&item.ticket_id, None, None, None, Some("high"), None, None, Some("my-epic"), None, None).unwrap();
+    store.update_item(&item.ticket_id, None, None, None, Some("high"), None, None, Some("my-epic"), None, None, None, None, None).unwrap();
 
     // Events after should include the update event
     let events_after = wardwell::kanban::events::read_events(&vault_root(&dir), "dom", "proj");
@@ -912,8 +912,8 @@ fn proposal_full_apply_flow_with_multiple_ops() {
     }).unwrap();
 
     // 3. Apply each operation (simulating what MCP handler does)
-    store.update_item(&a.ticket_id, None, None, Some("todo"), None, None, None, Some("operational-loop-v1"), None, None).unwrap();
-    store.update_item(&b.ticket_id, None, None, None, None, None, None, Some("operational-loop-v1"), None, None).unwrap();
+    store.update_item(&a.ticket_id, None, None, Some("todo"), None, None, None, Some("operational-loop-v1"), None, None, None, None, None).unwrap();
+    store.update_item(&b.ticket_id, None, None, None, None, None, None, Some("operational-loop-v1"), None, None, None, None, None).unwrap();
 
     let rel = Relationship {
         id: uuid::Uuid::new_v4().to_string(), project: "proj".into(),
@@ -1974,7 +1974,7 @@ fn plan_answers_what_is_next_after_ship() {
     // The definition-of-done scenario: the shipping ticket is now done; a fresh
     // plan should point at the next high-priority item under the root.
     let f = make_plan_fixture();
-    f.store.update_item(&f.shipping, None, None, Some("done"), None, None, None, None, None, None).unwrap();
+    f.store.update_item(&f.shipping, None, None, Some("done"), None, None, None, None, None, None, None, None, None).unwrap();
     let items = all_items(&f);
     let map = plan::build_plan("proj", Some(&f.root), None, &items, &[], &[], &PlanOptions::default());
 
@@ -2405,4 +2405,198 @@ fn no_grooming_when_no_events_and_no_artifact() {
     let pf = HashMap::new();
     let item = store.create_item("Plain", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
     assert!(store.get_item(&item.ticket_id).unwrap().grooming.is_none());
+}
+
+// ===== WA-5: Loop stage progression + tool-enforced invariants =====
+
+// Helper: create a ticket ready to receive loop updates.
+fn loop_ticket(store: &KanbanStore) -> String {
+    let pf = HashMap::new();
+    let item = store.create_item("Loop task", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
+    item.ticket_id
+}
+
+fn set_stage(store: &KanbanStore, id: &str, stage: &str) -> wardwell::kanban::store::KanbanItem {
+    store.update_item(id, None, None, None, None, None, None, None, None, None, Some(stage), None, None).unwrap()
+}
+
+fn set_waiting(store: &KanbanStore, id: &str, waiting_on: &str, summary: Option<&str>) -> wardwell::kanban::store::KanbanItem {
+    store.update_item(id, None, None, None, None, None, None, None, None, None, None, Some(waiting_on), summary).unwrap()
+}
+
+// Invariant 1: setting waiting_on auto-stamps waiting_since = now.
+#[test]
+fn wa5_inv1_waiting_on_stamps_waiting_since() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    let item = set_waiting(&store, &id, "human:design_decisions", Some("2 decisions"));
+    assert_eq!(item.waiting_on.as_deref(), Some("human:design_decisions"));
+    assert!(item.waiting_since.is_some(), "waiting_since must be auto-stamped");
+    assert_eq!(item.waiting_summary.as_deref(), Some("2 decisions"));
+}
+
+// Invariant 2: ANY stage change clears waiting_on/summary/since — including backward moves.
+#[test]
+fn wa5_inv2_stage_change_clears_waiting() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    set_stage(&store, &id, "post_design_audit");
+    set_waiting(&store, &id, "human:design_decisions", Some("pick one"));
+
+    // Forward move clears.
+    let item = set_stage(&store, &id, "audit_gate");
+    assert_eq!(item.stage.as_deref(), Some("audit_gate"));
+    assert!(item.waiting_on.is_none(), "forward stage move clears waiting_on");
+    assert!(item.waiting_summary.is_none());
+    assert!(item.waiting_since.is_none());
+
+    // Re-establish a wait, then move BACKWARD — must also clear.
+    set_waiting(&store, &id, "blocker:external", Some("vendor"));
+    let item = set_stage(&store, &id, "design_audit");
+    assert_eq!(item.stage.as_deref(), Some("design_audit"));
+    assert!(item.waiting_on.is_none(), "backward stage move also clears the ask");
+    assert!(item.waiting_summary.is_none());
+    assert!(item.waiting_since.is_none());
+}
+
+// Invariant 3: human:* → status=review, blocker:* → status=blocked.
+#[test]
+fn wa5_inv3_waiting_on_derives_status() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+
+    let item = set_waiting(&store, &id, "human:spec_review", None);
+    assert_eq!(item.status, "review", "human:* → review");
+
+    let item = set_waiting(&store, &id, "blocker:external", None);
+    assert_eq!(item.status, "blocked", "blocker:* → blocked");
+}
+
+// Invariant 4: clearing waiting_on (empty string or "null") → status=in_progress.
+#[test]
+fn wa5_inv4_clearing_waiting_on_sets_in_progress() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    set_waiting(&store, &id, "human:pr_review", Some("PR ready"));
+
+    // Empty string clears.
+    let item = set_waiting(&store, &id, "", None);
+    assert!(item.waiting_on.is_none());
+    assert!(item.waiting_summary.is_none());
+    assert!(item.waiting_since.is_none());
+    assert_eq!(item.status, "in_progress");
+
+    // Literal "null" also clears.
+    set_waiting(&store, &id, "blocker:external", None);
+    let item = set_waiting(&store, &id, "null", None);
+    assert!(item.waiting_on.is_none());
+    assert_eq!(item.status, "in_progress");
+}
+
+// Invariant 5: stage=complete → status=done + clears waiting fields.
+#[test]
+fn wa5_inv5_stage_complete_sets_done() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    set_waiting(&store, &id, "human:pr_review", Some("last look"));
+
+    let item = set_stage(&store, &id, "complete");
+    assert_eq!(item.stage.as_deref(), Some("complete"));
+    assert_eq!(item.status, "done");
+    assert!(item.completed_at.is_some(), "done sets completed_at");
+    assert!(item.waiting_on.is_none());
+    assert!(item.waiting_summary.is_none());
+    assert!(item.waiting_since.is_none());
+}
+
+// Invariant 6: stage is enum-validated; free text rejected with a helpful error.
+#[test]
+fn wa5_inv6_stage_enum_validated() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    let err = store
+        .update_item(&id, None, None, None, None, None, None, None, None, None, Some("almost-done"), None, None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("invalid stage"), "got: {msg}");
+    assert!(msg.contains("design_audit"), "error lists valid stages: {msg}");
+    // All 9 valid stages accepted.
+    for s in ["idea", "grill", "spec", "design_audit", "post_design_audit", "audit_gate", "build", "pr", "complete"] {
+        assert!(set_stage(&store, &id, s).stage.as_deref() == Some(s));
+    }
+}
+
+// Invariant 7: waiting_on is prefix-validated; free text rejected.
+#[test]
+fn wa5_inv7_waiting_on_prefix_validated() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    let err = store
+        .update_item(&id, None, None, None, None, None, None, None, None, None, None, Some("waiting on Jack"), None)
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("invalid waiting_on"), "got: {msg}");
+    assert!(msg.contains("human:") && msg.contains("blocker:"), "error names valid prefixes: {msg}");
+}
+
+// JSONL replay round-trip: update events carry the new fields; materialize applies them.
+#[test]
+fn wa5_jsonl_replay_roundtrip() {
+    let (dir, store) = make_store();
+    let id = loop_ticket(&store);
+    set_stage(&store, &id, "design_audit");
+    set_waiting(&store, &id, "human:design_decisions", Some("grouping vs flat"));
+
+    // Read raw events straight from the JSONL source of truth and materialize.
+    let events = events::read_events(&vault_root(&dir), "dom", "proj");
+    let items = events::materialize("dom", &events);
+    let item = items.iter().find(|i| i.ticket_id == id).unwrap();
+    assert_eq!(item.stage.as_deref(), Some("design_audit"));
+    assert_eq!(item.waiting_on.as_deref(), Some("human:design_decisions"));
+    assert_eq!(item.waiting_summary.as_deref(), Some("grouping vs flat"));
+    assert!(item.waiting_since.is_some(), "waiting_since replays from JSONL");
+    assert_eq!(item.status, "review", "status invariant persisted to JSONL");
+
+    // Rebuild the SQLite cache purely from JSONL — fields survive.
+    store.rebuild_from_jsonl().unwrap();
+    let rebuilt = store.get_item(&id).unwrap();
+    assert_eq!(rebuilt.stage.as_deref(), Some("design_audit"));
+    assert_eq!(rebuilt.waiting_on.as_deref(), Some("human:design_decisions"));
+    assert_eq!(rebuilt.waiting_summary.as_deref(), Some("grouping vs flat"));
+    assert!(rebuilt.waiting_since.is_some());
+}
+
+// Nullable / opt-in: a ticket that never touches loop fields is untouched by all of this.
+#[test]
+fn wa5_nullable_opt_in_untouched() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+
+    // Plain, non-loop update leaves all loop fields None and status unchanged.
+    let item = store.update_item(&id, Some("Renamed"), None, None, Some("high"), None, None, None, None, None, None, None, None).unwrap();
+    assert_eq!(item.title, "Renamed");
+    assert!(item.stage.is_none());
+    assert!(item.waiting_on.is_none());
+    assert!(item.waiting_summary.is_none());
+    assert!(item.waiting_since.is_none());
+    assert_eq!(item.status, "todo", "no loop invariant fired, status stays as-is");
+
+    // get/list/search omit the loop keys entirely when unset.
+    let json = serde_json::to_string(&store.get_item(&id).unwrap()).unwrap();
+    assert!(!json.contains("waiting_on"), "unset loop fields are omitted from output");
+    assert!(!json.contains("\"stage\""));
+}
+
+// waiting_summary is only applied when a wait is set (a stage advance clears it).
+#[test]
+fn wa5_waiting_summary_ignored_without_wait() {
+    let (_dir, store) = make_store();
+    let id = loop_ticket(&store);
+    // Advance stage AND pass a summary in the same call — the stage advance clears
+    // the ask, so the stray summary must not stick.
+    let item = store
+        .update_item(&id, None, None, None, None, None, None, None, None, None, Some("build"), None, Some("stray"))
+        .unwrap();
+    assert_eq!(item.stage.as_deref(), Some("build"));
+    assert!(item.waiting_summary.is_none(), "summary without an active wait is dropped");
 }
