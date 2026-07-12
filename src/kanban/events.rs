@@ -198,6 +198,33 @@ pub fn read_events_from_path(path: &Path) -> Vec<KanbanEvent> {
         .collect()
 }
 
+/// Like `read_events_from_path`, but unparseable event lines are skipped with a
+/// warning on stderr instead of silently dropped. Schema headers and `_meta`
+/// lines are expected non-events and skipped quietly. Never aborts: a corrupt
+/// line costs one warning, not the fold.
+pub fn read_events_from_path_warn(path: &Path) -> Vec<KanbanEvent> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut events = Vec::new();
+    for (i, line) in content.lines().enumerate() {
+        let l = line.trim();
+        if l.is_empty() || l.contains("\"_schema\"") || l.contains("\"_meta\"") {
+            continue;
+        }
+        match serde_json::from_str(l) {
+            Ok(e) => events.push(e),
+            Err(e) => eprintln!(
+                "wardwell: kanban fold: skipping unparseable line {} in {}: {e}",
+                i + 1,
+                path.display()
+            ),
+        }
+    }
+    events
+}
+
 /// Read the last line of a JSONL file looking for a meta entry with next_id.
 /// Falls back to scanning create events if no meta line found.
 pub fn next_ticket_number(vault_root: &Path, domain: &str, project: &str, prefix: &str) -> i64 {
@@ -246,6 +273,19 @@ pub fn append_meta(vault_root: &Path, domain: &str, project: &str, prefix: &str,
 }
 
 pub fn scan_all_jsonl(vault_root: &Path) -> Vec<(String, String, Vec<KanbanEvent>)> {
+    scan_jsonl_paths(vault_root)
+        .into_iter()
+        .filter_map(|(domain, project, path)| {
+            let events = read_events_from_path(&path);
+            if events.is_empty() { None } else { Some((domain, project, events)) }
+        })
+        .collect()
+}
+
+/// Enumerate every `<domain>/<project>/kanban.jsonl` under the vault root,
+/// without reading file contents. Used by the fold watermark check, which
+/// needs a cheap stat-only pass.
+pub fn scan_jsonl_paths(vault_root: &Path) -> Vec<(String, String, PathBuf)> {
     let mut results = vec![];
     let entries = match std::fs::read_dir(vault_root) {
         Ok(e) => e,
@@ -264,10 +304,7 @@ pub fn scan_all_jsonl(vault_root: &Path) -> Vec<(String, String, Vec<KanbanEvent
             let proj_name = proj_entry.file_name().to_string_lossy().to_string();
             let jsonl = proj_entry.path().join("kanban.jsonl");
             if jsonl.exists() {
-                let events = read_events_from_path(&jsonl);
-                if !events.is_empty() {
-                    results.push((domain_name.clone(), proj_name, events));
-                }
+                results.push((domain_name.clone(), proj_name, jsonl));
             }
         }
     }

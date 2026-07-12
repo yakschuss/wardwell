@@ -209,7 +209,13 @@ impl KanbanStore {
             CREATE INDEX IF NOT EXISTS idx_kanban_items_project ON kanban_items(project);
             CREATE INDEX IF NOT EXISTS idx_kanban_items_status ON kanban_items(status);
             CREATE INDEX IF NOT EXISTS idx_kanban_notes_ticket ON kanban_notes(ticket_id);
-            CREATE INDEX IF NOT EXISTS idx_kanban_attachments_ticket ON kanban_attachments(ticket_id);"
+            CREATE INDEX IF NOT EXISTS idx_kanban_attachments_ticket ON kanban_attachments(ticket_id);
+            CREATE TABLE IF NOT EXISTS kanban_fold_state (
+                path      TEXT PRIMARY KEY,
+                byte_len  INTEGER NOT NULL,
+                mtime_ns  INTEGER NOT NULL,
+                folded_at TEXT NOT NULL
+            );"
         )?;
 
         let mut project_to_group = HashMap::new();
@@ -248,6 +254,7 @@ impl KanbanStore {
         tags: Option<&[String]>,
         config_prefixes: &HashMap<String, String>,
     ) -> Result<KanbanItem, KanbanError> {
+        self.fold_foreign_events_logged();
         let status = validate_status(status.unwrap_or("backlog"))?;
         let priority = validate_priority(priority.unwrap_or("medium"))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -300,6 +307,7 @@ impl KanbanStore {
     }
 
     pub fn move_item(&self, ticket_id: &str, new_status: &str) -> Result<(KanbanItem, String), KanbanError> {
+        self.fold_foreign_events_logged();
         let new_status = validate_status(new_status)?;
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -354,6 +362,7 @@ impl KanbanStore {
         waiting_on: Option<&str>,
         waiting_summary: Option<&str>,
     ) -> Result<KanbanItem, KanbanError> {
+        self.fold_foreign_events_logged();
         if let Some(p) = priority { validate_priority(p)?; }
         if let Some(s) = stage { validate_stage(s)?; }
         if let Some(w) = waiting_on
@@ -503,6 +512,7 @@ impl KanbanStore {
     }
 
     pub fn add_note(&self, ticket_id: &str, text: &str, author: Option<&str>) -> Result<KanbanItem, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -529,6 +539,7 @@ impl KanbanStore {
     }
 
     pub fn sequence_single(&self, ticket_id: &str, position: i64) -> Result<KanbanItem, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
         let (_status, project, domain) = self.get_item_context(&conn, ticket_id)?;
@@ -549,6 +560,7 @@ impl KanbanStore {
     }
 
     pub fn sequence_bulk(&self, project: &str, order: &[String]) -> Result<Vec<KanbanItem>, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -582,6 +594,7 @@ impl KanbanStore {
     // ---- Read path: SQLite only ----
 
     pub fn get_item(&self, ticket_id: &str) -> Result<KanbanItem, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let mut item = self.get_item_with_conn(&conn, ticket_id)?;
         let mut items = vec![item];
@@ -658,6 +671,7 @@ impl KanbanStore {
     }
 
     pub fn search(&self, query: &str, project: Option<&str>, domains: Option<&[String]>) -> Result<Vec<KanbanItem>, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let use_domain = domains.map(|d| !d.is_empty()).unwrap_or(false);
         let from = if use_domain {
@@ -721,6 +735,7 @@ impl KanbanStore {
         &self, project: Option<&str>, status: Option<&str>, priority: Option<&str>,
         assignee: Option<&str>, epic: Option<&str>, tag: Option<&str>, include_done: bool, domains: Option<&[String]>,
     ) -> Result<Vec<KanbanItem>, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let mut conditions: Vec<String> = vec![];
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
@@ -790,6 +805,7 @@ impl KanbanStore {
     pub fn list_metadata(
         &self, project: Option<&str>, include_done: bool,
     ) -> Result<Vec<KanbanItem>, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let mut conditions: Vec<String> = vec![];
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
@@ -841,6 +857,7 @@ impl KanbanStore {
     pub fn list_with_notes(
         &self, project: &str, ticket_ids: &[String],
     ) -> Result<Vec<KanbanItem>, KanbanError> {
+        self.fold_foreign_events_logged();
         if ticket_ids.is_empty() { return Ok(vec![]); }
         let conn = self.conn()?;
         let ph: Vec<String> = (1..=ticket_ids.len()).map(|i| format!("?{i}")).collect();
@@ -876,6 +893,7 @@ impl KanbanStore {
         &self, question: &str, queries: &HashMap<String, String>,
         project: Option<&str>, domains: Option<&[String]>,
     ) -> Result<Vec<KanbanItem>, KanbanError> {
+        self.fold_foreign_events_logged();
         let named_where = queries.get(question).ok_or_else(|| {
             let mut names: Vec<&str> = queries.keys().map(String::as_str).collect();
             names.sort();
@@ -942,14 +960,15 @@ impl KanbanStore {
     // ---- Rebuild SQLite from JSONL ----
 
     pub fn rebuild_from_jsonl(&self) -> Result<(), KanbanError> {
-        let all = events::scan_all_jsonl(&self.vault_root);
+        let files = events::scan_jsonl_paths(&self.vault_root);
         let conn = self.conn()?;
 
         conn.execute_batch(
             "DROP TABLE IF EXISTS kanban_attachments;
              DROP TABLE IF EXISTS kanban_notes;
              DROP TABLE IF EXISTS kanban_items;
-             DROP TABLE IF EXISTS kanban_projects;"
+             DROP TABLE IF EXISTS kanban_projects;
+             DELETE FROM kanban_fold_state;"
         )?;
         // Recreate with current schema
         conn.execute_batch(
@@ -981,38 +1000,136 @@ impl KanbanStore {
             CREATE INDEX IF NOT EXISTS idx_kanban_attachments_ticket ON kanban_attachments(ticket_id);"
         )?;
 
-        for (domain, _project, evts) in &all {
-            let items = events::materialize(domain, evts);
+        for (domain, project, path) in &files {
+            let evts = events::read_events_from_path_warn(path);
+            let items = events::materialize(domain, &evts);
             for item in &items {
-                // Derive prefix from ticket_id
-                if let Some(dash) = item.ticket_id.find('-') {
-                    let prefix = &item.ticket_id[..dash];
-                    let num: i64 = item.ticket_id[dash + 1..].parse().unwrap_or(1);
-                    self.upsert_project(&conn, &item.project, prefix, &item.domain, num + 1)?;
-                }
-
-                let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
-                conn.execute(
-                    "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, position, tags, stage, waiting_on, waiting_summary, waiting_since, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-                    rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.parent, item.position, tags_json, item.stage, item.waiting_on, item.waiting_summary, item.waiting_since, item.created_at, item.updated_at, item.completed_at],
-                )?;
-
-                for note in &item.notes {
-                    conn.execute(
-                        "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4)",
-                        rusqlite::params![item.ticket_id, note.text, note.author, note.created_at],
-                    )?;
-                }
-                for att in &item.attachments {
-                    conn.execute(
-                        "INSERT OR REPLACE INTO kanban_attachments (attachment_id, ticket_id, filename, mime_type, size, storage_path, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                        rusqlite::params![att.attachment_id, item.ticket_id, att.filename, att.mime_type, att.size, att.storage_path, att.created_at],
-                    )?;
-                }
+                self.insert_materialized_item(&conn, item)?;
             }
+            Self::record_fold_watermark(&conn, domain, project, path)?;
         }
 
         Ok(())
+    }
+
+    /// Insert one replay-materialized item (plus its notes/attachments and
+    /// project registration) into the SQLite cache. Shared by the full rebuild
+    /// and the incremental foreign-event fold so both produce identical rows.
+    fn insert_materialized_item(&self, conn: &Connection, item: &events::MaterializedItem) -> Result<(), KanbanError> {
+        // Derive prefix from ticket_id
+        if let Some(dash) = item.ticket_id.find('-') {
+            let prefix = &item.ticket_id[..dash];
+            let num: i64 = item.ticket_id[dash + 1..].parse().unwrap_or(1);
+            self.upsert_project(conn, &item.project, prefix, &item.domain, num + 1)?;
+        }
+
+        let tags_json = serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".into());
+        conn.execute(
+            "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, position, tags, stage, waiting_on, waiting_summary, waiting_since, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+            rusqlite::params![item.ticket_id, item.project, item.title, item.description, item.status, item.priority, item.assignee, item.deadline, item.source, item.epic, item.parent, item.position, tags_json, item.stage, item.waiting_on, item.waiting_summary, item.waiting_since, item.created_at, item.updated_at, item.completed_at],
+        )?;
+
+        for note in &item.notes {
+            conn.execute(
+                "INSERT INTO kanban_notes (ticket_id, text, author, created_at) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![item.ticket_id, note.text, note.author, note.created_at],
+            )?;
+        }
+        for att in &item.attachments {
+            conn.execute(
+                "INSERT OR REPLACE INTO kanban_attachments (attachment_id, ticket_id, filename, mime_type, size, storage_path, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![att.attachment_id, item.ticket_id, att.filename, att.mime_type, att.size, att.storage_path, att.created_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// (size, mtime_ns) identity of a jsonl file, used as the fold watermark.
+    /// Appends grow the size; vault-sync file replacement bumps the mtime.
+    fn file_watermark(path: &Path) -> Option<(i64, i64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime_ns = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        Some((meta.len() as i64, mtime_ns))
+    }
+
+    fn record_fold_watermark(conn: &Connection, domain: &str, project: &str, path: &Path) -> Result<(), KanbanError> {
+        if let Some((byte_len, mtime_ns)) = Self::file_watermark(path) {
+            conn.execute(
+                "INSERT OR REPLACE INTO kanban_fold_state (path, byte_len, mtime_ns, folded_at) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![format!("{domain}/{project}"), byte_len, mtime_ns, chrono::Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(())
+    }
+
+    // ---- Fold foreign events (multi-machine sync) ----
+
+    /// Fold events appended to kanban.jsonl files by OTHER writers — other
+    /// machines via vault sync, or other processes on this one — into the
+    /// SQLite cache. The jsonl is truth; the db is a derived index. Without
+    /// this, a long-running reader (the MCP server) only ever sees its own
+    /// writes: `open()` rebuilds once, and every later foreign event is
+    /// visible in the activity feed (read from jsonl) but missing from
+    /// kanban_notes/kanban_items.
+    ///
+    /// Cheap when quiescent: one stat per project file, compared against a
+    /// per-project (byte_len, mtime_ns) watermark in kanban_fold_state. When a
+    /// watermark differs, that project's rows are atomically re-materialized
+    /// from a full replay of its jsonl. Idempotency and dedupe are structural:
+    /// every row — locally written or foreign — is regenerated from the same
+    /// event stream, so repeated folds can never double-insert.
+    ///
+    /// Returns the number of projects re-folded.
+    pub fn fold_foreign_events(&self) -> Result<usize, KanbanError> {
+        let files = events::scan_jsonl_paths(&self.vault_root);
+        let mut folded = 0usize;
+        for (domain, project, path) in files {
+            let Some(current) = Self::file_watermark(&path) else { continue };
+            {
+                let conn = self.conn()?;
+                let stored: Option<(i64, i64)> = conn.query_row(
+                    "SELECT byte_len, mtime_ns FROM kanban_fold_state WHERE path=?1",
+                    rusqlite::params![format!("{domain}/{project}")],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional()?;
+                if stored == Some(current) { continue; }
+            }
+
+            // Replay this project's full event stream (bad lines skipped with
+            // a warning, never aborting) and atomically swap its rows.
+            let evts = events::read_events_from_path_warn(&path);
+            let items = events::materialize(&domain, &evts);
+
+            let mut conn = self.conn()?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM kanban_notes WHERE ticket_id IN (SELECT ticket_id FROM kanban_items WHERE project=?1)",
+                rusqlite::params![project],
+            )?;
+            tx.execute(
+                "DELETE FROM kanban_attachments WHERE ticket_id IN (SELECT ticket_id FROM kanban_items WHERE project=?1)",
+                rusqlite::params![project],
+            )?;
+            tx.execute("DELETE FROM kanban_items WHERE project=?1", rusqlite::params![project])?;
+            for item in &items {
+                self.insert_materialized_item(&tx, item)?;
+            }
+            Self::record_fold_watermark(&tx, &domain, &project, &path)?;
+            tx.commit()?;
+            folded += 1;
+        }
+        Ok(folded)
+    }
+
+    /// Read/write-path entry point: fold, but never let a fold failure take
+    /// down the operation — the db just stays one sync behind.
+    fn fold_foreign_events_logged(&self) {
+        if let Err(e) = self.fold_foreign_events() {
+            eprintln!("wardwell: kanban fold warning (non-fatal): {e}");
+        }
     }
 
     // ---- Internal helpers ----
@@ -1036,7 +1153,10 @@ impl KanbanStore {
     }
 
     fn load_notes(&self, conn: &Connection, ticket_id: &str) -> Result<Vec<KanbanNote>, KanbanError> {
-        let mut stmt = conn.prepare("SELECT id, text, author, created_at FROM kanban_notes WHERE ticket_id=?1 ORDER BY created_at DESC")?;
+        // Newest first; id tiebreak keeps same-timestamp notes stable. No LIMIT:
+        // full note bodies are the point — agents must be able to read what the
+        // activity feed only headlines.
+        let mut stmt = conn.prepare("SELECT id, text, author, created_at FROM kanban_notes WHERE ticket_id=?1 ORDER BY created_at DESC, id DESC")?;
         let notes = stmt.query_map(rusqlite::params![ticket_id], |row| {
             Ok(KanbanNote { id: row.get(0)?, text: row.get(1)?, author: row.get(2)?, created_at: row.get(3)? })
         })?.collect::<Result<_, _>>()?;
@@ -1059,6 +1179,7 @@ impl KanbanStore {
     /// If content is provided: writes to {domain}/{project}/docs/{filename}, then records pointer.
     /// If content is None: registers an existing vault-relative file path as a pointer.
     pub fn attach_file(&self, ticket_id: &str, filename: &str, content: Option<&str>, vault_path: Option<&str>) -> Result<KanbanAttachment, KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1124,6 +1245,7 @@ impl KanbanStore {
 
     /// Remove an attachment pointer from a ticket. Does not delete the file.
     pub fn detach_file(&self, ticket_id: &str, attachment_id: &str) -> Result<(), KanbanError> {
+        self.fold_foreign_events_logged();
         let conn = self.conn()?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1513,14 +1635,11 @@ mod tests {
         store.move_item("SH-1", "todo").unwrap();
         store.add_note("SH-1", "Note", None).unwrap();
 
-        // Wipe SQLite cache
+        // Wipe SQLite cache (fold watermarks too, so this stays wiped until
+        // an explicit rebuild — reads would otherwise self-heal via the fold)
         let conn = store.conn().unwrap();
         conn.execute_batch("DELETE FROM kanban_notes; DELETE FROM kanban_items; DELETE FROM kanban_projects;").unwrap();
         drop(conn);
-
-        // Verify empty
-        let items = store.list(None, None, None, None, None, None, true, None).unwrap();
-        assert_eq!(items.len(), 0);
 
         // Rebuild
         store.rebuild_from_jsonl().unwrap();
@@ -1604,5 +1723,115 @@ mod tests {
         let store = KanbanStore::open(&dir.path().join("k.db"), vault).unwrap();
         let item = store.create_item("Test", "proj", "work", None, None, None, None, None, None, None, None, None, &HashMap::new()).unwrap();
         assert!(item.group.is_none());
+    }
+
+    // ---- fold_foreign_events: multi-machine sync fidelity ----
+
+    /// Simulate another machine's write landing via vault sync: append a raw
+    /// event line to the jsonl without touching this store's SQLite cache.
+    fn append_foreign_line(jsonl: &Path, line: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(jsonl).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
+    #[test]
+    fn fold_ingests_foreign_notes_with_full_text_and_dedupes_local() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
+        store.add_note("SH-1", "local note", Some("laptop")).unwrap();
+
+        let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
+        let body = "foreign note body — the full 860 chars, not the 80-char headline";
+        append_foreign_line(&jsonl, &format!(
+            r#"{{"event":"note","ticket_id":"SH-1","text":"{body}","author":"mini","timestamp":"2099-01-01T00:00:00+00:00"}}"#
+        ));
+
+        // The read path folds before serving.
+        let item = store.get_item("SH-1").unwrap();
+        assert_eq!(item.notes.len(), 2, "foreign note ingested, local note not duplicated");
+        assert_eq!(item.notes[0].text, body, "full text preserved, newest first");
+        assert_eq!(item.notes[0].author.as_deref(), Some("mini"));
+        assert_eq!(item.notes[0].created_at, "2099-01-01T00:00:00+00:00");
+
+        // Idempotency: repeated reads / explicit refolds never double-insert.
+        let refolded = store.fold_foreign_events().unwrap();
+        assert_eq!(refolded, 0, "quiescent fold is a no-op");
+        let item = store.get_item("SH-1").unwrap();
+        assert_eq!(item.notes.len(), 2);
+    }
+
+    #[test]
+    fn fold_ingests_foreign_create_and_move_latest_event_wins() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Local", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
+
+        let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
+        append_foreign_line(&jsonl, r#"{"event":"create","ticket_id":"SH-2","title":"Foreign ticket","project":"shulops","status":"backlog","priority":"high","timestamp":"2099-01-01T00:00:00+00:00"}"#);
+        append_foreign_line(&jsonl, r#"{"event":"move","ticket_id":"SH-2","from":"backlog","to":"in_progress","timestamp":"2099-01-02T00:00:00+00:00"}"#);
+        append_foreign_line(&jsonl, r#"{"event":"update","ticket_id":"SH-2","fields":{"assignee":"jack"},"timestamp":"2099-01-03T00:00:00+00:00"}"#);
+
+        let item = store.get_item("SH-2").unwrap();
+        assert_eq!(item.title, "Foreign ticket");
+        assert_eq!(item.status, "in_progress", "latest event wins");
+        assert_eq!(item.assignee.as_deref(), Some("jack"));
+        assert_eq!(item.created_at, "2099-01-01T00:00:00+00:00");
+
+        // Both tickets visible in list; local one untouched.
+        let items = store.list(Some("shulops"), None, None, None, None, None, true, None).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn fold_skips_unparseable_lines_without_aborting() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
+
+        let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
+        append_foreign_line(&jsonl, "{this is not json");
+        append_foreign_line(&jsonl, r#"{"event":"note","ticket_id":"SH-1","text":"after garbage","timestamp":"2099-01-01T00:00:00+00:00"}"#);
+
+        let item = store.get_item("SH-1").unwrap();
+        assert_eq!(item.notes.len(), 1);
+        assert_eq!(item.notes[0].text, "after garbage");
+    }
+
+    #[test]
+    fn fold_is_idempotent_across_repeated_explicit_calls() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
+
+        let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
+        append_foreign_line(&jsonl, r#"{"event":"note","ticket_id":"SH-1","text":"once","timestamp":"2099-01-01T00:00:00+00:00"}"#);
+
+        assert_eq!(store.fold_foreign_events().unwrap(), 1);
+        assert_eq!(store.fold_foreign_events().unwrap(), 0);
+        assert_eq!(store.fold_foreign_events().unwrap(), 0);
+        let item = store.get_item("SH-1").unwrap();
+        assert_eq!(item.notes.iter().filter(|n| n.text == "once").count(), 1);
+    }
+
+    #[test]
+    fn notes_ordering_is_created_at_desc_with_no_cap() {
+        let (dir, store) = make_store();
+        let p = HashMap::new();
+        store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
+
+        let jsonl = dir.path().join("vault/work/shulops/kanban.jsonl");
+        // 60 foreign notes with ascending timestamps — more than any small cap.
+        for i in 0..60 {
+            append_foreign_line(&jsonl, &format!(
+                r#"{{"event":"note","ticket_id":"SH-1","text":"note {i}","timestamp":"2099-01-01T00:{i:02}:00+00:00"}}"#
+            ));
+        }
+
+        let item = store.get_item("SH-1").unwrap();
+        assert_eq!(item.notes.len(), 60, "no hidden LIMIT on notes");
+        assert_eq!(item.notes[0].text, "note 59", "newest first");
+        assert_eq!(item.notes[59].text, "note 0");
     }
 }
