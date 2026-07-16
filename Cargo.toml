@@ -27,6 +27,7 @@ dirs = "6"
 schemars = "1.0"
 fastembed = "5"
 sqlite-vec = "0.1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
