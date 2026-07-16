@@ -196,6 +196,12 @@ pub struct KanbanParams {
     pub evidence: Option<String>,
     #[schemars(description = "For question_create/update: what decision/work this question blocks.")]
     pub needed_for: Option<String>,
+    #[schemars(description = "For question_create/update: semantic control shown in Wardwell. One of: question, decision. Defaults to question. Use decision only with 2-5 explicit interaction_options.")]
+    pub interaction_type: Option<crate::kanban::questions::QuestionInteractionType>,
+    #[schemars(description = "For decision questions: 2-5 explicit options, each with a unique id, a human-readable label, and optional detail. Do not include an 'other' option; the Wardwell surface supplies it.")]
+    pub interaction_options: Option<Vec<crate::kanban::questions::QuestionOption>>,
+    #[schemars(description = "For plain questions: short answer-field guidance, at most 300 characters.")]
+    pub interaction_placeholder: Option<String>,
     #[schemars(description = "For question_answer: the resolved answer. For question_invalidate: optional reason.")]
     pub answer: Option<String>,
     #[schemars(description = "For question_answer/invalidate/update, proposal_approve/reject/apply/get: the question or proposal ID.")]
@@ -2560,6 +2566,13 @@ impl WardwellServer {
                 return json_error(&format!("ticket '{}' not found", tid));
             }
         }
+        if let Err(error) = crate::kanban::questions::validate_interaction(
+            p.interaction_type,
+            p.interaction_options.as_deref(),
+            p.interaction_placeholder.as_deref(),
+        ) {
+            return json_error(&error);
+        }
 
         let now = chrono::Utc::now().to_rfc3339();
         let q = crate::kanban::questions::Question {
@@ -2570,6 +2583,9 @@ impl WardwellServer {
             current_assumption: p.current_assumption.clone(),
             evidence: p.evidence.clone(),
             needed_for: p.needed_for.clone(),
+            interaction_type: p.interaction_type,
+            interaction_options: p.interaction_options.clone(),
+            interaction_placeholder: p.interaction_placeholder.clone(),
             status: crate::kanban::questions::QuestionStatus::Open,
             answer: None,
             created_at: now.clone(),
@@ -2634,8 +2650,31 @@ impl WardwellServer {
             return json_error(&e);
         }
         let existing = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
-        if !existing.iter().any(|q| q.id == *target_id) {
+        let Some(existing_question) = existing.iter().find(|q| q.id == *target_id) else {
             return json_error(&format!("question '{}' not found", target_id));
+        };
+        let interaction_type = p.interaction_type.or(existing_question.interaction_type);
+        let clears_options = p.interaction_type
+            == Some(crate::kanban::questions::QuestionInteractionType::Question)
+            && p.interaction_options.is_none();
+        let interaction_options = if clears_options {
+            None
+        } else {
+            p.interaction_options
+                .as_deref()
+                .or(existing_question.interaction_options.as_deref())
+        };
+        let interaction_placeholder = p
+            .interaction_placeholder
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or(existing_question.interaction_placeholder.as_deref());
+        if let Err(error) = crate::kanban::questions::validate_interaction(
+            interaction_type,
+            interaction_options,
+            interaction_placeholder,
+        ) {
+            return json_error(&error);
         }
         let event = crate::kanban::questions::QuestionEvent::Update {
             id: target_id.clone(),
@@ -2644,6 +2683,13 @@ impl WardwellServer {
             current_assumption: p.current_assumption.clone(),
             evidence: p.evidence.clone(),
             needed_for: p.needed_for.clone(),
+            interaction_type: p.interaction_type,
+            interaction_options: if clears_options {
+                Some(vec![])
+            } else {
+                p.interaction_options.clone()
+            },
+            interaction_placeholder: p.interaction_placeholder.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
         if let Err(e) = crate::kanban::questions::append_event(&self.vault_root, &domain, project, &event) {
@@ -2758,6 +2804,20 @@ impl WardwellServer {
         for (i, val) in changes_json.iter().enumerate() {
             match serde_json::from_value::<crate::kanban::proposals::ChangeOperation>(val.clone()) {
                 Ok(op) => {
+                    if let crate::kanban::proposals::ChangeOperation::CreateQuestion {
+                        interaction_type,
+                        interaction_options,
+                        interaction_placeholder,
+                        ..
+                    } = &op
+                    && let Err(error) = crate::kanban::questions::validate_interaction(
+                        *interaction_type,
+                        interaction_options.as_deref(),
+                        interaction_placeholder.as_deref(),
+                    )
+                    {
+                        return json_error(&format!("change[{}]: {}", i, error));
+                    }
                     // Validate ticket references and collect snapshots
                     let referenced_tickets = extract_ticket_ids_from_op(&op);
                     for tid in &referenced_tickets {
@@ -3107,7 +3167,21 @@ impl WardwellServer {
                     .map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({"op": "create_relationship", "from": from_ticket_id, "to": to_ticket_id, "applied": true}))
             }
-            ChangeOperation::CreateQuestion { question, ticket_id, current_assumption, evidence, needed_for } => {
+            ChangeOperation::CreateQuestion {
+                question,
+                ticket_id,
+                current_assumption,
+                evidence,
+                needed_for,
+                interaction_type,
+                interaction_options,
+                interaction_placeholder,
+            } => {
+                crate::kanban::questions::validate_interaction(
+                    *interaction_type,
+                    interaction_options.as_deref(),
+                    interaction_placeholder.as_deref(),
+                )?;
                 let now = chrono::Utc::now().to_rfc3339();
                 let q = crate::kanban::questions::Question {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -3117,6 +3191,9 @@ impl WardwellServer {
                     current_assumption: current_assumption.clone(),
                     evidence: evidence.clone(),
                     needed_for: needed_for.clone(),
+                    interaction_type: *interaction_type,
+                    interaction_options: interaction_options.clone(),
+                    interaction_placeholder: interaction_placeholder.clone(),
                     status: crate::kanban::questions::QuestionStatus::Open,
                     answer: None,
                     created_at: now.clone(),
@@ -4713,5 +4790,77 @@ mod tests {
         assert_eq!(lines.len(), 3); // schema + first + second
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn question_mcp_persists_a_typed_decision_and_can_return_it_to_a_question() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("personal").join("finance")).unwrap();
+        let server = make_test_server(tmp.path());
+        let store = crate::kanban::store::KanbanStore::open(
+            &tmp.path().join("kanban.db"),
+            tmp.path().to_path_buf(),
+        ).unwrap();
+        let create: KanbanParams = serde_json::from_value(serde_json::json!({
+            "action": "question_create",
+            "domain": "personal",
+            "project": "finance",
+            "question_text": "Keep Figma?",
+            "interaction_type": "decision",
+            "interaction_options": [
+                {"id": "keep", "label": "Keep Figma", "detail": "Retain the workspace."},
+                {"id": "cancel", "label": "Cancel Figma", "detail": "Save the monthly cost."}
+            ],
+            "source": "hank"
+        })).unwrap();
+
+        let created: serde_json::Value = serde_json::from_str(
+            &server.kanban_question_create(&store, &create),
+        ).unwrap();
+        assert_eq!(created["created"], true);
+        let id = created["question"]["id"].as_str().unwrap();
+        let persisted = crate::kanban::questions::read_all(tmp.path(), "personal", "finance");
+        assert_eq!(persisted[0].interaction_type, Some(crate::kanban::questions::QuestionInteractionType::Decision));
+        assert_eq!(persisted[0].interaction_options.as_ref().map(Vec::len), Some(2));
+
+        let update: KanbanParams = serde_json::from_value(serde_json::json!({
+            "action": "question_update",
+            "domain": "personal",
+            "project": "finance",
+            "target_id": id,
+            "interaction_type": "question",
+            "interaction_placeholder": "Explain the preferred outcome"
+        })).unwrap();
+        let updated: serde_json::Value = serde_json::from_str(
+            &server.kanban_question_update(&update),
+        ).unwrap();
+        assert_eq!(updated["updated"], true);
+        let persisted = crate::kanban::questions::read_all(tmp.path(), "personal", "finance");
+        assert_eq!(persisted[0].interaction_type, Some(crate::kanban::questions::QuestionInteractionType::Question));
+        assert_eq!(persisted[0].interaction_options, None);
+        assert_eq!(persisted[0].interaction_placeholder.as_deref(), Some("Explain the preferred outcome"));
+    }
+
+    #[test]
+    fn question_mcp_rejects_a_decision_without_enough_choices() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("personal").join("finance")).unwrap();
+        let server = make_test_server(tmp.path());
+        let store = crate::kanban::store::KanbanStore::open(
+            &tmp.path().join("kanban.db"),
+            tmp.path().to_path_buf(),
+        ).unwrap();
+        let params: KanbanParams = serde_json::from_value(serde_json::json!({
+            "action": "question_create",
+            "domain": "personal",
+            "project": "finance",
+            "question_text": "Keep Figma?",
+            "interaction_type": "decision",
+            "interaction_options": [{"id": "keep", "label": "Keep Figma"}]
+        })).unwrap();
+
+        let result = server.kanban_question_create(&store, &params);
+        assert!(result.contains("requires 2 to 5"));
+        assert!(!crate::kanban::questions::jsonl_path(tmp.path(), "personal", "finance").exists());
     }
 }
