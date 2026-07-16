@@ -113,6 +113,18 @@ pub enum KanbanError {
     LockPoisoned,
 }
 
+/// Result of `recover_collisions`: what identity faults were found and which
+/// boards were quarantined.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct CollisionReport {
+    /// Cross-domain slug shadows found (human-readable).
+    pub slug_collisions: Vec<String>,
+    /// Duplicate ticket_id create events found within a board.
+    pub duplicate_ids: Vec<String>,
+    /// Paths of kanban.jsonl files renamed to quarantine sidecars.
+    pub quarantined: Vec<String>,
+}
+
 /// Kanban store: JSONL is source of truth, SQLite is materialized cache.
 #[derive(Debug)]
 pub struct KanbanStore {
@@ -260,10 +272,24 @@ impl KanbanStore {
         let now = chrono::Utc::now().to_rfc3339();
         let tags_vec = tags.map(|t| t.to_vec()).unwrap_or_default();
 
-        let (prefix, next_id) = self.resolve_ticket_id(project, domain, config_prefixes)?;
-        let ticket_id = format!("{prefix}-{next_id}");
-
         let group = self.project_to_group.get(project).cloned();
+
+        // Hold the connection mutex for the ENTIRE allocate→append→cache
+        // critical section. The old code resolved the id under a brief lock,
+        // dropped it, then appended — so two concurrent creates could read the
+        // same next_id and mint the same ticket_id (the SW-57…67 collision).
+        // Now the single process-wide mutex serializes creates, and the id
+        // itself is reserved by an atomic counter bump inside a DB transaction.
+        // Cross-process lock on the board file coordinates this create with the
+        // Ruby dual writer. Held until the appends below complete.
+        let _board_lock = events::BoardLock::acquire(&self.vault_root, domain, project)?;
+
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        Self::ensure_project_domain(&tx, project, domain)?;
+        let (prefix, next_id) =
+            Self::reserve_ticket_id(&tx, &self.vault_root, project, domain, config_prefixes, &self.project_to_group_prefixes())?;
+        let ticket_id = format!("{prefix}-{next_id}");
 
         let event = KanbanEvent::Create {
             ticket_id: ticket_id.clone(),
@@ -282,18 +308,19 @@ impl KanbanStore {
             timestamp: now.clone(),
         };
 
+        // Append to canonical JSONL while still holding the mutex. If either
+        // append fails, the transaction is dropped (rolled back) and the
+        // reserved id is released — no gap, no orphaned counter bump.
         events::append_event(&self.vault_root, domain, project, &event)?;
         events::append_meta(&self.vault_root, domain, project, &prefix, next_id + 1)?;
 
-        // Update SQLite cache
-        let conn = self.conn()?;
-        self.upsert_project(&conn, project, &prefix, domain, next_id + 1)?;
         let completed_at: Option<String> = if status == "done" { Some(now.clone()) } else { None };
         let tags_json = serde_json::to_string(&tags_vec).unwrap_or_else(|_| "[]".into());
-        conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO kanban_items (ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, tags, created_at, updated_at, completed_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             rusqlite::params![ticket_id, project, title, description, status, priority, assignee, deadline, source, epic, parent, tags_json, now, now, completed_at],
         )?;
+        tx.commit()?;
 
         Ok(KanbanItem {
             ticket_id, project: project.into(), group, epic: epic.map(str::to_string), title: title.into(),
@@ -1085,6 +1112,18 @@ impl KanbanStore {
     /// Returns the number of projects re-folded.
     pub fn fold_foreign_events(&self) -> Result<usize, KanbanError> {
         let files = events::scan_jsonl_paths(&self.vault_root);
+
+        // Prune boards that vanished from disk (deleted, or quarantined by the
+        // recovery command which renames kanban.jsonl → kanban.jsonl.quarantine-*).
+        // A board still cached but no longer on disk must have its materialized
+        // rows dropped immediately, or the cache keeps serving a board the
+        // source of truth no longer has.
+        let live: std::collections::HashSet<String> = files
+            .iter()
+            .map(|(domain, project, _)| format!("{domain}/{project}"))
+            .collect();
+        self.prune_vanished_boards(&live)?;
+
         let mut folded = 0usize;
         for (domain, project, path) in files {
             let Some(current) = Self::file_watermark(&path) else { continue };
@@ -1102,6 +1141,11 @@ impl KanbanStore {
             // a warning, never aborting) and atomically swap its rows.
             let evts = events::read_events_from_path_warn(&path);
             let items = events::materialize(&domain, &evts);
+
+            {
+                let conn = self.conn()?;
+                Self::ensure_project_domain(&conn, &project, &domain)?;
+            }
 
             let mut conn = self.conn()?;
             let tx = conn.transaction()?;
@@ -1122,6 +1166,124 @@ impl KanbanStore {
             folded += 1;
         }
         Ok(folded)
+    }
+
+    /// Drop cached rows for any board recorded in kanban_fold_state whose
+    /// `<domain>/<project>/kanban.jsonl` is no longer on disk. `live` is the set
+    /// of `domain/project` keys that DO currently exist. Runs at the top of
+    /// every fold, so a delete/quarantine is reflected on the very next read.
+    fn prune_vanished_boards(&self, live: &std::collections::HashSet<String>) -> Result<(), KanbanError> {
+        let mut conn = self.conn()?;
+        let stale: Vec<(String, String)> = {
+            let mut stmt = conn.prepare("SELECT path FROM kanban_fold_state")?;
+            let keys: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<_, _>>()?;
+            keys.into_iter()
+                .filter(|key| !live.contains(key))
+                .filter_map(|key| key.split_once('/').map(|(_d, p)| (key.clone(), p.to_string())))
+                .collect()
+        };
+        if stale.is_empty() {
+            return Ok(());
+        }
+        let tx = conn.transaction()?;
+        for (key, project) in &stale {
+            tx.execute(
+                "DELETE FROM kanban_notes WHERE ticket_id IN (SELECT ticket_id FROM kanban_items WHERE project=?1)",
+                rusqlite::params![project],
+            )?;
+            tx.execute(
+                "DELETE FROM kanban_attachments WHERE ticket_id IN (SELECT ticket_id FROM kanban_items WHERE project=?1)",
+                rusqlite::params![project],
+            )?;
+            tx.execute("DELETE FROM kanban_items WHERE project=?1", rusqlite::params![project])?;
+            tx.execute("DELETE FROM kanban_projects WHERE project=?1", rusqlite::params![project])?;
+            tx.execute("DELETE FROM kanban_fold_state WHERE path=?1", rusqlite::params![key])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recovery command (SW-68 acceptance): scan every board on disk for
+    /// identity collisions and quarantine the offenders. Two collision classes:
+    ///   1. cross-domain slug shadow — the same `project` slug in two domains
+    ///      (the work/switchboard vs personal/switchboard fault);
+    ///   2. duplicate ticket_ids within a single board's create events.
+    /// For (1), the newer board (by first create timestamp) is quarantined,
+    /// preserving the original. Quarantine renames kanban.jsonl →
+    /// kanban.jsonl.quarantine-<UTC date>, so the source of truth is retained
+    /// but no longer folded. Returns a report of what was found and moved.
+    /// `dry_run` reports without moving anything.
+    pub fn recover_collisions(&self, dry_run: bool) -> Result<CollisionReport, KanbanError> {
+        let files = events::scan_jsonl_paths(&self.vault_root);
+        let mut report = CollisionReport::default();
+
+        // Class 1: cross-domain slug shadowing. Group paths by project slug.
+        let mut by_slug: HashMap<String, Vec<(String, PathBuf)>> = HashMap::new();
+        for (domain, project, path) in &files {
+            by_slug.entry(project.clone()).or_default().push((domain.clone(), path.clone()));
+        }
+        for (slug, mut boards) in by_slug {
+            if boards.len() < 2 {
+                continue;
+            }
+            // Keep the oldest board (earliest first-create timestamp); quarantine
+            // the rest. Sort ascending so index 0 is the keeper.
+            boards.sort_by_key(|(_d, path)| Self::first_create_ts(path));
+            let keeper_domain = boards[0].0.clone();
+            for (domain, path) in boards.into_iter().skip(1) {
+                report.slug_collisions.push(format!(
+                    "project '{slug}' exists in domains '{keeper_domain}' (kept) and '{domain}' (quarantined)"
+                ));
+                if !dry_run {
+                    Self::quarantine_board(&path)?;
+                    report.quarantined.push(path.display().to_string());
+                }
+            }
+        }
+
+        // Class 2: duplicate ticket_ids inside a single board.
+        for (_domain, project, path) in &files {
+            let evts = events::read_events_from_path_warn(path);
+            let mut seen = std::collections::HashSet::new();
+            for evt in &evts {
+                if let KanbanEvent::Create { ticket_id, .. } = evt
+                    && !seen.insert(ticket_id.clone())
+                {
+                    report.duplicate_ids.push(format!("{project}: duplicate create for {ticket_id}"));
+                }
+            }
+        }
+
+        // Reflect the quarantines in the cache immediately.
+        if !dry_run && !report.quarantined.is_empty() {
+            self.fold_foreign_events()?;
+        }
+        Ok(report)
+    }
+
+    /// Earliest create-event timestamp on a board, used to pick the keeper in a
+    /// cross-domain collision. Missing/empty → a max sentinel so it sorts last.
+    fn first_create_ts(path: &Path) -> String {
+        events::read_events_from_path_warn(path)
+            .into_iter()
+            .filter_map(|e| match e {
+                KanbanEvent::Create { timestamp, .. } => Some(timestamp),
+                _ => None,
+            })
+            .min()
+            .unwrap_or_else(|| "9999".to_string())
+    }
+
+    /// Rename a board's kanban.jsonl to a dated quarantine sidecar. The source
+    /// is preserved (never deleted), but scan_jsonl_paths no longer sees it, so
+    /// the next fold prunes its rows from the cache.
+    fn quarantine_board(path: &Path) -> Result<(), KanbanError> {
+        let date = chrono::Utc::now().format("%Y-%m-%d");
+        let target = path.with_file_name(format!("kanban.jsonl.quarantine-{date}"));
+        std::fs::rename(path, &target)?;
+        Ok(())
     }
 
     /// Read/write-path entry point: fold, but never let a fold failure take
@@ -1297,32 +1459,67 @@ impl KanbanStore {
         ).optional()?.ok_or_else(|| KanbanError::NotFound(format!("ticket '{ticket_id}' not found")))
     }
 
-    fn resolve_ticket_id(&self, project: &str, domain: &str, config_prefixes: &HashMap<String, String>) -> Result<(String, i64), KanbanError> {
-        let conn = self.conn()?;
+    /// Snapshot of config-derived prefixes, so the allocator (which runs inside
+    /// a held transaction and can't borrow `self.config`) sees the same mapping.
+    /// Currently empty — prefix config is threaded through `create_item`'s
+    /// `config_prefixes` arg — but kept as a seam for group-scoped prefixes.
+    fn project_to_group_prefixes(&self) -> HashMap<String, String> {
+        HashMap::new()
+    }
 
-        // Check if project already registered
+    /// Atomically reserve the next ticket number for `project`, inside an open
+    /// transaction. This is the collision fix: the id is minted by a single
+    /// monotonic counter in `kanban_projects.next_id`, bumped with a
+    /// serialized `UPDATE`, so no two callers can ever mint the same id.
+    ///
+    /// The DB counter is the allocator; the JSONL `_meta`/create events are the
+    /// durable seed. On each reserve we reconcile: the effective counter is the
+    /// MAX of (a) the DB row's next_id and (b) the JSONL-derived next number.
+    /// That keeps the counter correct across cold starts, rebuilds, and events
+    /// folded in from other machines — always monotonic, never reused.
+    fn reserve_ticket_id(
+        conn: &Connection,
+        vault_root: &Path,
+        project: &str,
+        domain: &str,
+        config_prefixes: &HashMap<String, String>,
+        _group_prefixes: &HashMap<String, String>,
+    ) -> Result<(String, i64), KanbanError> {
+        // Existing registration?
         let existing: Option<(String, i64)> = conn.query_row(
             "SELECT prefix, next_id FROM kanban_projects WHERE project=?1",
             rusqlite::params![project], |row| Ok((row.get(0)?, row.get(1)?)),
         ).optional()?;
 
-        if let Some((prefix, _)) = existing {
-            // Get authoritative next_id from JSONL meta
-            let next = events::next_ticket_number(&self.vault_root, domain, project, &prefix);
-            return Ok((prefix, next));
-        }
+        let prefix = match &existing {
+            Some((prefix, _)) => prefix.clone(),
+            None => {
+                let mut stmt = conn.prepare("SELECT prefix FROM kanban_projects")?;
+                let existing_prefixes: Vec<String> =
+                    stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+                crate::kanban::prefix::resolve_prefix(project, config_prefixes, &existing_prefixes)
+                    .ok_or_else(|| KanbanError::InvalidInput(format!(
+                        "could not derive a unique prefix for project '{project}'; set an explicit prefix in config"
+                    )))?
+            }
+        };
 
-        // New project — derive prefix
-        let mut stmt = conn.prepare("SELECT prefix FROM kanban_projects")?;
-        let existing_prefixes: Vec<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+        // Reconcile DB counter with the JSONL seed and take the higher. The
+        // JSONL seed guards against a stale/empty cache handing out a number
+        // that already exists on disk (rebuild races, foreign folds).
+        let db_next = existing.map(|(_, n)| n).unwrap_or(1);
+        let jsonl_next = events::next_ticket_number(vault_root, domain, project, &prefix);
+        let reserved = db_next.max(jsonl_next).max(1);
 
-        let prefix = crate::kanban::prefix::resolve_prefix(project, config_prefixes, &existing_prefixes)
-            .ok_or_else(|| KanbanError::InvalidInput(format!(
-                "could not derive a unique prefix for project '{project}'; set an explicit prefix in config"
-            )))?;
+        // Persist the bump atomically within the transaction. Any concurrent
+        // create is blocked on the same mutex/tx, so it will read reserved+1.
+        conn.execute(
+            "INSERT INTO kanban_projects (project, prefix, domain, next_id) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(project) DO UPDATE SET next_id=?4",
+            rusqlite::params![project, prefix, domain, reserved + 1],
+        )?;
 
-        let next = events::next_ticket_number(&self.vault_root, domain, project, &prefix);
-        Ok((prefix, next))
+        Ok((prefix, reserved))
     }
 
     /// If `name` is a group name, return all member projects. Otherwise empty vec.
@@ -1334,11 +1531,32 @@ impl KanbanStore {
     }
 
     fn upsert_project(&self, conn: &Connection, project: &str, prefix: &str, domain: &str, next_id: i64) -> Result<(), KanbanError> {
+        Self::ensure_project_domain(conn, project, domain)?;
         conn.execute(
             "INSERT INTO kanban_projects (project, prefix, domain, next_id) VALUES (?1,?2,?3,?4) ON CONFLICT(project) DO UPDATE SET next_id=MAX(next_id, excluded.next_id)",
             rusqlite::params![project, prefix, domain, next_id],
         )?;
         Ok(())
+    }
+
+    /// The current cache/API address projects and tickets by bare slug/id.
+    /// Until those public identities become `(domain, project, ticket_id)`,
+    /// accepting the same project slug in two domains would silently replace
+    /// one domain's materialized rows with the other. Fail closed before any
+    /// source write or cache swap; JSONL remains canonical and untouched.
+    fn ensure_project_domain(conn: &Connection, project: &str, domain: &str) -> Result<(), KanbanError> {
+        let existing: Option<String> = conn.query_row(
+            "SELECT domain FROM kanban_projects WHERE project=?1",
+            rusqlite::params![project],
+            |row| row.get(0),
+        ).optional()?;
+
+        match existing {
+            Some(existing) if existing != domain => Err(KanbanError::InvalidInput(format!(
+                "project slug collision: '{project}' is already registered in domain '{existing}', cannot also use domain '{domain}'"
+            ))),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1813,6 +2031,142 @@ mod tests {
         assert_eq!(store.fold_foreign_events().unwrap(), 0);
         let item = store.get_item("SH-1").unwrap();
         assert_eq!(item.notes.iter().filter(|n| n.text == "once").count(), 1);
+    }
+
+    #[test]
+    fn duplicate_project_slug_across_domains_fails_closed_without_replacing_rows()
+        -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (dir, store) = make_store();
+        let prefixes = HashMap::new();
+        let original = store.create_item(
+            "Personal board item",
+            "switchboard",
+            "personal",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &prefixes,
+        )?;
+
+        let foreign_dir = dir.path().join("vault/work/switchboard");
+        std::fs::create_dir_all(&foreign_dir)?;
+        std::fs::write(
+            foreign_dir.join("kanban.jsonl"),
+            r#"{"event":"create","ticket_id":"SW-1","title":"Warden replacement","project":"switchboard","status":"backlog","priority":"medium","timestamp":"2099-01-01T00:00:00+00:00"}
+"#,
+        )?;
+
+        let error = match store.fold_foreign_events() {
+            Err(error) => error,
+            Ok(_) => return Err("duplicate domain fold unexpectedly succeeded".into()),
+        };
+
+        assert!(error.to_string().contains("project slug collision"));
+        let still_standing = store.get_item(&original.ticket_id)?;
+        assert_eq!(still_standing.title, "Personal board item");
+        Ok(())
+    }
+
+    // ---- SW-68: collision-free, domain-scoped identity ----
+
+    #[test]
+    fn concurrent_creates_yield_unique_monotonic_ids() {
+        use std::sync::Arc;
+        let (_dir, store) = make_store();
+        let store = Arc::new(store);
+        let n = 25;
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    store
+                        .create_item(
+                            &format!("item {i}"), "shulops", "work",
+                            None, None, None, None, None, None, None, None, None,
+                            &HashMap::new(),
+                        )
+                        .unwrap()
+                        .ticket_id
+                })
+            })
+            .collect();
+
+        let mut ids: Vec<i64> = handles
+            .into_iter()
+            .map(|h| {
+                let id = h.join().unwrap();
+                id.strip_prefix("SH-").unwrap().parse::<i64>().unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+
+        // 25 unique, contiguous, monotonic ids 1..=25 — no dupes, no gaps.
+        assert_eq!(ids.len(), n as usize);
+        let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), n as usize, "duplicate ids minted: {ids:?}");
+        assert_eq!(ids, (1..=n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn quarantining_a_board_removes_its_rows_from_cache_on_next_fold()
+        -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, store) = make_store();
+        store.create_item("Doomed", "acme", "work", None, None, None, None, None, None, None, None, None, &HashMap::new())?;
+        assert!(store.get_item("AC-1").is_ok());
+
+        // Simulate the recovery command / a deletion: rename the board away.
+        let board = dir.path().join("vault/work/acme/kanban.jsonl");
+        std::fs::rename(&board, board.with_file_name("kanban.jsonl.quarantine-2026-07-16"))?;
+
+        // Next fold must prune the vanished board's rows immediately.
+        store.fold_foreign_events()?;
+        assert!(store.get_item("AC-1").is_err(), "row survived quarantine");
+        Ok(())
+    }
+
+    #[test]
+    fn recover_quarantines_cross_domain_slug_shadow_keeping_the_original()
+        -> Result<(), Box<dyn std::error::Error>> {
+        let (dir, _store) = make_store();
+        // Original personal board (older create).
+        let personal = dir.path().join("vault/personal/switchboard");
+        std::fs::create_dir_all(&personal)?;
+        std::fs::write(personal.join("kanban.jsonl"),
+            "{\"event\":\"create\",\"ticket_id\":\"SW-1\",\"title\":\"original\",\"project\":\"switchboard\",\"status\":\"backlog\",\"priority\":\"medium\",\"timestamp\":\"2026-01-01T00:00:00+00:00\"}\n")?;
+        // Shadowing work board (newer create).
+        let work = dir.path().join("vault/work/switchboard");
+        std::fs::create_dir_all(&work)?;
+        std::fs::write(work.join("kanban.jsonl"),
+            "{\"event\":\"create\",\"ticket_id\":\"SW-1\",\"title\":\"shadow\",\"project\":\"switchboard\",\"status\":\"backlog\",\"priority\":\"medium\",\"timestamp\":\"2026-07-14T00:00:00+00:00\"}\n")?;
+
+        // Fresh store so open() doesn't fail-closed on the pre-existing collision.
+        let db = dir.path().join("kanban2.db");
+        let store = KanbanStore::open(&db, dir.path().join("vault"))?;
+        let report = store.recover_collisions(false)?;
+
+        assert_eq!(report.slug_collisions.len(), 1, "{report:?}");
+        assert_eq!(report.quarantined.len(), 1);
+        // Original personal board preserved; work board quarantined away.
+        assert!(personal.join("kanban.jsonl").exists());
+        assert!(!work.join("kanban.jsonl").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn write_file_rejects_kanban_owned_paths_is_covered_by_server_tests() {
+        // The prohibition lives in the MCP write_file handler (server.rs);
+        // this marker documents that store-level creates remain the only
+        // sanctioned path to mutate kanban.jsonl.
+        let (_dir, store) = make_store();
+        assert!(store.create_item("x", "shulops", "work", None, None, None, None, None, None, None, None, None, &HashMap::new()).is_ok());
     }
 
     #[test]

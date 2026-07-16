@@ -456,7 +456,8 @@ impl WardwellServer {
             "hygiene_suggestions" => self.kanban_hygiene_suggestions(kanban, &p),
             "plan" => self.kanban_plan(kanban, &p),
             "groom" => self.kanban_groom(kanban, &p),
-            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan, groom")),
+            "recover" => self.kanban_recover(kanban, &p),
+            other => json_error(&format!("unknown kanban action '{other}'. Use: get, list, search, create, update, move, note, query, attach, detach, sequence, export_roadmap, relationship_create, relationship_list, relationship_delete, question_create, question_list, question_update, question_answer, question_invalidate, proposal_create, proposal_get, proposal_list, proposal_approve, proposal_reject, proposal_apply, verify, reality_check, hygiene_suggestions, plan, groom, recover")),
         }
     }
 
@@ -2053,6 +2054,24 @@ impl WardwellServer {
             return json_error("path cannot contain '..'");
         }
 
+        // Prohibit generic writes to kanban-owned files. kanban.jsonl is the
+        // canonical, append-only event log; a raw overwrite here would corrupt
+        // the board's identity and desync the SQLite projection (which folds
+        // from these files). All kanban mutation must go through
+        // wardwell_kanban, which allocates ids atomically and keeps the cache
+        // consistent. (SW-68: "Generic file writes must ... be prohibited for
+        // kanban-owned files.")
+        let basename = std::path::Path::new(rel_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if basename == "kanban.jsonl" || basename.starts_with("kanban.jsonl.") {
+            return json_error(
+                "refusing to write_file to a kanban-owned file (kanban.jsonl); \
+                 use the wardwell_kanban tool for board mutations",
+            );
+        }
+
         let project_dir = self.vault_root.join(&p.domain).join(project);
         let file_path = project_dir.join(rel_path);
 
@@ -3256,6 +3275,21 @@ impl WardwellServer {
     }
 
     // ---- Reality check handler ----
+
+    /// Recovery command (SW-68): scan all boards for identity collisions
+    /// (cross-domain slug shadows, duplicate ticket_ids) and quarantine the
+    /// offenders. Defaults to a dry run; set full=true to actually quarantine.
+    fn kanban_recover(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
+        let apply = p.full.unwrap_or(false);
+        match kanban.recover_collisions(!apply) {
+            Ok(report) => serde_json::to_string(&serde_json::json!({
+                "dry_run": !apply,
+                "report": report,
+                "hint": if apply { "collisions quarantined" } else { "dry run — set full:true to quarantine" },
+            })).unwrap_or_default(),
+            Err(e) => json_error(&e.to_string()),
+        }
+    }
 
     fn kanban_reality_check(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> String {
         let Some(ref project) = p.project else {

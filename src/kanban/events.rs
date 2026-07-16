@@ -165,6 +165,42 @@ pub fn jsonl_path(vault_root: &Path, domain: &str, project: &str) -> PathBuf {
     vault_root.join(domain).join(project).join("kanban.jsonl")
 }
 
+/// An exclusive advisory lock (flock LOCK_EX) on a board's kanban.jsonl,
+/// released on drop. SW-68: this is what coordinates the two dual writers —
+/// the Rust MCP server (here) and the Ruby app (KanbanJsonl#with_board_lock) —
+/// so a create's read-max-id → append-create → append-meta section is atomic
+/// ACROSS processes, not just across this process's mutex. Without it, the
+/// Rust and Ruby writers could each read the same next_id and mint a duplicate
+/// ticket id even though each is internally serialized.
+pub struct BoardLock {
+    file: std::fs::File,
+}
+
+impl BoardLock {
+    /// Acquire the lock, creating the board file (and its dir) if absent so the
+    /// first create on a brand-new board can still lock. Blocks until held.
+    pub fn acquire(vault_root: &Path, domain: &str, project: &str) -> Result<Self, std::io::Error> {
+        let dir = vault_root.join(domain).join(project);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("kanban.jsonl");
+        let file = std::fs::OpenOptions::new().create(true).append(true).read(true).open(&path)?;
+        // SAFETY: flock on a valid fd; LOCK_EX blocks until acquired.
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&file);
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for BoardLock {
+    fn drop(&mut self) {
+        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&self.file);
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+    }
+}
+
 pub fn append_event(vault_root: &Path, domain: &str, project: &str, event: &KanbanEvent) -> Result<(), std::io::Error> {
     let dir = vault_root.join(domain).join(project);
     std::fs::create_dir_all(&dir)?;
