@@ -118,6 +118,12 @@ pub enum ChangeOperation {
         evidence: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         needed_for: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interaction_type: Option<crate::kanban::questions::QuestionInteractionType>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interaction_options: Option<Vec<crate::kanban::questions::QuestionOption>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interaction_placeholder: Option<String>,
     },
     #[serde(rename = "answer_question")]
     AnswerQuestion {
