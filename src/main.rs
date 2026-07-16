@@ -2,7 +2,11 @@ use clap::{Parser, Subcommand};
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "wardwell", version, about = "Personal AI knowledge vault — MCP server")]
+#[command(
+    name = "wardwell",
+    version,
+    about = "Personal AI knowledge vault — MCP server"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,6 +22,15 @@ enum Commands {
     },
     /// First-run setup — generates config, injects MCP entries, installs hooks
     Init,
+    /// Set up or repair Wardwell on this computer
+    Setup {
+        /// Show intended client-config changes without writing them
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply client-config changes without an interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Check that everything is wired correctly
     Doctor,
     /// Clean removal — removes MCP entries, hooks, and markers (preserves vault data)
@@ -50,6 +63,7 @@ async fn main() {
             run_serve(domain).await
         }
         Commands::Init => wardwell::install::init::run(),
+        Commands::Setup { dry_run, yes } => wardwell::install::setup::run(dry_run, yes),
         Commands::Doctor => wardwell::install::doctor::run(),
         Commands::Uninstall => wardwell::install::uninstall::run(),
         Commands::Inject { ref path } => run_inject(path),
@@ -125,8 +139,14 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
             match IndexBuilder::build_filtered(&bg_index, root, &bg_exclude, None) {
                 Ok(stats) => {
                     if stats.indexed > 0 || stats.removed > 0 {
-                        eprintln!("wardwell: indexed {} files from {} ({} skipped, {} removed, {} errors)",
-                            stats.indexed, root.display(), stats.skipped, stats.removed, stats.errors);
+                        eprintln!(
+                            "wardwell: indexed {} files from {} ({} skipped, {} removed, {} errors)",
+                            stats.indexed,
+                            root.display(),
+                            stats.skipped,
+                            stats.removed,
+                            stats.errors
+                        );
                     }
                 }
                 Err(e) => eprintln!("wardwell: index error for {}: {e}", root.display()),
@@ -144,15 +164,27 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
                 // 3. Re-index with embeddings for any files that need chunk vectors
                 for root in &bg_roots {
                     let mut emb_guard = bg_embedder.lock().unwrap_or_else(|e| e.into_inner());
-                    let result = IndexBuilder::build_filtered(&bg_index, root, &bg_exclude, emb_guard.as_mut());
+                    let result = IndexBuilder::build_filtered(
+                        &bg_index,
+                        root,
+                        &bg_exclude,
+                        emb_guard.as_mut(),
+                    );
                     drop(emb_guard);
                     match result {
                         Ok(stats) => {
                             if stats.chunks_embedded > 0 {
-                                eprintln!("wardwell: embedded {} chunks from {}", stats.chunks_embedded, root.display());
+                                eprintln!(
+                                    "wardwell: embedded {} chunks from {}",
+                                    stats.chunks_embedded,
+                                    root.display()
+                                );
                             }
                         }
-                        Err(e) => eprintln!("wardwell: embedding index error for {}: {e}", root.display()),
+                        Err(e) => eprintln!(
+                            "wardwell: embedding index error for {}: {e}",
+                            root.display()
+                        ),
                     }
                 }
             }
@@ -177,7 +209,13 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
             None
         };
         tokio::spawn(async move {
-            if let Err(e) = wardwell::daemon::watcher::watch_vault(root.clone(), watcher_index, registry_for_watcher).await {
+            if let Err(e) = wardwell::daemon::watcher::watch_vault(
+                root.clone(),
+                watcher_index,
+                registry_for_watcher,
+            )
+            .await
+            {
                 eprintln!("wardwell: watcher error for {}: {e}", root.display());
             }
         });
@@ -190,7 +228,14 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
     let summaries_dir = config_dir.join("summaries");
     let sessions_db = config_dir.join("sessions.db");
     tokio::spawn(async move {
-        run_daemon_loop(sessions_db, session_sources, domains, summaries_dir, ai_config).await;
+        run_daemon_loop(
+            sessions_db,
+            session_sources,
+            domains,
+            summaries_dir,
+            ai_config,
+        )
+        .await;
     });
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
@@ -221,19 +266,31 @@ async fn run_daemon_loop(
         match indexer::index_sessions(&session_sources, &session_store, &domains) {
             Ok(stats) => {
                 if stats.indexed > 0 {
-                    eprintln!("wardwell: indexed {} sessions ({} skipped, {} errors)",
-                        stats.indexed, stats.skipped, stats.errors);
+                    eprintln!(
+                        "wardwell: indexed {} sessions ({} skipped, {} errors)",
+                        stats.indexed, stats.skipped, stats.errors
+                    );
                 }
             }
             Err(e) => eprintln!("wardwell: session indexing error: {e}"),
         }
 
         // 2. Summarize via claude CLI
-        match summarizer::summarize_pending(&session_store, &session_sources, &summaries_dir, &ai_config.summarize_model, false).await {
+        match summarizer::summarize_pending(
+            &session_store,
+            &session_sources,
+            &summaries_dir,
+            &ai_config.summarize_model,
+            false,
+        )
+        .await
+        {
             Ok(stats) => {
                 if stats.summarized > 0 {
-                    eprintln!("wardwell: summarized {} sessions ({} skipped, {} errors)",
-                        stats.summarized, stats.skipped, stats.errors);
+                    eprintln!(
+                        "wardwell: summarized {} sessions ({} skipped, {} errors)",
+                        stats.summarized, stats.skipped, stats.errors
+                    );
                 }
             }
             Err(e) => eprintln!("wardwell: summarization error: {e}"),
@@ -257,19 +314,14 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Try to match cwd to a vault domain by checking if cwd directory name
     // matches a subdirectory of the vault
     let cwd_path = std::path::Path::new(cwd);
-    let cwd_name = cwd_path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let cwd_name = cwd_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-    let matched_domain = std::fs::read_dir(vault_path).ok()
-        .and_then(|entries| {
-            entries.flatten()
-                .find(|e| {
-                    e.path().is_dir()
-                        && e.file_name().to_string_lossy() == cwd_name
-                })
-                .map(|e| e.path())
-        });
+    let matched_domain = std::fs::read_dir(vault_path).ok().and_then(|entries| {
+        entries
+            .flatten()
+            .find(|e| e.path().is_dir() && e.file_name().to_string_lossy() == cwd_name)
+            .map(|e| e.path())
+    });
 
     if let Some(domain_dir) = matched_domain {
         // Found a matching domain — output its project summaries
@@ -282,7 +334,8 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Output context for a specific domain's projects.
 fn inject_domain_context(domain_dir: &Path) {
-    let domain = domain_dir.file_name()
+    let domain = domain_dir
+        .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
@@ -304,10 +357,11 @@ fn inject_domain_context(domain_dir: &Path) {
                 if state.exists()
                     && let Ok(vf) = wardwell::vault::reader::read_file(&state)
                 {
-                    let project = p.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
-                    let status = vf.frontmatter.status.as_ref()
+                    let project = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                    let status = vf
+                        .frontmatter
+                        .status
+                        .as_ref()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "active".to_string());
                     let focus = extract_section_simple(&vf.body, "Focus");
@@ -334,14 +388,12 @@ fn extract_section_simple(body: &str, heading: &str) -> String {
     rest[..end].trim().to_string()
 }
 
-
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
     // No-op. Session logging is handled by CLAUDE.md behavioral rules.
     // The hook entry is kept so wardwell can re-enable blocking if
     // Claude Code adds a silent block mechanism.
     Ok(())
 }
-
 
 fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;
@@ -358,7 +410,10 @@ fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
     index.clear()?;
 
     if !config.vault_path.exists() {
-        println!("Vault directory does not exist: {}", config.vault_path.display());
+        println!(
+            "Vault directory does not exist: {}",
+            config.vault_path.display()
+        );
         return Ok(());
     }
 
@@ -375,8 +430,16 @@ fn run_reindex() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let stats = IndexBuilder::build_filtered(&index, &config.vault_path, &config.exclude, embedder.as_mut())?;
-    println!("Reindexed {} file(s) ({} skipped, {} error(s)).", stats.indexed, stats.skipped, stats.errors);
+    let stats = IndexBuilder::build_filtered(
+        &index,
+        &config.vault_path,
+        &config.exclude,
+        embedder.as_mut(),
+    )?;
+    println!(
+        "Reindexed {} file(s) ({} skipped, {} error(s)).",
+        stats.indexed, stats.skipped, stats.errors
+    );
     if stats.chunks_embedded > 0 {
         println!("Embedded {} chunks.", stats.chunks_embedded);
     }
@@ -426,11 +489,18 @@ fn run_seed(target: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rel = format!("{domain}/{project}");
 
     std::fs::create_dir_all(&project_dir)?;
-    println!("  Creating  {rel}/                {:>width$}", "\u{2713}", width = 40_usize.saturating_sub(rel.len() + 12));
+    println!(
+        "  Creating  {rel}/                {:>width$}",
+        "\u{2713}",
+        width = 40_usize.saturating_sub(rel.len() + 12)
+    );
 
     // INDEX.md
     let index_path = project_dir.join("INDEX.md");
-    std::fs::write(&index_path, format!("\
+    std::fs::write(
+        &index_path,
+        format!(
+            "\
 # {title}
 
 ## What
@@ -441,12 +511,17 @@ fn run_seed(target: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 ## Links
 (related vault files, external URLs)
-"))?;
+"
+        ),
+    )?;
     println!("  Writing   {rel}/INDEX.md         \u{2713}");
 
     // current_state.md
     let state_path = project_dir.join("current_state.md");
-    std::fs::write(&state_path, format!("\
+    std::fs::write(
+        &state_path,
+        format!(
+            "\
 ---
 chat_name: {project}
 updated: {now}
@@ -465,7 +540,9 @@ context: {domain}
 
 ## Commit Message
 Seeded by wardwell
-"))?;
+"
+        ),
+    )?;
     println!("  Writing   {rel}/current_state.md \u{2713}");
 
     println!("\n  Done. Fill in the placeholders in INDEX.md and current_state.md.");
@@ -522,7 +599,9 @@ fn run_migrate_attachments() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                let source = if old_path.exists() { &old_path } else {
+                let source = if old_path.exists() {
+                    &old_path
+                } else {
                     skipped += 1;
                     continue;
                 };
@@ -539,7 +618,10 @@ fn run_migrate_attachments() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 std::fs::copy(source, &dest)?;
-                println!("  {} → {domain}/{project}/docs/{dest_filename}", att.storage_path);
+                println!(
+                    "  {} → {domain}/{project}/docs/{dest_filename}",
+                    att.storage_path
+                );
                 migrated += 1;
             }
         }
@@ -547,8 +629,9 @@ fn run_migrate_attachments() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nMigrated: {migrated}, Skipped: {skipped}");
     if migrated > 0 {
-        println!("Note: Old files left in ~/.wardwell/attachments/ — delete manually after verifying.");
+        println!(
+            "Note: Old files left in ~/.wardwell/attachments/ — delete manually after verifying."
+        );
     }
     Ok(())
 }
-

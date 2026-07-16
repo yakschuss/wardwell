@@ -25,6 +25,18 @@ wardwell init
 
 This creates `~/.wardwell/`, generates a config, registers the MCP server in Claude Code, and installs the SessionStart hook. It walks you through each step interactively.
 
+On an additional computer, or to repair agent connections without touching the
+vault, run:
+
+```bash
+wardwell setup --dry-run
+wardwell setup
+```
+
+`setup` reconciles Wardwell's user-scoped entries in Claude Code, Claude
+Desktop, and Codex. It preserves unrelated MCP servers, backs up changed client
+configs, and leaves hosted access disconnected until you approve OAuth.
+
 ## How It Works
 
 Wardwell has three pieces:
@@ -157,6 +169,8 @@ The hook runs `wardwell inject "$(pwd)"` and outputs the content of `current_sta
 wardwell serve                Start the MCP server (full access)
 wardwell serve --domain work  Start scoped to a specific domain
 wardwell init                 First-run setup — interactive walkthrough
+wardwell setup --dry-run      Preview agent config repair; never changes the vault
+wardwell setup                Configure detected agents, with backups and one consent gate
 wardwell doctor               Check that everything is wired correctly
 wardwell uninstall            Clean removal — MCP entries, hooks, markers (preserves vault)
 wardwell inject .             Output project context for a directory (used by hooks)
@@ -176,6 +190,14 @@ Interactive setup that walks you through:
 6. Building the search index
 
 Each step can be skipped. Skipped steps are listed at the end with manual instructions. Re-running `init` is safe — it detects existing config and updates in place.
+
+### wardwell setup
+
+Configures or repairs this computer after Wardwell itself is installed. Unlike
+`init`, it does not inspect, create, index, or change vault files. Before any
+write it preflights every detected client and aborts on malformed or conflicting
+configuration. OAuth approval and a successful publish/refresh remain required
+before the hosted app is considered connected.
 
 ### wardwell seed
 
@@ -199,9 +221,13 @@ Checks that everything is wired correctly:
 - Vault directory exists with indexed files
 - Domains detected
 - Index built
-- MCP configured in Claude Code and Desktop
+- Local context and hosted-app MCP entries configured in Claude Code and Codex
+- Local context configured in Claude Desktop; hosted access remains an account connector
 - SessionStart hook registered
 - Claude CLI available (for summarizer)
+
+`doctor` verifies configuration, not authorization. Complete OAuth and publish
+or refresh one brief to prove the live end-to-end connection.
 
 ## Config
 

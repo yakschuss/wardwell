@@ -1,5 +1,6 @@
-pub mod init;
-pub mod doctor;
-pub mod uninstall;
-mod mcp_config;
 mod detect;
+pub mod doctor;
+pub mod init;
+mod mcp_config;
+pub mod setup;
+pub mod uninstall;

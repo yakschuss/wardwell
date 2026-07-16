@@ -1,5 +1,14 @@
 use std::path::PathBuf;
 
+pub fn command_available(command: &str) -> bool {
+    std::process::Command::new(command)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Find the wardwell binary path for MCP config.
 pub fn find_binary_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
@@ -104,4 +113,3 @@ fn expand_tilde(path: &str) -> String {
     }
     path.to_string()
 }
-

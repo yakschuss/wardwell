@@ -1,6 +1,6 @@
 use crate::config::loader::{self, config_dir};
 use crate::install::detect;
-use crate::install::mcp_config::{self, McpConfigPaths, RemoveResult};
+use crate::install::mcp_config::{self, McpConfigPaths, RemovalResult};
 
 /// Clean removal. Reverse of init.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,19 +9,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Remove MCP config entries
     let mcp_paths = McpConfigPaths::detect();
 
-    print!("  Removing Claude Code MCP entry...   ");
-    match mcp_config::remove_mcp_entry(&mcp_paths.claude_code) {
-        Ok(RemoveResult::Removed) => println!("removed"),
-        Ok(RemoveResult::NotFound) => println!("not found (ok)"),
-        Err(e) => println!("error: {e}"),
-    }
-
-    print!("  Removing Desktop MCP entry...       ");
-    match mcp_config::remove_mcp_entry(&mcp_paths.claude_desktop) {
-        Ok(RemoveResult::Removed) => println!("removed"),
-        Ok(RemoveResult::NotFound) => println!("not found (ok)"),
-        Err(e) => println!("error: {e}"),
-    }
+    print_removal(
+        "Claude Code MCP entries",
+        mcp_config::remove_owned_json_entries(&mcp_paths.claude_code, true),
+    );
+    print_removal(
+        "Claude Desktop MCP entries",
+        mcp_config::remove_owned_json_entries(&mcp_paths.claude_desktop, true),
+    );
+    print_removal(
+        "Codex MCP entries",
+        mcp_config::remove_owned_codex_entries(&mcp_paths.codex),
+    );
 
     // 2. Remove CLAUDE.md markers
     let config = loader::load(Some(&config_dir().join("config.yml"))).ok();
@@ -94,9 +93,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("  Removed MCP entries, hooks, markers, and databases.");
-    println!("  Your vault and config preserved at {}.", config_dir().display());
+    println!(
+        "  Your vault and config preserved at {}.",
+        config_dir().display()
+    );
 
     Ok(())
+}
+
+fn print_removal(label: &str, result: Result<RemovalResult, std::io::Error>) {
+    print!("  Removing {label}...  ");
+    match result {
+        Ok(RemovalResult {
+            removed: true,
+            backup_path,
+        }) => {
+            println!("removed");
+            if let Some(backup) = backup_path {
+                println!("    backup: {}", backup.display());
+            }
+        }
+        Ok(RemovalResult { removed: false, .. }) => println!("not found (ok)"),
+        Err(error) => println!("unchanged: {error}"),
+    }
 }
 
 /// Remove wardwell hooks from a given event in settings.json.
@@ -106,8 +125,8 @@ fn remove_hook(settings_path: &std::path::Path, event: &str) -> Result<bool, std
     }
 
     let content = std::fs::read_to_string(settings_path)?;
-    let mut config: serde_json::Value = serde_json::from_str(&content)
-        .unwrap_or_else(|_| serde_json::json!({}));
+    let mut config: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
 
     let removed = if let Some(hooks) = config.get_mut("hooks")
         && let Some(event_hooks) = hooks.get_mut(event)
@@ -115,12 +134,20 @@ fn remove_hook(settings_path: &std::path::Path, event: &str) -> Result<bool, std
     {
         let before = entries.len();
         entries.retain(|entry| {
-            let is_wardwell = entry.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("wardwell"))
-                || entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
-                    hooks.iter().any(|h| {
-                        h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("wardwell"))
-                    })
-                });
+            let is_wardwell = entry
+                .get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains("wardwell"))
+                || entry
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c.contains("wardwell"))
+                        })
+                    });
             !is_wardwell
         });
         entries.len() < before

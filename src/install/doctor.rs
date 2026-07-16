@@ -1,6 +1,7 @@
 use crate::config::loader::{self, config_dir};
 use crate::install::detect;
-use crate::install::mcp_config::{self, McpConfigPaths, McpEntryStatus};
+use crate::install::mcp_config::{self, ClientStatus, EntryStatus, McpConfigPaths};
+use std::path::Path;
 
 /// Run diagnostic checks.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,12 +14,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if config_path.exists() {
         match loader::load(Some(&config_path)) {
             Ok(config) => {
-                println!("  Config                                 \u{2713} vault: {}", config.vault_path.display());
+                println!(
+                    "  Config                                 \u{2713} vault: {}",
+                    config.vault_path.display()
+                );
 
                 // Vault directory + file count
                 if config.vault_path.exists() {
                     let md_count = count_md_files(&config.vault_path, &config.exclude);
-                    println!("  Vault                                  \u{2713} {} .md files", md_count);
+                    println!(
+                        "  Vault                                  \u{2713} {} .md files",
+                        md_count
+                    );
                 } else {
                     println!("  Vault                                  \u{2717}");
                     println!("    {} does not exist", config.vault_path.display());
@@ -29,9 +36,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if config.vault_path.exists() {
                     let domains = list_vault_domains(&config.vault_path);
                     if domains.is_empty() {
-                        println!("  Domains                                \u{2717} no subdirectories in vault");
+                        println!(
+                            "  Domains                                \u{2717} no subdirectories in vault"
+                        );
                     } else {
-                        println!("  Domains                                \u{2713} {}", domains.join(", "));
+                        println!(
+                            "  Domains                                \u{2713} {}",
+                            domains.join(", ")
+                        );
                     }
                 }
 
@@ -47,19 +59,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let size = std::fs::metadata(&index_path)
                             .map(|m| format_size(m.len()))
                             .unwrap_or_default();
-                        println!("  Index                                  \u{2713} {} entries ({})", count, size);
+                        println!(
+                            "  Index                                  \u{2713} {} entries ({})",
+                            count, size
+                        );
                     } else {
-                        println!("  Index                                  \u{2717} could not open");
+                        println!(
+                            "  Index                                  \u{2717} could not open"
+                        );
                         all_ok = false;
                     }
                 } else {
-                    println!("  Index                                  \u{2717} not built yet (run `wardwell serve`)");
+                    println!(
+                        "  Index                                  \u{2717} not built yet (run `wardwell serve`)"
+                    );
                     all_ok = false;
                 }
 
                 // Excluded patterns
                 if !config.exclude.is_empty() {
-                    println!("  Excluded                               \u{2713} {}", config.exclude.join(", "));
+                    println!(
+                        "  Excluded                               \u{2713} {}",
+                        config.exclude.join(", ")
+                    );
                 }
 
                 // Sessions
@@ -68,19 +90,46 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     && let Ok(store) = crate::daemon::indexer::SessionStore::open(&sessions_db)
                     && let Ok(count) = store.count()
                 {
-                    println!("  Sessions                               \u{2713} {} indexed", count);
+                    println!(
+                        "  Sessions                               \u{2713} {} indexed",
+                        count
+                    );
                 }
 
                 // MCP configs
                 let mcp_paths = McpConfigPaths::detect();
                 let binary_path = detect::find_binary_path();
-                let binary_str = binary_path.to_string_lossy().to_string();
 
-                check_mcp("Claude Code MCP", &mcp_paths.claude_code, &binary_str, &mut all_ok);
-                check_mcp("Claude Desktop MCP", &mcp_paths.claude_desktop, &binary_str, &mut all_ok);
+                if detect::command_available("claude") || mcp_paths.claude_code.exists() {
+                    print_client_status(
+                        "Claude Code",
+                        mcp_config::inspect_claude_code(&mcp_paths.claude_code, &binary_path),
+                        true,
+                        &mut all_ok,
+                    );
+                }
+                if Path::new("/Applications/Claude.app").exists()
+                    || mcp_paths.claude_desktop.exists()
+                {
+                    print_client_status(
+                        "Claude Desktop",
+                        mcp_config::inspect_claude_desktop(&mcp_paths.claude_desktop, &binary_path),
+                        false,
+                        &mut all_ok,
+                    );
+                }
+                if detect::command_available("codex") || mcp_paths.codex.exists() {
+                    print_client_status(
+                        "Codex",
+                        mcp_config::inspect_codex(&mcp_paths.codex, &binary_path),
+                        true,
+                        &mut all_ok,
+                    );
+                }
 
                 // CLAUDE.md pointers
-                let domain_paths: Vec<String> = config.registry
+                let domain_paths: Vec<String> = config
+                    .registry
                     .all()
                     .iter()
                     .flat_map(|d| d.paths.iter().map(|p| p.as_str().to_string()))
@@ -98,7 +147,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if pointer_count > 0 {
                     println!("  CLAUDE.md pointer                      \u{2713} markers found");
                 } else {
-                    println!("  CLAUDE.md pointer                      \u{2717} no wardwell markers");
+                    println!(
+                        "  CLAUDE.md pointer                      \u{2717} no wardwell markers"
+                    );
                     all_ok = false;
                 }
 
@@ -120,9 +171,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .status()
                     .is_ok_and(|s| s.success());
                 if claude_available {
-                    println!("  Claude CLI                             \u{2713} {} available", config.ai.summarize_model);
+                    println!(
+                        "  Claude CLI                             \u{2713} {} available",
+                        config.ai.summarize_model
+                    );
                 } else {
-                    println!("  Claude CLI                             \u{2717} `claude` not found");
+                    println!(
+                        "  Claude CLI                             \u{2717} `claude` not found"
+                    );
                     all_ok = false;
                 }
             }
@@ -132,13 +188,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        println!("  Config                                 \u{2717} not found. Run `wardwell init`.");
+        println!(
+            "  Config                                 \u{2717} not found. Run `wardwell init`."
+        );
         all_ok = false;
     }
 
     println!();
     if all_ok {
-        println!("  All checks passed.");
+        println!("  Configuration checks passed.");
+        println!("  OAuth and a publish/refresh smoke are still required connection proof.");
     } else {
         println!("  Some checks failed. Run `wardwell init` to fix.");
     }
@@ -156,7 +215,8 @@ fn check_session_start_hook(settings_path: &std::path::Path) -> bool {
         Err(_) => return false,
     };
 
-    let entries = match config.get("hooks")
+    let entries = match config
+        .get("hooks")
         .and_then(|h| h.get("SessionStart"))
         .and_then(|s| s.as_array())
     {
@@ -165,30 +225,66 @@ fn check_session_start_hook(settings_path: &std::path::Path) -> bool {
     };
 
     entries.iter().any(|entry| {
-        entry.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("wardwell"))
-            || entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("wardwell"))
+        entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains("wardwell"))
+            || entry
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| c.contains("wardwell"))
+                    })
                 })
-            })
     })
 }
 
-fn check_mcp(name: &str, config_path: &std::path::Path, expected_binary: &str, all_ok: &mut bool) {
-    match mcp_config::check_mcp_entry(config_path) {
-        McpEntryStatus::Configured { binary_path } => {
-            if binary_path == expected_binary {
-                println!("  {name:<40} \u{2713} wardwell in mcpServers");
-            } else {
-                println!("  {name:<40} \u{2713} wardwell (binary path differs)");
-            }
-        }
-        McpEntryStatus::NotConfigured => {
-            println!("  {name:<40} \u{2717} not configured");
+fn print_client_status(
+    client: &str,
+    status: ClientStatus,
+    expects_remote: bool,
+    all_ok: &mut bool,
+) {
+    print_entry_status(&format!("{client} · local context"), status.local, all_ok);
+    if expects_remote {
+        print_hosted_entry_status(&format!("{client} · hosted app"), status.remote, all_ok);
+    } else {
+        println!("  {client:<30} · hosted app    account connector");
+    }
+    if status.legacy_remote {
+        println!("  {client:<30} · legacy MCP    \u{2717} static/proxy connection remains");
+        *all_ok = false;
+    }
+}
+
+fn print_hosted_entry_status(label: &str, status: EntryStatus, all_ok: &mut bool) {
+    if status == EntryStatus::Configured {
+        println!("  {label:<40} registered; OAuth unverified");
+    } else {
+        print_entry_status(label, status, all_ok);
+    }
+}
+
+fn print_entry_status(label: &str, status: EntryStatus, all_ok: &mut bool) {
+    match status {
+        EntryStatus::Configured => println!("  {label:<40} \u{2713} configured"),
+        EntryStatus::ConfigMissing => {
+            println!("  {label:<40} \u{2717} client config missing");
             *all_ok = false;
         }
-        McpEntryStatus::ConfigMissing => {
-            println!("  {name:<40} \u{2717} config file missing");
+        EntryStatus::ParseError => {
+            println!("  {label:<40} \u{2717} malformed; left untouched");
+            *all_ok = false;
+        }
+        EntryStatus::Missing => {
+            println!("  {label:<40} \u{2717} not configured");
+            *all_ok = false;
+        }
+        EntryStatus::WrongTarget => {
+            println!("  {label:<40} \u{2717} points somewhere unexpected");
             *all_ok = false;
         }
     }
@@ -275,11 +371,19 @@ mod tests {
         let root = dir.path();
         // Create .md files
         std::fs::write(root.join("note.md"), "---\ntype: reference\n---\n# Note\n").unwrap();
-        std::fs::write(root.join("other.md"), "---\ntype: reference\n---\n# Other\n").unwrap();
+        std::fs::write(
+            root.join("other.md"),
+            "---\ntype: reference\n---\n# Other\n",
+        )
+        .unwrap();
         // Create excluded subdir
         let excluded = root.join("node_modules");
         std::fs::create_dir(&excluded).unwrap();
-        std::fs::write(excluded.join("pkg.md"), "---\ntype: reference\n---\n# Pkg\n").unwrap();
+        std::fs::write(
+            excluded.join("pkg.md"),
+            "---\ntype: reference\n---\n# Pkg\n",
+        )
+        .unwrap();
         let count = count_md_files(root, &["node_modules".to_string()]);
         assert_eq!(count, 2);
     }
@@ -301,6 +405,8 @@ mod tests {
 
     #[test]
     fn check_session_start_hook_missing_file() {
-        assert!(!check_session_start_hook(std::path::Path::new("/nonexistent")));
+        assert!(!check_session_start_hook(std::path::Path::new(
+            "/nonexistent"
+        )));
     }
 }

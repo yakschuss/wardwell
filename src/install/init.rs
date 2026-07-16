@@ -1,6 +1,6 @@
 use crate::config::loader::config_dir;
 use crate::install::detect;
-use crate::install::mcp_config::{self, McpConfigPaths};
+use crate::install::mcp_config::{self, ChangeStatus, McpConfigPaths, ReconcileResult};
 use std::path::{Path, PathBuf};
 
 /// Read one line from stdin, trimmed.
@@ -112,7 +112,11 @@ fn scan_and_display_vault(vault_path: &Path) {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+        {
             continue;
         }
         if path.is_dir() {
@@ -164,13 +168,29 @@ fn preview_and_confirm(vault_path: &Path, config_path: &Path, binary_path: &Path
     println!("    CREATE  ~/.wardwell/summaries/");
 
     let mcp_paths = McpConfigPaths::detect();
-    println!("    INJECT  MCP → {}", mcp_paths.claude_code.display());
-    println!("    INJECT  MCP → {}", mcp_paths.claude_desktop.display());
+    println!(
+        "    RECONCILE  Claude Code MCP → {}",
+        mcp_paths.claude_code.display()
+    );
+    println!(
+        "    RECONCILE  Claude Desktop MCP → {}",
+        mcp_paths.claude_desktop.display()
+    );
+    println!("    RECONCILE  Codex MCP → {}", mcp_paths.codex.display());
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    println!("    INJECT  SessionStart hook → {}", home.join(".claude/settings.json").display());
-    println!("    INJECT  CLAUDE.md markers → {}", home.join(".claude/CLAUDE.md").display());
-    println!("    INDEX   {} → ~/.wardwell/index.db", vault_path.display());
+    println!(
+        "    INJECT  SessionStart hook → {}",
+        home.join(".claude/settings.json").display()
+    );
+    println!(
+        "    INJECT  CLAUDE.md markers → {}",
+        home.join(".claude/CLAUDE.md").display()
+    );
+    println!(
+        "    INDEX   {} → ~/.wardwell/index.db",
+        vault_path.display()
+    );
     println!("    BINARY  {}", binary_path.display());
 
     print!("\n  Proceed? [Y/n] ");
@@ -202,10 +222,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create dirs + write config
     println!();
-    for dir in &[
-        config_dir().to_path_buf(),
-        config_dir().join("summaries"),
-    ] {
+    for dir in &[config_dir().to_path_buf(), config_dir().join("summaries")] {
         std::fs::create_dir_all(dir)?;
     }
 
@@ -225,31 +242,39 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  \u{2713} Config written: {}", config_path.display());
     }
 
-    // 5. MCP — Claude Code
+    // 5. Agent-client MCP configuration. The global preview above is the one
+    // consent gate; each client mutation is idempotent and backed up.
     let mcp_paths = McpConfigPaths::detect();
-    if prompt_pause("Inject MCP server into Claude Code config?") {
-        match mcp_config::inject_mcp_entry(&mcp_paths.claude_code, &binary_path) {
-            Ok(_) => println!("  \u{2713} MCP injected into {}", mcp_paths.claude_code.display()),
-            Err(e) => {
-                println!("  \u{2717} MCP inject failed: {e}");
-                skipped.push(format!("MCP Claude Code: manually add wardwell to {}", mcp_paths.claude_code.display()));
-            }
-        }
+    if detect::command_available("claude") {
+        report_reconciliation(
+            "Claude Code",
+            mcp_config::reconcile_claude_code(&mcp_paths.claude_code, &binary_path, false),
+            &mut skipped,
+        );
     } else {
-        skipped.push(format!("MCP Claude Code: manually add wardwell to {}", mcp_paths.claude_code.display()));
+        println!("  - Claude Code not installed; configuration unchanged");
     }
 
-    // 6. MCP — Claude Desktop
-    if prompt_pause("Inject MCP server into Claude Desktop config?") {
-        match mcp_config::inject_mcp_entry(&mcp_paths.claude_desktop, &binary_path) {
-            Ok(_) => println!("  \u{2713} MCP injected into {}", mcp_paths.claude_desktop.display()),
-            Err(e) => {
-                println!("  \u{2717} MCP inject failed: {e}");
-                skipped.push(format!("MCP Claude Desktop: manually add wardwell to {}", mcp_paths.claude_desktop.display()));
-            }
-        }
+    let claude_desktop_installed =
+        Path::new("/Applications/Claude.app").exists() || mcp_paths.claude_desktop.exists();
+    if claude_desktop_installed {
+        report_reconciliation(
+            "Claude Desktop",
+            mcp_config::reconcile_claude_desktop(&mcp_paths.claude_desktop, &binary_path, false),
+            &mut skipped,
+        );
     } else {
-        skipped.push(format!("MCP Claude Desktop: manually add wardwell to {}", mcp_paths.claude_desktop.display()));
+        println!("  - Claude Desktop not installed; configuration unchanged");
+    }
+
+    if detect::command_available("codex") {
+        report_reconciliation(
+            "Codex",
+            mcp_config::reconcile_codex(&mcp_paths.codex, &binary_path, false),
+            &mut skipped,
+        );
+    } else {
+        println!("  - Codex not installed; configuration unchanged");
     }
 
     // 7. SessionStart hook
@@ -262,7 +287,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
-        skipped.push("SessionStart hook: manually register wardwell inject in ~/.claude/settings.json".to_string());
+        skipped.push(
+            "SessionStart hook: manually register wardwell inject in ~/.claude/settings.json"
+                .to_string(),
+        );
     }
 
     // 8. CLAUDE.md injection
@@ -281,8 +309,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         let index_path = config_dir().join("index.db");
         if let Ok(index) = crate::index::store::IndexStore::open(&index_path) {
-            match crate::index::builder::IndexBuilder::build_filtered(&index, &vault_path, &exclude, None) {
-                Ok(stats) => println!("  \u{2713} Indexed {} files ({} skipped, {} errors)", stats.indexed, stats.skipped, stats.errors),
+            match crate::index::builder::IndexBuilder::build_filtered(
+                &index,
+                &vault_path,
+                &exclude,
+                None,
+            ) {
+                Ok(stats) => println!(
+                    "  \u{2713} Indexed {} files ({} skipped, {} errors)",
+                    stats.indexed, stats.skipped, stats.errors
+                ),
                 Err(e) => println!("  \u{2717} Index build failed: {e}"),
             }
         }
@@ -295,7 +331,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let vault_domains_dir = vault_path.join("domains");
         let has_vault_domains = vault_domains_dir.exists()
             && std::fs::read_dir(&vault_domains_dir)
-                .map(|e| e.flatten().any(|f| f.path().extension().and_then(|e| e.to_str()) == Some("md")))
+                .map(|e| {
+                    e.flatten()
+                        .any(|f| f.path().extension().and_then(|e| e.to_str()) == Some("md"))
+                })
                 .unwrap_or(false);
 
         if !has_vault_domains {
@@ -311,13 +350,48 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("    - {s}");
         }
     }
-    println!("\n  Restart Claude Code to activate wardwell.");
+    println!("\n  Authenticate hosted Wardwell when each client asks for OAuth approval.");
+    println!("  Claude account connector: https://claude.ai/customize/connectors");
+    println!("  Codex: codex mcp login wardwell");
 
     Ok(())
 }
 
+fn report_reconciliation(
+    client: &str,
+    result: Result<ReconcileResult, std::io::Error>,
+    skipped: &mut Vec<String>,
+) {
+    match result {
+        Ok(result) => {
+            let outcome = match result.status {
+                ChangeStatus::Created => "configured",
+                ChangeStatus::Updated => "updated",
+                ChangeStatus::Unchanged => "already current",
+                ChangeStatus::DryRunCreate | ChangeStatus::DryRunUpdate => "planned",
+            };
+            println!("  \u{2713} {client} {outcome}");
+            if let Some(backup) = result.backup_path {
+                println!("    backup: {}", backup.display());
+            }
+            if result.migrated_legacy_remote {
+                println!("    replaced legacy static Wardwell connection with OAuth configuration");
+            }
+        }
+        Err(error) => {
+            println!("  \u{2717} {client} configuration unchanged: {error}");
+            skipped.push(format!(
+                "{client} MCP: resolve the reported configuration conflict"
+            ));
+        }
+    }
+}
+
 /// Update just the vault_path in an existing config.yml.
-fn update_config_vault_path(config_path: &Path, vault_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn update_config_vault_path(
+    config_path: &Path,
+    vault_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(config_path)?;
     // Replace the vault_path line
     let mut new_lines = Vec::new();
@@ -339,7 +413,10 @@ fn update_config_vault_path(config_path: &Path, vault_path: &Path) -> Result<(),
 }
 
 /// Migrate domains from config to vault files.
-fn migrate_config_domains(config: &crate::config::loader::WardwellConfig, vault_path: &std::path::Path) {
+fn migrate_config_domains(
+    config: &crate::config::loader::WardwellConfig,
+    vault_path: &std::path::Path,
+) {
     let domains_dir = vault_path.join("domains");
     if let Err(e) = std::fs::create_dir_all(&domains_dir) {
         eprintln!("wardwell: failed to create domains dir: {e}");
@@ -368,7 +445,10 @@ fn migrate_config_domains(config: &crate::config::loader::WardwellConfig, vault_
         }
 
         if let Err(e) = std::fs::write(&path, content) {
-            eprintln!("wardwell: failed to write domain file {}: {e}", path.display());
+            eprintln!(
+                "wardwell: failed to write domain file {}: {e}",
+                path.display()
+            );
         } else {
             count += 1;
         }
@@ -379,7 +459,10 @@ fn migrate_config_domains(config: &crate::config::loader::WardwellConfig, vault_
     }
 }
 
-fn write_minimal_config(config_path: &std::path::Path, vault_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+fn write_minimal_config(
+    config_path: &std::path::Path,
+    vault_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let yaml = format!(
         "\
 # Wardwell config
@@ -490,7 +573,10 @@ fn inject_claude_md_pointer() {
 
     // Inject into domain project CLAUDE.md files
     if let Ok(config) = crate::config::loader::load(Some(&config_path)) {
-        let domain_paths: Vec<String> = config.registry.all().iter()
+        let domain_paths: Vec<String> = config
+            .registry
+            .all()
+            .iter()
             .flat_map(|d| d.paths.iter().map(|p| p.as_str().to_string()))
             .collect();
         let claude_md_files = crate::install::detect::find_claude_md_files(&domain_paths);
@@ -557,8 +643,8 @@ fn install_hook() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string_pretty(&config)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(&settings_path, json)?;
 
     Ok(())
@@ -594,12 +680,20 @@ fn install_hook_entry(
 /// Check if a hook entry is a wardwell hook (old or new format).
 fn is_wardwell_hook(entry: &serde_json::Value) -> bool {
     // Old flat format: {type: "command", command: "...wardwell..."}
-    entry.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("wardwell"))
-        || entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
-            hooks.iter().any(|h| {
-                h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.contains("wardwell"))
+    entry
+        .get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c.contains("wardwell"))
+        || entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .is_some_and(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains("wardwell"))
+                })
             })
-        })
 }
 
 #[cfg(test)]
@@ -664,8 +758,14 @@ mod tests {
     #[test]
     fn build_injection_content_returns_expected() {
         let content = build_injection_content(&[]);
-        assert!(content.contains("wardwell_search"), "missing wardwell_search");
+        assert!(
+            content.contains("wardwell_search"),
+            "missing wardwell_search"
+        );
         assert!(content.contains("wardwell_write"), "missing wardwell_write");
-        assert!(content.contains("wardwell_clipboard"), "missing wardwell_clipboard");
+        assert!(
+            content.contains("wardwell_clipboard"),
+            "missing wardwell_clipboard"
+        );
     }
 }
