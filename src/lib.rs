@@ -8,3 +8,5 @@ pub mod inject;
 pub mod install;
 pub mod daemon;
 pub mod kanban;
+
+pub mod companion;
