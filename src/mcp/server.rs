@@ -342,6 +342,14 @@ impl WardwellServer {
         }
     }
 
+    #[tool(description = "Publish and resume this conversation's Hank Companion through the existing Wardwell connection. Use status for connection health, schema for hosted capture/work contracts, then capture, publish, list, get or responses. Work calls require the stable source_key from this conversation's journal; arguments are corresponding hosted tool inputs. No separate cloud connector is needed. This tool does not read local vault files or authorize execution. Keep pending work locally on failure and reconcile uncertain publication before retrying.")]
+    async fn wardwell_companion(&self, params: Parameters<crate::companion::CompanionParams>) -> Result<String, String> {
+        match crate::companion::execute(params.0).await {
+            Ok(result) => Ok(result.to_string()),
+            Err(message) => Err(message),
+        }
+    }
+
     #[tool(description = "Search the vault index, query project history, read files, or get a prioritized work queue. Use `action` to specify what you need.")]
     async fn wardwell_search(&self, params: Parameters<SearchParams>) -> String {
         let p = params.0;
@@ -3490,7 +3498,7 @@ impl WardwellServer {
 impl ServerHandler for WardwellServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = if self.kanban.is_some() {
-            "Wardwell: Personal AI knowledge vault. Four tools: \
+            "Wardwell: Personal AI knowledge vault. Local context tools: \
              wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
@@ -3499,7 +3507,7 @@ impl ServerHandler for WardwellServer {
              GROOMING RULE: when you read a ticket (get), check item.grooming. If item.grooming.artifact_path is present, READ that artifact (wardwell_search action:read path:<artifact_path>) BEFORE planning or building — it is the latest readiness/DDD assessment for the ticket. Treat item.grooming.readiness (e.g. build_prompt_needed, design_needed, audit_needed, blocker) and item.grooming.surfaced as primary signals."
                 .to_string()
         } else {
-            "Wardwell: Personal AI knowledge vault. Three tools: \
+            "Wardwell: Personal AI knowledge vault. Local context tools: \
              wardwell_search (action: search|read|history|orchestrate|retrospective|patterns|context|resume; \
              search supports mode:'semantic' for broad/conceptual queries — prefer it over keyword for exploratory searches), \
              wardwell_write (action: sync|decide|append_history|lesson|append|write_file), \
@@ -3511,7 +3519,7 @@ impl ServerHandler for WardwellServer {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some(instructions),
+            instructions: Some(format!("{instructions}\nHank Companion: use wardwell_companion on this same connection for status, schema, capture, publish, list, get and responses. Keep one stable source_key per conversation and preserve its local journal on failure. Hosted connection failures never disable local context or kanban. Do not use a separate claude.ai Wardwell connector for Companion work.")),
         }
     }
 }

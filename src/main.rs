@@ -16,6 +16,11 @@ enum Commands {
         #[arg(long)]
         domain: Option<String>,
     },
+    /// Inspect or configure the optional hosted Companion connection
+    Companion {
+        #[command(subcommand)]
+        command: CompanionCommand,
+    },
     /// First-run setup — generates config, injects MCP entries, installs hooks
     Init,
     /// Check that everything is wired correctly
@@ -41,6 +46,18 @@ enum Commands {
     MigrateAttachments,
 }
 
+#[derive(Subcommand)]
+enum CompanionCommand {
+    /// Verify the installation can read hosted work; never prints credentials
+    Status,
+    /// Bootstrap an already-issued installation credential from standard input
+    Connect {
+        /// Read a credential from stdin, never a command-line argument
+        #[arg(long, required = true)]
+        token_stdin: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -49,6 +66,7 @@ async fn main() {
             let domain = domain.or_else(|| std::env::var("WARDWELL_DOMAIN").ok());
             run_serve(domain).await
         }
+        Commands::Companion { command } => run_companion(command).await,
         Commands::Init => wardwell::install::init::run(),
         Commands::Doctor => wardwell::install::doctor::run(),
         Commands::Uninstall => wardwell::install::uninstall::run(),
@@ -61,6 +79,27 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("wardwell: {e}");
         std::process::exit(1);
+    }
+}
+
+async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::error::Error>> {
+    use wardwell::companion::{self, CompanionParams};
+    let result = match command {
+        CompanionCommand::Status => companion::execute(CompanionParams {
+            action: "status".into(), source_key: None, arguments: None,
+        }).await,
+        CompanionCommand::Connect { token_stdin: _ } => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin().take(8193).read_to_end(&mut bytes)?;
+            if bytes.len() > 8192 { return Err("Installation credential exceeds size limit".into()); }
+            let token = String::from_utf8(bytes).map_err(|_| "Installation credential must be UTF-8")?;
+            companion::connect(token.trim_end_matches(['\r', '\n'])).await
+        }
+    };
+    match result {
+        Ok(value) => { println!("{value}"); Ok(()) },
+        Err(message) => Err(message.into()),
     }
 }
 
