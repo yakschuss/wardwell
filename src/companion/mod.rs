@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompanionParams {
-    /// status or schema; capture, publish, list, get, responses for one conversation.
+    /// status or schema; discover by workstream; capture, publish, list, get, responses for one conversation.
     pub action: String,
     /// Stable identity from this conversation's Companion journal, never a project-wide key.
     pub source_key: Option<String>,
@@ -88,6 +88,10 @@ async fn execute_connected(
             let result = remote_tool(connection, "work_plan_list", args).await?;
             own_plans(result, key)
         }
+        "discover" => {
+            let result = remote_tool(connection, "work_plan_list", json!({})).await?;
+            discover_plans(result, args["workstream"].as_str().unwrap_or_default())
+        }
         "get" | "responses" => {
             // A plan ID alone is insufficient routing information for a shared installation.
             let plan = remote_tool(connection, "work_plan_get", json!({"id":args["id"]})).await?;
@@ -107,9 +111,11 @@ async fn execute_connected(
 fn validate(params: &CompanionParams) -> Result<(), String> {
     if !matches!(
         params.action.as_str(),
-        "status" | "schema" | "capture" | "publish" | "list" | "get" | "responses"
+        "status" | "schema" | "discover" | "capture" | "publish" | "list" | "get" | "responses"
     ) {
-        return Err("Use status, schema, capture, publish, list, get, or responses".into());
+        return Err(
+            "Use status, schema, discover, capture, publish, list, get, or responses".into(),
+        );
     }
     if params
         .arguments
@@ -127,6 +133,27 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
         return Err("This action accepts no hosted arguments".into());
     }
     if matches!(params.action.as_str(), "status" | "schema") {
+        return Ok(());
+    }
+    if params.action == "discover" {
+        if params.source_key.is_some() {
+            return Err("Discover does not accept source_key".into());
+        }
+        let args = args
+            .and_then(Value::as_object)
+            .ok_or("A workstream is required")?;
+        args
+            .get("workstream")
+            .and_then(Value::as_str)
+            .filter(|workstream| {
+                !workstream.trim().is_empty()
+                    && workstream.len() <= 200
+                    && !workstream.chars().any(char::is_control)
+            })
+            .ok_or("Workstream must be a nonempty string of at most 200 characters")?;
+        if args.len() != 1 || !args.contains_key("workstream") {
+            return Err("Discover accepts only workstream".into());
+        }
         return Ok(());
     }
     let key = params
@@ -186,6 +213,16 @@ fn own_plans(result: Value, source_key: &str) -> Result<Value, String> {
         .ok_or("Hank returned an invalid plan list")?;
     Ok(
         json!({"work_plans":plans.iter().filter(|plan| plan["source_key"].as_str() == Some(source_key)).collect::<Vec<_>>()}),
+    )
+}
+
+fn discover_plans(result: Value, workstream: &str) -> Result<Value, String> {
+    let plans = result
+        .get("work_plans")
+        .and_then(Value::as_array)
+        .ok_or("Hank returned an invalid plan list")?;
+    Ok(
+        json!({"work_plans":plans.iter().filter(|plan| plan["workstream"].as_str() == Some(workstream)).collect::<Vec<_>>()}),
     )
 }
 
@@ -296,6 +333,62 @@ mod tests {
         assert!(validate(&params("artifact_publish", "session-a", json!({}))).is_err());
         assert!(validate(&params("list", "session-a", json!({"tenant_id":"other"}))).is_err());
         assert!(validate(&params("get", "session-a", json!({"id":"bad"}))).is_err());
+    }
+
+    #[test]
+    fn discover_requires_only_a_bounded_workstream_and_no_source_key() {
+        assert!(
+            validate(&CompanionParams {
+                action: "discover".into(),
+                source_key: None,
+                arguments: Some(json!({"workstream":"corr/pcc"})),
+            })
+            .is_ok()
+        );
+        for arguments in [
+            json!({}),
+            json!({"workstream":""}),
+            json!({"workstream":"x", "source_key":"session-a"}),
+            json!({"workstream":"x".repeat(201)}),
+        ] {
+            assert!(
+                validate(&CompanionParams {
+                    action: "discover".into(),
+                    source_key: None,
+                    arguments: Some(arguments),
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            validate(&CompanionParams {
+                action: "discover".into(),
+                source_key: Some("session-a".into()),
+                arguments: Some(json!({"workstream":"corr/pcc"})),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn discover_filters_other_sources_by_exact_workstream() {
+        let result = discover_plans(
+            json!({"work_plans":[
+                {"source_key":"a","workstream":"corr/pcc","id":"one"},
+                {"source_key":"b","workstream":"corr/pcc","id":"two"},
+                {"source_key":"c","workstream":"Corr/PCC","id":"three"},
+                {"source_key":"d","id":"four"}
+            ]}),
+            "corr/pcc",
+        );
+        assert_eq!(
+            result,
+            Ok(json!({"work_plans":[
+                {"source_key":"a","workstream":"corr/pcc","id":"one"},
+                {"source_key":"b","workstream":"corr/pcc","id":"two"}
+            ]}))
+        );
+        assert!(discover_plans(json!({}), "corr/pcc").is_err());
     }
 
     #[test]

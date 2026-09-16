@@ -356,7 +356,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Publish and resume this conversation's Hank Companion through the existing Wardwell connection. Use status for connection health, schema for hosted capture/work contracts, then capture, publish, list, get or responses. Work calls require the stable source_key from this conversation's journal; arguments are corresponding hosted tool inputs. No separate cloud connector is needed. This tool does not read local vault files or authorize execution. Keep pending work locally on failure and reconcile uncertain publication before retrying.")]
+    #[tool(description = "Publish and resume this conversation's Hank Companion through the existing Wardwell connection. Use status for connection health, schema for hosted capture/work contracts, discover to find tenant-visible plans by exact workstream, then capture, publish, list, get or responses. Source-owned work calls require the stable source_key from this conversation's journal; discover does not. Arguments are corresponding hosted tool inputs. No separate cloud connector is needed. This tool does not read local vault files or authorize execution. Keep pending work locally on failure and reconcile uncertain publication before retrying.")]
     async fn wardwell_companion(&self, params: Parameters<crate::companion::CompanionParams>) -> Result<String, String> {
         match crate::companion::execute(params.0).await {
             Ok(result) => Ok(result.to_string()),
@@ -3608,7 +3608,7 @@ impl ServerHandler for WardwellServer {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some(format!("{instructions}\nHank Companion: use wardwell_companion on this same connection for status, schema, capture, publish, list, get and responses. Keep one stable source_key per conversation and preserve its local journal on failure. Hosted connection failures never disable local context or kanban. Do not use a separate claude.ai Wardwell connector for Companion work.")),
+            instructions: Some(format!("{instructions}\nHank Companion: use wardwell_companion on this same connection for status, schema, discover, capture, publish, list, get and responses. Discover tenant-visible plans by exact workstream without a source key. Keep one stable source_key per conversation for source-owned calls and preserve its local journal on failure. Hosted connection failures never disable local context or kanban. Do not use a separate claude.ai Wardwell connector for Companion work.")),
         }
     }
 }
