@@ -211,16 +211,23 @@ upload vault files or change local kanban. Local tools remain usable when Hank
 is disconnected.
 
 Use `status` to check the hosted connection and `schema` to discover the current
-hosted capture/work inputs. Each work call supplies the stable `source_key` from
-its conversation journal and an `arguments` object:
+hosted capture/work inputs. Source-owned calls supply the stable `source_key`
+from their conversation journal and an `arguments` object. `discover` is a
+tenant-scoped read and does not require a source key:
 
 | Action | Hosted operation |
 | --- | --- |
 | `capture` | `capture_submit`; `conversation_key` must match `source_key` |
 | `publish` | `work_plan_publish`; source key must match and revisions use CAS |
+| `discover` | List tenant-visible plans whose `workstream` exactly matches the required nonempty `arguments.workstream` string |
 | `list` | List only this source's plans, for recovery |
 | `get` | Read a plan after checking its source key |
 | `responses` | Read the source's durable owner responses and current source document |
+
+Use `discover` when an agent needs exact targets from another session before it
+adds a cited cross-plan reference to its own next WorkPlan version. Discovery
+does not grant access to another source's `get` or `responses` calls and does not
+transfer execution authority.
 
 Conversation keys prevent accidental cross-session routing; they are not
 credentials or isolation against other processes on the same OS account. The
