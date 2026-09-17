@@ -1,5 +1,6 @@
 //! Optional hosted Companion access. Local vault and kanban calls never enter here.
 pub mod connection;
+mod journal;
 mod transport;
 
 use connection::Connection;
@@ -9,7 +10,7 @@ use serde_json::{Value, json};
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompanionParams {
-    /// status or schema; discover by workstream; capture, publish, list, get, responses for one conversation.
+    /// status or schema; discover, publish, read, consume, or acknowledge one conversation.
     pub action: String,
     /// Stable identity from this conversation's Companion journal, never a project-wide key.
     pub source_key: Option<String>,
@@ -80,8 +81,26 @@ async fn execute_connected(
             Ok(result)
         }
         "publish" => {
-            let result = remote_tool(connection, "work_plan_publish", args).await?;
+            let mut publish_args = args;
+            if publish_args.get("response_cursor").is_none()
+                && let Ok(Some(cursor)) = journal::source_cursor(key)
+            {
+                publish_args["response_cursor"] = Value::String(cursor);
+            }
+            let mut result = remote_tool(connection, "work_plan_publish", publish_args).await?;
             require_plan_key(&result, key).map_err(|_| "Unexpected publication identity; retain the request and reconcile before retrying")?;
+            if let Some(page) = result.get("pending_responses")
+                && page.get("observations").is_some()
+            {
+                let receipt = match journal::stage(key, page) {
+                    Ok(receipt) => receipt,
+                    Err(_) => json!({
+                        "status": "write_failed",
+                        "meaning": "publication succeeded; explicitly consume responses before retrying publication"
+                    }),
+                };
+                result["local_response_journal"] = receipt;
+            }
             Ok(result)
         }
         "list" => {
@@ -104,6 +123,35 @@ async fn execute_connected(
                 Ok(response)
             }
         }
+        "consume" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            if let Some(pending) = journal::pending(key, id)? {
+                return Ok(pending);
+            }
+            let plan = remote_tool(connection, "work_plan_get", json!({"id":id})).await?;
+            require_plan_key(&plan, key)?;
+            let mut request = json!({"id":id});
+            if let Some(cursor) = journal::cursor(key, id)? {
+                request["cursor"] = Value::String(cursor);
+            }
+            let page = remote_tool(connection, "work_plan_responses", request).await?;
+            require_plan_key(&page, key)?;
+            journal::stage(key, &page)
+        }
+        "acknowledge" => {
+            let id = args["id"].as_str().unwrap_or_default();
+            let ids = args["observation_ids"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            journal::acknowledge(key, id, &ids)
+        }
         _ => Err("Unsupported Companion action".into()),
     }
 }
@@ -111,10 +159,19 @@ async fn execute_connected(
 fn validate(params: &CompanionParams) -> Result<(), String> {
     if !matches!(
         params.action.as_str(),
-        "status" | "schema" | "discover" | "capture" | "publish" | "list" | "get" | "responses"
+        "status"
+            | "schema"
+            | "discover"
+            | "capture"
+            | "publish"
+            | "list"
+            | "get"
+            | "responses"
+            | "consume"
+            | "acknowledge"
     ) {
         return Err(
-            "Use status, schema, discover, capture, publish, list, get, or responses".into(),
+            "Use status, schema, discover, capture, publish, list, get, responses, consume, or acknowledge".into(),
         );
     }
     if params
@@ -142,8 +199,7 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
         let args = args
             .and_then(Value::as_object)
             .ok_or("A workstream is required")?;
-        args
-            .get("workstream")
+        args.get("workstream")
             .and_then(Value::as_str)
             .filter(|workstream| {
                 !workstream.trim().is_empty()
@@ -176,7 +232,10 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
     {
         return Err("Hosted source identity must match this conversation's source_key".into());
     }
-    if matches!(params.action.as_str(), "get" | "responses") {
+    if matches!(
+        params.action.as_str(),
+        "get" | "responses" | "consume" | "acknowledge"
+    ) {
         let args = args
             .and_then(Value::as_object)
             .ok_or("A plan id is required")?;
@@ -185,10 +244,26 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
             .and_then(Value::as_str)
             .ok_or("A plan id is required")?;
         uuid::Uuid::parse_str(id).map_err(|_| "Plan id must be a UUID")?;
-        if args
-            .keys()
-            .any(|name| name != "id" && !(params.action == "responses" && name == "cursor"))
-        {
+        let valid = match params.action.as_str() {
+            "responses" => args.keys().all(|name| name == "id" || name == "cursor"),
+            "acknowledge" => {
+                args.keys()
+                    .all(|name| name == "id" || name == "observation_ids")
+                    && args
+                        .get("observation_ids")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ids| {
+                            !ids.is_empty()
+                                && ids.len() <= 100
+                                && ids.iter().all(|id| {
+                                    id.as_str()
+                                        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                                })
+                        })
+            }
+            _ => args.len() == 1,
+        };
+        if !valid {
             return Err("Unsupported read arguments".into());
         }
     }
