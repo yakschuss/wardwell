@@ -342,7 +342,7 @@ impl WardwellServer {
         }
     }
 
-    #[tool(description = "Publish and resume this conversation's Hank Companion through the existing Wardwell connection. Use status for connection health, schema for hosted capture/work contracts, discover to find tenant-visible plans by exact workstream, then capture, publish, list, get or responses. Source-owned work calls require the stable source_key from this conversation's journal; discover does not. Arguments are corresponding hosted tool inputs. No separate cloud connector is needed. This tool does not read local vault files or authorize execution. Keep pending work locally on failure and reconcile uncertain publication before retrying.")]
+    #[tool(description = "Publish and resume this conversation's Hank Companion through the existing Wardwell connection. Use consume to durably stage revision-bound owner responses in the private local journal, then acknowledge by observation id after handling. Acknowledgement proves local persistence only, never execution or completion. Source-owned calls require the stable source_key. No chat injection, session wake, or external execution occurs.")]
     async fn wardwell_companion(&self, params: Parameters<crate::companion::CompanionParams>) -> Result<String, String> {
         match crate::companion::execute(params.0).await {
             Ok(result) => Ok(result.to_string()),

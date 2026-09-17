@@ -223,6 +223,8 @@ tenant-scoped read and does not require a source key:
 | `list` | List only this source's plans, for recovery |
 | `get` | Read a plan after checking its source key |
 | `responses` | Read the source's durable owner responses and current source document |
+| `consume` | Stage the next response page in a private local journal; returns existing staged responses before fetching again |
+| `acknowledge` | Record that named staged observation IDs were persisted locally; this does not claim execution or completion |
 
 Use `discover` when an agent needs exact targets from another session before it
 adds a cited cross-plan reference to its own next WorkPlan version. Discovery
@@ -247,6 +249,8 @@ pending work and reconcile through `list`, `get`, or `responses` before replayin
 the exact request. The forwarding layer does not retry writes automatically or
 wake idle agents. This version supports the hosted endpoint's JSON responses;
 SSE-only endpoints are rejected explicitly. No kanban migration is required.
+`consume` stores journals under the Wardwell config directory with owner-only
+permissions and will not advance pagination while staged observations remain.
 
 ## Config
 
