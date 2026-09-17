@@ -357,6 +357,28 @@ mod tests {
         assert_eq!(replayed["status"], "caught_up");
         assert_eq!(replayed["pending_observations"], json!([]));
 
+        let generic = json!({
+            "plan_id": "2e2ea0dd-8b32-42e0-b102-fd18589a6214",
+            "source_key": "session-a",
+            "current_revision": 2,
+            "cursor": "next-signed-cursor",
+            "observations": [{
+                "id": "e548918f-a986-4b74-955d-a339c8549bee",
+                "node_id": "choose",
+                "sequence": 2,
+                "kind": "set_priority",
+                "priority": "high",
+                "expected_revision": 1,
+                "inserted_at": "2026-09-17T14:00:00Z"
+            }]
+        });
+        let generic_staged = stage_at(&journal_path, "session-a", &generic).unwrap();
+        assert_eq!(generic_staged["status"], "staged");
+        assert_eq!(
+            generic_staged["pending_observations"][0]["kind"],
+            "set_priority"
+        );
+
         #[cfg(unix)]
         assert_eq!(
             fs::metadata(journal_path).unwrap().permissions().mode() & 0o777,
