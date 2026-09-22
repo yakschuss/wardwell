@@ -100,7 +100,7 @@ async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::err
     use wardwell::companion::{self, CompanionParams};
     let result = match command {
         CompanionCommand::Status => companion::execute(CompanionParams {
-            action: "status".into(), source_key: None, arguments: None,
+            action: "status".into(), source_key: None, arguments: None, arguments_file: None,
         }).await,
         CompanionCommand::Connect { token_stdin: _ } => {
             use std::io::Read;
