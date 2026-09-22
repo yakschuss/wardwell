@@ -6,6 +6,9 @@ mod transport;
 use connection::Connection;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::{fs, io::Read, path::Path};
+
+const PUBLISH_ARGUMENTS_FILE_LIMIT: u64 = 200_000;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +19,8 @@ pub struct CompanionParams {
     pub source_key: Option<String>,
     /// Exact hosted tool arguments. Use schema to discover their current contract.
     pub arguments: Option<Value>,
+    /// Absolute path to a bounded local JSON object, accepted only by publish.
+    pub arguments_file: Option<String>,
 }
 
 /// Customer-zero credential bootstrap; interactive account sign-in is a later slice.
@@ -35,17 +40,17 @@ pub async fn connect(token: &str) -> Result<Value, String> {
 }
 
 pub async fn execute(params: CompanionParams) -> Result<Value, String> {
-    validate(&params)?;
+    let args = resolve_arguments(&params)?;
+    validate(&params, &args)?;
     let connection = connection::load(&connection::default_path()?)?;
-    execute_connected(&connection, params).await
+    execute_connected(&connection, params, args).await
 }
 
 async fn execute_connected(
     connection: &Connection,
     params: CompanionParams,
+    args: Value,
 ) -> Result<Value, String> {
-    validate(&params)?;
-    let args = params.arguments.unwrap_or_else(|| json!({}));
     let key = params.source_key.as_deref().unwrap_or_default();
     match params.action.as_str() {
         "status" => {
@@ -108,12 +113,17 @@ async fn execute_connected(
             own_plans(result, key)
         }
         "discover" => {
-            let result = remote_tool(connection, "work_plan_list", json!({})).await?;
+            let result = remote_tool(connection, "work_plan_list", compact_args(&args)).await?;
             discover_plans(result, args["workstream"].as_str().unwrap_or_default())
         }
         "get" | "responses" => {
             // A plan ID alone is insufficient routing information for a shared installation.
-            let plan = remote_tool(connection, "work_plan_get", json!({"id":args["id"]})).await?;
+            let plan = remote_tool(
+                connection,
+                "work_plan_get",
+                get_args(&args, params.action == "get"),
+            )
+            .await?;
             require_plan_key(&plan, key)?;
             if params.action == "get" {
                 Ok(plan)
@@ -156,7 +166,65 @@ async fn execute_connected(
     }
 }
 
-fn validate(params: &CompanionParams) -> Result<(), String> {
+fn resolve_arguments(params: &CompanionParams) -> Result<Value, String> {
+    if params.arguments.is_some() && params.arguments_file.is_some() {
+        return Err("Use either arguments or arguments_file, not both".into());
+    }
+    let Some(path) = params.arguments_file.as_deref() else {
+        return Ok(params.arguments.clone().unwrap_or_else(|| json!({})));
+    };
+    if params.action != "publish" {
+        return Err("arguments_file is accepted only by publish".into());
+    }
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err("arguments_file must be an absolute path".into());
+    }
+    let file = open_arguments_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Unable to read arguments_file")?;
+    if !metadata.file_type().is_file() {
+        return Err("arguments_file must be a regular file, not a symlink".into());
+    }
+    if metadata.len() > PUBLISH_ARGUMENTS_FILE_LIMIT {
+        return Err("arguments_file exceeds the 200000-byte limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(PUBLISH_ARGUMENTS_FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Unable to read arguments_file")?;
+    if bytes.len() as u64 > PUBLISH_ARGUMENTS_FILE_LIMIT {
+        return Err("arguments_file exceeds the 200000-byte limit".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "arguments_file must contain valid JSON".to_string())
+}
+
+#[cfg(unix)]
+fn open_arguments_file(path: &Path) -> Result<fs::File, String> {
+    use std::os::unix::fs::MetadataExt;
+    let before = fs::symlink_metadata(path).map_err(|_| "Unable to read arguments_file")?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        return Err("arguments_file must be a regular file, not a symlink".into());
+    }
+    let file = fs::File::open(path).map_err(|_| "Unable to read arguments_file")?;
+    let opened = file.metadata().map_err(|_| "Unable to read arguments_file")?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        return Err("arguments_file changed while being opened".into());
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_arguments_file(path: &Path) -> Result<fs::File, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "Unable to read arguments_file")?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("arguments_file must be a regular file, not a symlink".into());
+    }
+    fs::File::open(path).map_err(|_| "Unable to read arguments_file".into())
+}
+
+fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
     if !matches!(
         params.action.as_str(),
         "status"
@@ -174,18 +242,12 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
             "Use status, schema, discover, capture, publish, list, get, responses, consume, or acknowledge".into(),
         );
     }
-    if params
-        .arguments
-        .as_ref()
-        .is_some_and(|args| !args.is_object())
-    {
+    if !arguments.is_object() {
         return Err("Companion arguments must be an object".into());
     }
-    let args = params.arguments.as_ref();
-    if matches!(params.action.as_str(), "status" | "schema" | "list")
-        && args
-            .and_then(Value::as_object)
-            .is_some_and(|args| !args.is_empty())
+    let args = Some(arguments);
+    if matches!(params.action.as_str(), "status" | "schema")
+        && arguments.as_object().is_some_and(|args| !args.is_empty())
     {
         return Err("This action accepts no hosted arguments".into());
     }
@@ -207,8 +269,12 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
                     && !workstream.chars().any(char::is_control)
             })
             .ok_or("Workstream must be a nonempty string of at most 200 characters")?;
-        if args.len() != 1 || !args.contains_key("workstream") {
-            return Err("Discover accepts only workstream".into());
+        if !args
+            .keys()
+            .all(|key| matches!(key.as_str(), "workstream" | "compact"))
+            || args.get("compact").is_some_and(|value| !value.is_boolean())
+        {
+            return Err("Discover accepts only workstream and compact".into());
         }
         return Ok(());
     }
@@ -231,6 +297,24 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
             != Some(key)
     {
         return Err("Hosted source identity must match this conversation's source_key".into());
+    }
+    if params.action == "publish"
+        && arguments
+            .get("expected_revision")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err("Publish requires a nonnegative integer expected_revision".into());
+    }
+    if params.action == "list"
+        && (!arguments
+            .as_object()
+            .is_some_and(|args| args.keys().all(|key| key == "compact"))
+            || arguments
+                .get("compact")
+                .is_some_and(|value| !value.is_boolean()))
+    {
+        return Err("List accepts only a boolean compact argument".into());
     }
     if matches!(
         params.action.as_str(),
@@ -261,6 +345,10 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
                                 })
                         })
             }
+            "get" => {
+                args.keys().all(|name| name == "id" || name == "compact")
+                    && args.get("compact").is_none_or(Value::is_boolean)
+            }
             _ => args.len() == 1,
         };
         if !valid {
@@ -268,6 +356,19 @@ fn validate(params: &CompanionParams) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn compact_args(args: &Value) -> Value {
+    args.get("compact")
+        .map_or_else(|| json!({}), |compact| json!({"compact": compact}))
+}
+
+fn get_args(args: &Value, include_compact: bool) -> Value {
+    let mut result = json!({"id": args["id"]});
+    if include_compact && let Some(compact) = args.get("compact") {
+        result["compact"] = compact.clone();
+    }
+    result
 }
 
 fn require_plan_key(plan: &Value, source_key: &str) -> Result<(), String> {
@@ -332,6 +433,8 @@ fn decode_tool_result(result: Value) -> Result<Value, String> {
             "The installation connection lacks a required Companion permission."
         } else if text.contains("not_creator") {
             "This installation does not own that Companion. Keep the journal and reconnect its original installation."
+        } else if let Some(detail) = safe_validation_detail(text) {
+            return Err(format!("Hank rejected the Companion request: {detail}"));
         } else {
             "Hank rejected the Companion request. Check the current schema and source journal; no success is recorded."
         }.into());
@@ -346,6 +449,17 @@ fn decode_tool_result(result: Value) -> Result<Value, String> {
     })
 }
 
+fn safe_validation_detail(text: &str) -> Option<&str> {
+    let text = text.trim();
+    (text.len() <= 500
+        && !text.chars().any(char::is_control)
+        && matches!(
+            text.split_once(':').map(|(code, _)| code),
+            Some("invalid_work_plan" | "invalid_arguments" | "validation_error")
+        ))
+    .then_some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,7 +469,13 @@ mod tests {
             action: action.into(),
             source_key: Some(key.into()),
             arguments: Some(arguments),
+            arguments_file: None,
         }
+    }
+
+    fn valid(params: &CompanionParams) -> Result<(), String> {
+        let args = resolve_arguments(params)?;
+        validate(params, &args)
     }
 
     #[test]
@@ -373,12 +493,110 @@ mod tests {
             json!({"isError":true,"content":[{"text":"invalid_work_plan: stale_revision"}]}),
         );
         assert!(error.is_err_and(|text| text.contains("stale revision")));
+        let error = decode_tool_result(
+            json!({"isError":true,"content":[{"text":"invalid_work_plan: steps[0].owner is required"}]}),
+        );
+        assert!(error.is_err_and(|text| text.contains("steps[0].owner is required")));
+        assert!(
+            decode_tool_result(json!({"isError":true,"content":[{"text":"upstream secret"}]}))
+                .is_err_and(|text| !text.contains("secret"))
+        );
+    }
+
+    #[test]
+    fn publish_arguments_file_is_bounded_regular_json_and_source_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("publish.json");
+        fs::write(&good, r#"{"source_key":"session-a","expected_revision":0}"#).unwrap();
+        let from_file = CompanionParams {
+            action: "publish".into(),
+            source_key: Some("session-a".into()),
+            arguments: None,
+            arguments_file: Some(good.to_string_lossy().into()),
+        };
+        assert!(valid(&from_file).is_ok());
+
+        let conflicting = CompanionParams {
+            arguments: Some(json!({})),
+            ..from_file
+        };
+        assert!(valid(&conflicting).is_err());
+
+        let malformed = dir.path().join("malformed.json");
+        fs::write(&malformed, "{").unwrap();
+        let foreign = dir.path().join("foreign.json");
+        fs::write(
+            &foreign,
+            r#"{"source_key":"session-b","expected_revision":0}"#,
+        )
+        .unwrap();
+        let oversized = dir.path().join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b' '; PUBLISH_ARGUMENTS_FILE_LIMIT as usize + 1],
+        )
+        .unwrap();
+        for path in [malformed, foreign, oversized] {
+            assert!(
+                valid(&CompanionParams {
+                    action: "publish".into(),
+                    source_key: Some("session-a".into()),
+                    arguments: None,
+                    arguments_file: Some(path.to_string_lossy().into()),
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_arguments_file_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.json");
+        let link = dir.path().join("link.json");
+        fs::write(
+            &target,
+            r#"{"source_key":"session-a","expected_revision":0}"#,
+        )
+        .unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(
+            valid(&CompanionParams {
+                action: "publish".into(),
+                source_key: Some("session-a".into()),
+                arguments: None,
+                arguments_file: Some(link.to_string_lossy().into()),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn companion_schema_exposes_arguments_file() {
+        let schema = serde_json::to_value(schemars::schema_for!(CompanionParams)).unwrap();
+        assert!(schema["properties"]["arguments_file"].is_object());
+    }
+
+    #[test]
+    fn compact_is_boolean_and_forwarded_only_when_present() {
+        assert!(valid(&params("list", "session-a", json!({"compact":true}))).is_ok());
+        assert!(valid(&params("list", "session-a", json!({"compact":"yes"}))).is_err());
+        assert_eq!(
+            compact_args(&json!({"workstream":"x","compact":false})),
+            json!({"compact":false})
+        );
+        assert_eq!(
+            get_args(&json!({"id":"x","compact":true}), true),
+            json!({"id":"x","compact":true})
+        );
     }
 
     #[test]
     fn sessions_cannot_accidentally_publish_another_source() {
         assert!(
-            validate(&params(
+            valid(&params(
                 "publish",
                 "session-a",
                 json!({"source_key":"session-b"})
@@ -386,7 +604,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate(&params(
+            valid(&params(
                 "capture",
                 "session-a",
                 json!({"conversation_key":"session-b"})
@@ -394,10 +612,10 @@ mod tests {
             .is_err()
         );
         assert!(
-            validate(&params(
+            valid(&params(
                 "publish",
                 "session-a",
-                json!({"source_key":"session-a"})
+                json!({"source_key":"session-a", "expected_revision":0})
             ))
             .is_ok()
         );
@@ -405,18 +623,19 @@ mod tests {
 
     #[test]
     fn companion_does_not_forward_arbitrary_tools() {
-        assert!(validate(&params("artifact_publish", "session-a", json!({}))).is_err());
-        assert!(validate(&params("list", "session-a", json!({"tenant_id":"other"}))).is_err());
-        assert!(validate(&params("get", "session-a", json!({"id":"bad"}))).is_err());
+        assert!(valid(&params("artifact_publish", "session-a", json!({}))).is_err());
+        assert!(valid(&params("list", "session-a", json!({"tenant_id":"other"}))).is_err());
+        assert!(valid(&params("get", "session-a", json!({"id":"bad"}))).is_err());
     }
 
     #[test]
     fn discover_requires_only_a_bounded_workstream_and_no_source_key() {
         assert!(
-            validate(&CompanionParams {
+            valid(&CompanionParams {
                 action: "discover".into(),
                 source_key: None,
                 arguments: Some(json!({"workstream":"corr/pcc"})),
+                arguments_file: None,
             })
             .is_ok()
         );
@@ -427,19 +646,21 @@ mod tests {
             json!({"workstream":"x".repeat(201)}),
         ] {
             assert!(
-                validate(&CompanionParams {
+                valid(&CompanionParams {
                     action: "discover".into(),
                     source_key: None,
                     arguments: Some(arguments),
+                    arguments_file: None,
                 })
                 .is_err()
             );
         }
         assert!(
-            validate(&CompanionParams {
+            valid(&CompanionParams {
                 action: "discover".into(),
                 source_key: Some("session-a".into()),
                 arguments: Some(json!({"workstream":"corr/pcc"})),
+                arguments_file: None,
             })
             .is_err()
         );
