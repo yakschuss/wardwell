@@ -215,6 +215,11 @@ hosted capture/work inputs. Source-owned calls supply the stable `source_key`
 from their conversation journal and an `arguments` object. `discover` is a
 tenant-scoped read and does not require a source key:
 
+For large publish payloads, `arguments_file` may replace `arguments`. It must be
+an absolute path to a regular JSON file no larger than 200,000 bytes; the binary
+reads and validates it locally and never sends the path to Hank. `list`, `get`,
+and `discover` also accept an optional boolean `arguments.compact`.
+
 | Action | Hosted operation |
 | --- | --- |
 | `capture` | `capture_submit`; `conversation_key` must match `source_key` |
