@@ -2,13 +2,15 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_COMPACT_ITEMS: usize = 3;
+const MAX_COMPACT_TEXT: usize = 512;
 
 #[derive(Default, Deserialize, Serialize)]
 struct Journal {
@@ -20,6 +22,8 @@ struct Journal {
     pending_observations: Vec<Value>,
     #[serde(default)]
     acknowledgements: Vec<Value>,
+    #[serde(default)]
+    presented_observations: HashMap<String, HashSet<String>>,
 }
 
 pub fn path(source_key: &str) -> PathBuf {
@@ -34,16 +38,70 @@ pub fn path(source_key: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-pub fn pending(source_key: &str, plan_id: &str) -> Result<Option<Value>, String> {
-    let Some(journal) = load(&path(source_key))? else {
+/// Return a bounded view for a hook. Presentation is durable, but never acknowledges data.
+pub fn consume_view(
+    source_key: &str,
+    plan_id: &str,
+    compact: bool,
+    session_id: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let journal_path = path(source_key);
+    with_journal_lock(&journal_path, || {
+        consume_view_at(&journal_path, source_key, plan_id, compact, session_id)
+    })
+}
+
+fn consume_view_at(
+    journal_path: &Path,
+    source_key: &str,
+    plan_id: &str,
+    compact: bool,
+    session_id: Option<&str>,
+) -> Result<Option<Value>, String> {
+    let mut journal = load(journal_path)?;
+    let Some(ref mut journal) = journal else {
         return Ok(None);
     };
-    require_identity(&journal, source_key, plan_id)?;
+    require_identity(journal, source_key, plan_id)?;
     if journal.pending_observations.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(view(&journal, "pending")))
+        return Ok(None);
     }
+    if !compact {
+        return Ok(Some(view(journal, "pending")));
+    }
+    let session = session_id.unwrap_or("manual");
+    let fresh = if let Some(session) = session_id {
+        let presented = journal
+            .presented_observations
+            .entry(session.to_owned())
+            .or_default();
+        let fresh = journal
+            .pending_observations
+            .iter()
+            .filter(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !presented.contains(id))
+            })
+            .take(MAX_COMPACT_ITEMS)
+            .cloned()
+            .collect::<Vec<_>>();
+        for item in &fresh {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                presented.insert(id.to_owned());
+            }
+        }
+        save(journal_path, journal)?;
+        fresh
+    } else {
+        journal
+            .pending_observations
+            .iter()
+            .take(MAX_COMPACT_ITEMS)
+            .cloned()
+            .collect()
+    };
+    Ok(Some(compact_view(journal, fresh, session)))
 }
 
 pub fn cursor(source_key: &str, plan_id: &str) -> Result<Option<String>, String> {
@@ -65,7 +123,8 @@ pub fn source_cursor(source_key: &str) -> Result<Option<String>, String> {
 }
 
 pub fn stage(source_key: &str, page: &Value) -> Result<Value, String> {
-    stage_at(&path(source_key), source_key, page)
+    let journal_path = path(source_key);
+    with_journal_lock(&journal_path, || stage_at(&journal_path, source_key, page))
 }
 
 fn stage_at(journal_path: &Path, source_key: &str, page: &Value) -> Result<Value, String> {
@@ -129,7 +188,10 @@ fn stage_at(journal_path: &Path, source_key: &str, page: &Value) -> Result<Value
 }
 
 pub fn acknowledge(source_key: &str, plan_id: &str, ids: &[String]) -> Result<Value, String> {
-    acknowledge_at(&path(source_key), source_key, plan_id, ids)
+    let journal_path = path(source_key);
+    with_journal_lock(&journal_path, || {
+        acknowledge_at(&journal_path, source_key, plan_id, ids)
+    })
 }
 
 fn acknowledge_at(
@@ -219,6 +281,151 @@ fn view(journal: &Journal, status: &str) -> Value {
         "journal_path": path(&journal.source_key),
         "acknowledgement_meaning": "local persistence only; not execution or completion"
     })
+}
+
+fn compact_view(journal: &Journal, observations: Vec<Value>, session: &str) -> Value {
+    let total = journal.pending_observations.len();
+    let compact = observations
+        .iter()
+        .map(compact_observation)
+        .collect::<Vec<_>>();
+    let content_truncated = compact.iter().any(|(_, truncated)| *truncated);
+    let items = compact
+        .into_iter()
+        .map(|(item, _)| item)
+        .collect::<Vec<_>>();
+    json!({
+        "status": "pending",
+        "plan_id": journal.plan_id,
+        "source_key": journal.source_key,
+        "current_revision": journal.current_revision,
+        "response_cursor": journal.response_cursor,
+        "observations": items,
+        "pending_count": total,
+        "presented_count": observations.len(),
+        "truncated": total > observations.len() || content_truncated,
+        "full_retrieval": format!("consume source_key {} plan {} with compact false", journal.source_key, journal.plan_id),
+        "presentation_session": session,
+        "acknowledgement_meaning": "local persistence only; not execution or completion"
+    })
+}
+
+pub(crate) fn compact_observation(observation: &Value) -> (Value, bool) {
+    let snapshot = observation.get("context_snapshot").unwrap_or(&Value::Null);
+    let (question, question_truncated) = compact_text(
+        snapshot
+            .get("title")
+            .or_else(|| snapshot.get("question"))
+            .or_else(|| snapshot.get("step").and_then(|step| step.get("text")))
+            .and_then(Value::as_str),
+    );
+    let (detail, detail_truncated) = compact_text(
+        observation
+            .get("response_detail")
+            .or_else(|| observation.get("reason"))
+            .or_else(|| observation.get("evidence"))
+            .and_then(Value::as_str),
+    );
+    let (selected_answer, option_truncated) =
+        selected_option(snapshot, observation, detail.clone())
+            .map_or((None, false), |(answer, truncated)| {
+                (Some(answer), truncated)
+            });
+    let answer = selected_answer.or_else(|| {
+        detail
+            .clone()
+            .or_else(|| observation.get("response_key").cloned())
+    });
+    let content_truncated = question_truncated || detail_truncated || option_truncated;
+    (
+        json!({
+            "id": observation.get("id"),
+            "node_id": observation.get("node_id"),
+        "kind": observation.get("kind"),
+        "step_id": observation.get("step_id"),
+        "source_revision": observation.get("source_revision"),
+        "expected_revision": observation.get("expected_revision"),
+        "fingerprint": observation.get("context_fingerprint"),
+            "question": question,
+            "answer": answer,
+            "response_key": observation.get("response_key"),
+            "content_truncated": content_truncated,
+        }),
+        content_truncated,
+    )
+}
+
+fn selected_option(
+    snapshot: &Value,
+    observation: &Value,
+    owner_detail: Option<Value>,
+) -> Option<(Value, bool)> {
+    let selected = observation.get("response_key").and_then(Value::as_str)?;
+    let option = snapshot
+        .get("decision_options")?
+        .as_array()?
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(selected));
+    let (option_detail, truncated) = compact_text(
+        option
+            .and_then(|value| value.get("detail"))
+            .and_then(Value::as_str),
+    );
+    Some((
+        json!({
+            "response_key": selected,
+            "selected_label": option.and_then(|value| value.get("label")),
+            "selected_option_detail": option_detail,
+            "response_detail": owner_detail,
+        }),
+        truncated,
+    ))
+}
+
+fn compact_text(value: Option<&str>) -> (Option<Value>, bool) {
+    let Some(value) = value else {
+        return (None, false);
+    };
+    if value.len() <= MAX_COMPACT_TEXT {
+        return (Some(Value::String(value.to_owned())), false);
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= MAX_COMPACT_TEXT)
+        .last()
+        .unwrap_or(0);
+    (Some(Value::String(format!("{}…", &value[..end]))), true)
+}
+
+fn with_journal_lock<T>(
+    journal_path: &Path,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let parent = journal_path
+        .parent()
+        .ok_or("Companion response journal has no parent")?;
+    fs::create_dir_all(parent).map_err(|_| "Could not create the Companion journal directory")?;
+    #[cfg(unix)]
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|_| "Could not secure the Companion journal directory")?;
+    let lock_path = journal_path.with_extension("lock");
+    if fs::symlink_metadata(&lock_path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("Companion response journal lock must not be a symlink".into());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let file = options
+        .open(lock_path)
+        .map_err(|_| "Could not open the Companion response journal lock")?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| "Could not secure the Companion response journal lock")?;
+    file.try_lock()
+        .map_err(|_| "Companion response journal is busy; no state was changed")?;
+    operation()
 }
 
 fn load(path: &Path) -> Result<Option<Journal>, String> {
@@ -384,5 +591,59 @@ mod tests {
             fs::metadata(journal_path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn compact_response_preserves_selected_option_and_owner_detail_with_a_hard_text_bound() {
+        let observation = json!({
+            "id": "70b1c956-69cc-4bd3-94ac-780906817251",
+            "node_id": "choose",
+            "kind": "decision_response",
+            "expected_revision": 1,
+            "source_revision": 1,
+            "context_fingerprint": "fingerprint",
+            "context_snapshot": {
+                "question": "Ship it?",
+                "decision_options": [{"id": "approve", "label": "Approve"}]
+            },
+            "response_key": "approve",
+            "response_detail": "Use the staged rollout"
+        });
+
+        let (compact, truncated) = compact_observation(&observation);
+        assert!(!truncated);
+        assert_eq!(compact["question"], "Ship it?");
+        assert_eq!(compact["answer"]["response_key"], "approve");
+        assert_eq!(compact["answer"]["selected_label"], "Approve");
+        assert_eq!(
+            compact["answer"]["response_detail"],
+            "Use the staged rollout"
+        );
+
+        let mut oversized = observation;
+        oversized["response_detail"] = Value::String("é".repeat(MAX_COMPACT_TEXT));
+        let (compact, truncated) = compact_observation(&oversized);
+        assert!(truncated);
+        assert!(compact["content_truncated"].as_bool().unwrap());
+        assert!(
+            compact["answer"]["response_detail"].as_str().unwrap().len()
+                <= MAX_COMPACT_TEXT + '…'.len_utf8()
+        );
+    }
+
+    #[test]
+    fn journal_mutations_fail_closed_when_another_writer_holds_the_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("responses.json");
+
+        with_journal_lock(&journal_path, || {
+            let error = with_journal_lock(&journal_path, || Ok(())).unwrap_err();
+            assert_eq!(
+                error,
+                "Companion response journal is busy; no state was changed"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 }
