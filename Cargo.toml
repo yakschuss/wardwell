@@ -1,6 +1,6 @@
 [package]
 name = "wardwell"
-version = "0.11.1+companion.default.1"
+version = "0.11.1+companion.default.2"
 edition = "2024"
 description = "Persistent project memory for Claude Code — MCP server + CLI"
 license = "BSL-1.1"

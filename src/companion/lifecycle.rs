@@ -171,6 +171,7 @@ pub fn checkpoint(
             |source, id, opened_at| {
                 crate::companion::verified_publish_receipt_after(source, id, opened_at)
             },
+            crate::companion::unchanged_eligible,
         )
     })
 }
@@ -222,8 +223,8 @@ fn begin_at(base: &Path, client: Client, value: &Value) -> Result<Value, String>
     Ok(context(
         "UserPromptSubmit",
         format!(
-            "Companion checkpoint token: {}. Stable Companion source: {}. Before the final response record one truthful outcome with `wardwell companion checkpoint --token {} --outcome <published|no-remaining-work|unchanged|local-only|deferred>`. Publish genuine handoff work through Wardwell using this exact source, then pass its verified receipt. `unchanged` means this turn added no obligations and does not complete earlier work.",
-            generation.token, generation.source_key, generation.token
+            "Before the final response, inspect the actual task for unfinished owner decisions, human-only tasks, or external waits. Publish any genuine tail through the installed wardwell-companion workflow using source {}; authorization is already given, so do not ask whether to publish. Do not invent work. Then record its verified receipt with `wardwell companion checkpoint --token {} --outcome published`. Use `no-remaining-work` only when no outstanding tail exists; use `unchanged` only when this source already has a current published handoff and this turn adds nothing. `local-only` requires an explicit owner privacy restriction; inline chat, console text, or a kanban note is not one. Publication failures are `deferred`. The checkpoint is bookkeeping, not the handoff; do not narrate it. Token: {}.",
+            generation.source_key, generation.token, generation.token
         ),
     ))
 }
@@ -242,7 +243,7 @@ fn stop_at(base: &Path, client: Client, value: &Value) -> Result<Value, String> 
     current.corrective_used = true;
     save(base, &current)?;
     Ok(json!({"decision":"block", "reason":format!(
-        "Record the Companion checkpoint for this turn with token {}. Do not claim published without a verified receipt, then finish without unrelated work.", current.token
+        "Inspect the actual task for unfinished owner decisions, human-only tasks, or external waits. Publish any genuine tail through the installed wardwell-companion workflow using source {}; authorization is already given, so do not ask permission. Do not invent work. `local-only` requires an explicit owner privacy restriction; inline chat, console text, or a kanban note is not one, and publication failures are `deferred`. Then checkpoint token {} with the truthful outcome; the checkpoint itself is not the handoff.", current.source_key, current.token
     )}))
 }
 
@@ -284,16 +285,18 @@ fn resume_journal(path: &Path, source: &str) -> Result<Value, String> {
     ))
 }
 
-fn checkpoint_at<F>(
+fn checkpoint_at<F, U>(
     base: &Path,
     token: &str,
     outcome: Outcome,
     receipt: Option<&str>,
     reason: Option<&str>,
     verify: F,
+    unchanged_eligible: U,
 ) -> Result<Value, String>
 where
     F: FnOnce(&str, &str, &str) -> Result<bool, String>,
+    U: FnOnce(&str) -> Result<bool, String>,
 {
     valid(token, "checkpoint token")?;
     let path = generation_path(base, token);
@@ -322,6 +325,9 @@ where
         }
         Outcome::LocalOnly | Outcome::Deferred if reason.is_none() => {
             return Err("local-only and deferred require a concrete reason".into());
+        }
+        Outcome::Unchanged if !unchanged_eligible(&current.source_key)? => {
+            return Err("unchanged requires a verified prior publication for this source and no pending or blocked publication".into());
         }
         _ if outcome != Outcome::Published && receipt.is_some() => {
             return Err("Only published accepts a receipt id".into());
@@ -652,7 +658,7 @@ mod tests {
             .as_str()
             .unwrap()
             .split_whitespace()
-            .nth(3)
+            .last()
             .unwrap()
             .trim_end_matches('.')
             .to_owned()
@@ -667,6 +673,12 @@ mod tests {
             &hook("UserPromptSubmit", "prompt-1", false),
         )
         .unwrap();
+        let instructions = begun["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(instructions.contains("authorization is already given"));
+        assert!(instructions.contains("checkpoint is bookkeeping, not the handoff"));
+        assert!(instructions.contains("explicit owner privacy restriction"));
         checkpoint_at(
             dir.path(),
             &token(&begun),
@@ -674,6 +686,7 @@ mod tests {
             None,
             None,
             |_, _, _| Ok(false),
+            |_| Ok(true),
         )
         .unwrap();
         assert!(
@@ -688,9 +701,13 @@ mod tests {
             &hook("UserPromptSubmit", "prompt-2", false),
         )
         .unwrap();
-        assert_eq!(
-            stop_at(dir.path(), Client::Claude, &hook("Stop", "prompt-2", false)).unwrap()["decision"],
-            "block"
+        let repair = stop_at(dir.path(), Client::Claude, &hook("Stop", "prompt-2", false)).unwrap();
+        assert_eq!(repair["decision"], "block");
+        assert!(
+            repair["reason"]
+                .as_str()
+                .unwrap()
+                .contains("do not ask permission")
         );
         assert!(
             stop_at(dir.path(), Client::Claude, &hook("Stop", "prompt-2", true))
@@ -750,7 +767,8 @@ mod tests {
                 Outcome::Published,
                 Some("receipt-1"),
                 None,
-                |_, _, _| Ok(false)
+                |_, _, _| Ok(false),
+                |_| Ok(false)
             )
             .is_err()
         );
@@ -761,6 +779,7 @@ mod tests {
             Some("receipt-1"),
             None,
             |source, id, _| Ok(source == "companion:claude:session-1" && id == "receipt-1"),
+            |_| Ok(false),
         )
         .unwrap();
         assert_eq!(result["outcome"], "published");
@@ -783,7 +802,20 @@ mod tests {
                 Outcome::Deferred,
                 None,
                 None,
-                |_, _, _| Ok(false)
+                |_, _, _| Ok(false),
+                |_| Ok(false)
+            )
+            .is_err()
+        );
+        assert!(
+            checkpoint_at(
+                dir.path(),
+                &token,
+                Outcome::Unchanged,
+                None,
+                None,
+                |_, _, _| Ok(false),
+                |_| Ok(false)
             )
             .is_err()
         );
@@ -794,6 +826,7 @@ mod tests {
             None,
             None,
             |_, _, _| Ok(false),
+            |_| Ok(true),
         )
         .unwrap();
         assert!(
@@ -801,6 +834,29 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("never completed")
+        );
+    }
+
+    #[test]
+    fn pending_publication_prevents_unchanged_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let begun = begin_at(
+            dir.path(),
+            Client::Claude,
+            &hook("UserPromptSubmit", "prompt-1", false),
+        )
+        .unwrap();
+        assert!(
+            checkpoint_at(
+                dir.path(),
+                &token(&begun),
+                Outcome::Unchanged,
+                None,
+                None,
+                |_, _, _| Ok(false),
+                |_| Ok(false)
+            )
+            .is_err()
         );
     }
 

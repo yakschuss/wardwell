@@ -300,6 +300,44 @@ fn verified_publish_receipt_after_at(
     Ok(newer == 0)
 }
 
+pub fn unchanged_eligible(source_key: &str) -> Result<bool, String> {
+    unchanged_eligible_at(&path(), source_key)
+}
+
+fn unchanged_eligible_at(database_path: &Path, source_key: &str) -> Result<bool, String> {
+    let connection = open(database_path)?;
+    let outstanding: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM operations WHERE source_key = ?1 AND action = 'publish' AND state IN ('pending', 'blocked')",
+        [source_key], |row| row.get(0),
+    ).map_err(|_| "Could not inspect outstanding Companion publications")?;
+    if outstanding > 0 {
+        return Ok(false);
+    }
+    let mut statement = connection.prepare(
+        "SELECT receipt_json FROM operations WHERE source_key = ?1 AND action = 'publish' AND state = 'completed'"
+    ).map_err(|_| "Could not inspect completed Companion publications")?;
+    let receipts = statement
+        .query_map([source_key], |row| row.get::<_, String>(0))
+        .map_err(|_| "Could not read Companion publication receipts")?;
+    for receipt in receipts {
+        let encoded = receipt.map_err(|_| "Could not read Companion publication receipt")?;
+        let value: Value = serde_json::from_str(&encoded)
+            .map_err(|_| "Companion publication receipt is malformed")?;
+        if value["status"] == "verified"
+            && value["source_key"] == source_key
+            && value["action"] == "publish"
+            && value["revision"].as_u64().is_some()
+            && value["remote_id"].as_str().is_some_and(|id| !id.is_empty())
+            && value["verified_at"]
+                .as_str()
+                .is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn status(source_key: &str) -> Result<Value, String> {
     let connection = open(&path())?;
     let (pending, blocked, completed): (u64, u64, u64) = connection
@@ -460,6 +498,54 @@ fn secure_directory(path: &Path) -> Result<(), String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_requires_verified_publication_without_outstanding_work_for_exact_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("companions/wardwell-context/outbox.sqlite3");
+        assert!(!unchanged_eligible_at(&db, "a").unwrap());
+        let first = stage_at(
+            &db,
+            "a",
+            "publish",
+            &json!({"expected_revision":0}),
+            Some("p"),
+            true,
+        )
+        .unwrap();
+        assert!(!unchanged_eligible_at(&db, "a").unwrap());
+        complete_at(&db, &first, "a", "publish", "plan", Some(1)).unwrap();
+        assert!(unchanged_eligible_at(&db, "a").unwrap());
+        assert!(!unchanged_eligible_at(&db, "b").unwrap());
+        stage_at(
+            &db,
+            "b",
+            "publish",
+            &json!({"expected_revision":0}),
+            Some("p"),
+            true,
+        )
+        .unwrap();
+        assert!(unchanged_eligible_at(&db, "a").unwrap());
+        let next = stage_at(
+            &db,
+            "a",
+            "publish",
+            &json!({"expected_revision":1}),
+            Some("p"),
+            true,
+        )
+        .unwrap();
+        assert!(!unchanged_eligible_at(&db, "a").unwrap());
+        open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE operations SET state = 'blocked' WHERE request_id = ?1",
+                [&next],
+            )
+            .unwrap();
+        assert!(!unchanged_eligible_at(&db, "a").unwrap());
+    }
 
     #[test]
     fn duplicate_survives_restart_and_sources_are_isolated() {
