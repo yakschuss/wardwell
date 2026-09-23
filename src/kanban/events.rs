@@ -197,28 +197,22 @@ pub fn next_ticket_number(vault_root: &Path, domain: &str, project: &str, prefix
         for line in content.lines().rev() {
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if meta.get("_meta").is_some() {
-                    if let Some(n) = meta.get("next_id").and_then(|v| v.as_i64()) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && meta.get("_meta").is_some()
+                    && let Some(n) = meta.get("next_id").and_then(|v| v.as_i64()) {
                         return n;
                     }
-                }
-            }
             break; // only check last non-empty line
         }
         // Fallback: scan create events
         let prefix_dash = format!("{prefix}-");
         let mut max = 0i64;
         for line in content.lines() {
-            if let Ok(event) = serde_json::from_str::<KanbanEvent>(line) {
-                if let KanbanEvent::Create { ticket_id, .. } = &event {
-                    if let Some(num_str) = ticket_id.strip_prefix(&prefix_dash) {
-                        if let Ok(n) = num_str.parse::<i64>() {
-                            if n > max { max = n; }
-                        }
-                    }
-                }
-            }
+            if let Ok(event) = serde_json::from_str::<KanbanEvent>(line)
+                && let KanbanEvent::Create { ticket_id, .. } = &event
+                    && let Some(num_str) = ticket_id.strip_prefix(&prefix_dash)
+                        && let Ok(n) = num_str.parse::<i64>()
+                            && n > max { max = n; }
         }
         max + 1
     } else {

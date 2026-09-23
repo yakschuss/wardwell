@@ -129,8 +129,8 @@ impl KanbanStore {
         let groups = load_kanban_yml(&vault_root);
 
         // Check schema version — wipe if stale (SQLite is just a cache)
-        if db_path.exists() {
-            if let Ok(c) = Connection::open(db_path) {
+        if db_path.exists()
+            && let Ok(c) = Connection::open(db_path) {
                 let version: i64 = c.query_row(
                     "SELECT COALESCE((SELECT version FROM kanban_schema_version), 0)", [], |r| r.get(0),
                 ).unwrap_or(0);
@@ -144,7 +144,6 @@ impl KanbanStore {
                     eprintln!("wardwell: kanban schema v{version} → v{}, rebuilding from JSONL", Self::SCHEMA_VERSION);
                 }
             }
-        }
 
         let conn = Connection::open(db_path)?;
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
@@ -669,13 +668,12 @@ impl KanbanStore {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(search_pat)];
         let mut idx = 2;
 
-        if use_domain {
-            if let Some(dl) = domains {
+        if use_domain
+            && let Some(dl) = domains {
                 let ph: Vec<String> = dl.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
                 conditions.push(format!("p.domain IN ({})", ph.join(",")));
                 for d in dl { params.push(Box::new(d.clone())); }
             }
-        }
         if let Some(proj) = project {
             let group_members = self.resolve_group_members(proj);
             if group_members.is_empty() {
@@ -717,6 +715,8 @@ impl KanbanStore {
         Ok(items)
     }
 
+    // Preserve the existing positional public API during lint cleanup.
+    #[allow(clippy::too_many_arguments)]
     pub fn list(
         &self, project: Option<&str>, status: Option<&str>, priority: Option<&str>,
         assignee: Option<&str>, epic: Option<&str>, tag: Option<&str>, include_done: bool, domains: Option<&[String]>,
@@ -731,13 +731,12 @@ impl KanbanStore {
             "FROM kanban_items INNER JOIN kanban_projects p ON kanban_items.project = p.project"
         } else { "FROM kanban_items" };
 
-        if use_domain {
-            if let Some(dl) = domains {
+        if use_domain
+            && let Some(dl) = domains {
                 let ph: Vec<String> = dl.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
                 conditions.push(format!("p.domain IN ({})", ph.join(",")));
                 for d in dl { params.push(Box::new(d.clone())); }
             }
-        }
         if !include_done { conditions.push(format!("kanban_items.status != ?{idx}")); params.push(Box::new("done".to_string())); idx += 1; }
         if let Some(v) = project {
             let group_members = self.resolve_group_members(v);
@@ -891,11 +890,11 @@ impl KanbanStore {
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![];
         let mut idx = 1;
 
-        if use_domain { if let Some(dl) = domains {
+        if use_domain && let Some(dl) = domains {
             let ph: Vec<String> = dl.iter().map(|_| { let s = format!("?{idx}"); idx += 1; s }).collect();
             extra.push(format!("p.domain IN ({})", ph.join(",")));
             for d in dl { params.push(Box::new(d.clone())); }
-        }}
+        }
         if let Some(p) = project { extra.push(format!("kanban_items.project=?{idx}")); params.push(Box::new(p.to_string())); let _ = idx; }
 
         let wh = if extra.is_empty() { format!("WHERE {named_where}") } else { format!("WHERE ({named_where}) AND {}", extra.join(" AND ")) };
@@ -1304,6 +1303,7 @@ fn latest_grooming_artifact(vault_root: &Path, domain: &str, project: &str, tick
 /// The groomer writes a stable preamble:
 ///   - readiness: build_prompt_needed
 ///   - surface_to_jack: true
+///
 /// Returns `(readiness, surfaced)`; either may be `None` if absent/unreadable.
 fn parse_grooming_header(vault_root: &Path, rel_path: &str) -> (Option<String>, Option<bool>) {
     let full = vault_root.join(rel_path);
@@ -1318,15 +1318,14 @@ fn parse_grooming_header(vault_root: &Path, rel_path: &str) -> (Option<String>, 
         let l = line.trim_start_matches(['-', ' ', '*']).trim();
         if let Some(rest) = l.strip_prefix("readiness:") {
             if readiness.is_none() { readiness = Some(rest.trim().to_string()); }
-        } else if let Some(rest) = l.strip_prefix("surface_to_jack:") {
-            if surfaced.is_none() {
+        } else if let Some(rest) = l.strip_prefix("surface_to_jack:")
+            && surfaced.is_none() {
                 surfaced = match rest.trim() {
                     "true" => Some(true),
                     "false" => Some(false),
                     _ => None,
                 };
             }
-        }
     }
     (readiness, surfaced)
 }

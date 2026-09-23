@@ -295,12 +295,11 @@ fn gather_relevant(
         while changed {
             changed = false;
             for item in items.iter().filter(|i| i.project == project) {
-                if let Some(parent) = &item.parent {
-                    if set.contains(parent) && !set.contains(&item.ticket_id) {
+                if let Some(parent) = &item.parent
+                    && set.contains(parent) && !set.contains(&item.ticket_id) {
                         set.insert(item.ticket_id.clone());
                         changed = true;
                     }
-                }
             }
         }
     }
@@ -435,11 +434,10 @@ fn classify(
     }
 
     // Full mode keeps a richer note excerpt for sequencing context.
-    if opts.full {
-        if let Some(note) = item.notes.last() {
+    if opts.full
+        && let Some(note) = item.notes.last() {
             evidence.push(format!("latest note: \"{}\"", truncate(&note.text, 140)));
         }
-    }
 
     let cap_evidence = if opts.full { 6 } else { 2 };
     evidence.truncate(cap_evidence);

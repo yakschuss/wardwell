@@ -78,11 +78,10 @@ fn try_append(path: &Path, schema_header: Option<&str>, line: &str) -> io::Resul
         None => false,
     };
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if needs_schema {
-        if let Some(header) = schema_header {
+    if needs_schema
+        && let Some(header) = schema_header {
             writeln!(file, "{header}")?;
         }
-    }
     writeln!(file, "{line}")?;
     Ok(())
 }

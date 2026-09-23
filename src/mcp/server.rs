@@ -1186,7 +1186,7 @@ impl WardwellServer {
                 (term, count, projects)
             })
             .collect();
-        hot_topics.sort_by(|a, b| b.1.cmp(&a.1));
+        hot_topics.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         hot_topics.truncate(10);
         let hot_topics_json: Vec<serde_json::Value> = hot_topics.into_iter()
             .map(|(term, count, projects)| serde_json::json!({
@@ -2074,11 +2074,10 @@ impl WardwellServer {
         let file_path = project_dir.join(rel_path);
 
         // Create parent directories
-        if let Some(parent) = file_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = file_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 return json_error(&format!("failed to create directory: {e}"));
             }
-        }
 
         if let Err(e) = std::fs::write(&file_path, content) {
             return json_error(&format!("failed to write file: {e}"));
@@ -2164,11 +2163,10 @@ impl WardwellServer {
         let Some(ref ticket_id) = p.ticket_id else {
             return json_error("'ticket_id' is required for get");
         };
-        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
-            if let Err(e) = self.check_kanban_domain_access(dom) {
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom) {
                 return json_error(&e);
             }
-        }
         match kanban.get_item(ticket_id) {
             Ok(item) => serde_json::to_string(&serde_json::json!({"item": item})).unwrap_or_default(),
             Err(e) => json_error(&e.to_string()),
@@ -2376,11 +2374,10 @@ impl WardwellServer {
             return json_error("provide 'text' (content to write and attach) with 'title' (filename), or 'file_path' (vault-relative path to existing file)");
         }
         let filename = p.title.as_deref().or(p.file_path.as_deref()).unwrap_or("attachment.md");
-        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
-            if let Err(e) = self.check_kanban_domain_access(dom) {
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom) {
                 return json_error(&e);
             }
-        }
         match kanban.attach_file(ticket_id, filename, p.text.as_deref(), p.file_path.as_deref()) {
             Ok(att) => {
                 let audit_line = format!("{ticket_id} attach: \"{}\" ({})", att.filename, att.attachment_id);
@@ -2408,11 +2405,10 @@ impl WardwellServer {
         let Some(ref attachment_id) = p.attachment_id else {
             return json_error("'attachment_id' is required for detach");
         };
-        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id) {
-            if let Err(e) = self.check_kanban_domain_access(dom) {
+        if let Some((ref dom, _)) = self.lookup_item_domain(kanban, ticket_id)
+            && let Err(e) = self.check_kanban_domain_access(dom) {
                 return json_error(&e);
             }
-        }
         match kanban.detach_file(ticket_id, attachment_id) {
             Ok(()) => {
                 let audit_line = format!("{ticket_id} detach: {attachment_id}");
@@ -2569,11 +2565,10 @@ impl WardwellServer {
         if let Err(e) = self.check_kanban_domain_access(&domain) {
             return json_error(&e);
         }
-        if let Some(ref tid) = p.ticket_id {
-            if self.lookup_item_domain(kanban, tid).is_none() {
+        if let Some(ref tid) = p.ticket_id
+            && self.lookup_item_domain(kanban, tid).is_none() {
                 return json_error(&format!("ticket '{}' not found", tid));
             }
-        }
         if let Err(error) = crate::kanban::questions::validate_interaction(
             p.interaction_type,
             p.interaction_options.as_deref(),
@@ -2832,15 +2827,14 @@ impl WardwellServer {
                         if self.lookup_item_domain(kanban, tid).is_none() {
                             return json_error(&format!("change[{}]: ticket '{}' not found", i, tid));
                         }
-                        if !snapshot_ids.contains(tid) {
-                            if let Ok(item) = kanban.get_item(tid) {
+                        if !snapshot_ids.contains(tid)
+                            && let Ok(item) = kanban.get_item(tid) {
                                 ticket_snapshots.push(crate::kanban::proposals::TicketSnapshot {
                                     ticket_id: tid.clone(),
                                     updated_at: item.updated_at.clone(),
                                 });
                                 snapshot_ids.insert(tid.clone());
                             }
-                        }
                     }
                     changes.push(op);
                 }
@@ -3370,11 +3364,10 @@ impl WardwellServer {
             Err(e) => return json_error(&format!("failed to list tickets: {e}")),
         };
 
-        if let Some(ref root) = p.root_ticket_id {
-            if !items.iter().any(|i| &i.ticket_id == root) {
+        if let Some(ref root) = p.root_ticket_id
+            && !items.iter().any(|i| &i.ticket_id == root) {
                 return json_error(&format!("root_ticket_id '{}' not found in project '{}'", root, project));
             }
-        }
 
         let relationships = crate::kanban::relationships::read_all(&self.vault_root, &domain, project);
         let questions = crate::kanban::questions::read_all(&self.vault_root, &domain, project);
@@ -3686,8 +3679,8 @@ impl WardwellServer {
 
         // Check kanban tickets — filter by similarity to avoid noisy substring matches
         let mut kanban_matches = Vec::new();
-        if let Some(ref kanban) = self.kanban {
-            if let Ok(results) = kanban.search(&query, None, None) {
+        if let Some(ref kanban) = self.kanban
+            && let Ok(results) = kanban.search(&query, None, None) {
                 for item in results {
                     let id_lower = item.ticket_id.to_lowercase();
                     let title_lower = item.title.to_lowercase();
@@ -3716,7 +3709,6 @@ impl WardwellServer {
                 kanban_matches.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 kanban_matches.truncate(limit);
             }
-        }
         let kanban_matches: Vec<_> = kanban_matches.into_iter().map(|(_, v)| v).collect();
 
         serde_json::to_string_pretty(&serde_json::json!({
@@ -3741,30 +3733,26 @@ impl WardwellServer {
         // Build target names from file stem and frontmatter summary
         let mut target_names = Vec::new();
         let full_path = resolve_path(&self.vault_root, &clean);
-        if let Some(fp) = full_path {
-            if let Ok(vf) = crate::vault::reader::read_file(&fp) {
+        if let Some(fp) = full_path
+            && let Ok(vf) = crate::vault::reader::read_file(&fp) {
                 // Use filename stem
-                if let Some(stem) = fp.file_stem().and_then(|s| s.to_str()) {
-                    if stem.len() >= 3 {
+                if let Some(stem) = fp.file_stem().and_then(|s| s.to_str())
+                    && stem.len() >= 3 {
                         target_names.push(stem.to_string());
                     }
-                }
                 // Use summary/title if available
-                if let Some(ref summary) = vf.frontmatter.summary {
-                    if summary.len() >= 3 {
+                if let Some(ref summary) = vf.frontmatter.summary
+                    && summary.len() >= 3 {
                         target_names.push(summary.clone());
                     }
-                }
             }
-        }
 
         if target_names.is_empty() {
             // Fallback to filename stem from path
-            if let Some(stem) = std::path::Path::new(&clean).file_stem().and_then(|s| s.to_str()) {
-                if stem.len() >= 3 {
+            if let Some(stem) = std::path::Path::new(&clean).file_stem().and_then(|s| s.to_str())
+                && stem.len() >= 3 {
                     target_names.push(stem.to_string());
                 }
-            }
         }
 
         if target_names.is_empty() {
