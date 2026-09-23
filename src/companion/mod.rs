@@ -506,9 +506,11 @@ fn own_plans(result: Value, source_key: &str) -> Result<Value, String> {
         .get("work_plans")
         .and_then(Value::as_array)
         .ok_or("Hank returned an invalid plan list")?;
-    Ok(
-        json!({"work_plans":plans.iter().filter(|plan| plan["source_key"].as_str() == Some(source_key)).collect::<Vec<_>>()}),
-    )
+    let mut output = json!({"work_plans":plans.iter().filter(|plan| plan["source_key"].as_str() == Some(source_key)).collect::<Vec<_>>()});
+    if let Some(registry) = result.get("workstreams").filter(|value| value.is_array()) {
+        output["workstreams"] = registry.clone();
+    }
+    Ok(output)
 }
 
 fn discover_plans(result: Value, workstream: &str) -> Result<Value, String> {
@@ -517,8 +519,32 @@ fn discover_plans(result: Value, workstream: &str) -> Result<Value, String> {
         .and_then(Value::as_array)
         .ok_or("Hank returned an invalid plan list")?;
     Ok(
-        json!({"work_plans":plans.iter().filter(|plan| plan["workstream"].as_str() == Some(workstream)).collect::<Vec<_>>()}),
+        json!({"work_plans":plans.iter().filter(|plan| workstream_matches(plan, workstream)).collect::<Vec<_>>()}),
     )
+}
+
+fn workstream_matches(plan: &Value, requested: &str) -> bool {
+    if plan
+        .get("nodes")
+        .and_then(Value::as_array)
+        .is_some_and(|nodes| nodes.iter().any(|node| workstream_matches(node, requested)))
+    {
+        return true;
+    }
+    if plan["workstream_id"].as_str() == Some(requested)
+        || plan["workstream"].as_str() == Some(requested)
+    {
+        return true;
+    }
+    match (
+        plan["workstream"]["project"].as_str(),
+        plan["workstream"]["name"].as_str(),
+    ) {
+        (Some(project), Some(name)) => {
+            requested == format!("{project} / {name}") || (project == name && requested == name)
+        }
+        _ => false,
+    }
 }
 
 enum PublishReconciliation {
@@ -1141,6 +1167,37 @@ mod tests {
         );
         assert!(require_plan_key(&json!({"source_key":"b"}), "a").is_err());
         assert!(require_plan_key(&json!({}), "a").is_err());
+    }
+
+    #[test]
+    fn owner_categories_are_discoverable_without_exposing_other_source_plans() {
+        let plan = json!({"source_key":"a","id":"one","workstream_id":"category-id","workstream":{"project":"Corr","name":"ADT"},"source_workstream":"old-label"});
+        let result = json!({"work_plans":[plan.clone(),{"source_key":"b","id":"private"}],"workstreams":[{"id":"category-id","project":"Corr","name":"ADT"}]});
+        let own = own_plans(result.clone(), "a").unwrap();
+        assert_eq!(own["work_plans"], json!([plan]));
+        assert_eq!(own["workstreams"], result["workstreams"]);
+        assert_eq!(
+            discover_plans(result.clone(), "Corr / ADT").unwrap()["work_plans"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            discover_plans(result.clone(), "category-id").unwrap()["work_plans"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            discover_plans(result, "old-label").unwrap()["work_plans"],
+            json!([])
+        );
+        assert!(workstream_matches(
+            &json!({"workstream_id":"pcc","nodes":[{"workstream_id":"adt","workstream":{"project":"Corr","name":"ADT"}}]}),
+            "adt"
+        ));
     }
 
     #[test]
