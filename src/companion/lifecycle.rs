@@ -131,10 +131,10 @@ pub fn known_plan_id(
     value: &Value,
     source: &str,
 ) -> Result<Option<String>, String> {
-    if let Some(journal) = read_json(&crate::companion::journal::path(source))? {
-        if journal["source_key"].as_str() == Some(source) {
-            return Ok(journal["plan_id"].as_str().map(str::to_owned));
-        }
+    if let Some(journal) = read_json(&crate::companion::journal::path(source))?
+        && journal["source_key"].as_str() == Some(source)
+    {
+        return Ok(journal["plan_id"].as_str().map(str::to_owned));
     }
     let hook = parse(value, "SessionStart")?;
     let legacy = crate::config::loader::config_dir()
@@ -257,10 +257,10 @@ fn resume_at(base: &Path, client: Client, value: &Value) -> Result<Value, String
 }
 
 fn resume_journal(path: &Path, source: &str) -> Result<Value, String> {
-    let Some(journal) = read_json(&path)? else {
+    let Some(journal) = read_json(path)? else {
         return Ok(json!({}));
     };
-    if journal["source_key"].as_str() != Some(&source) {
+    if journal["source_key"].as_str() != Some(source) {
         return Err("Companion response journal identity mismatch".into());
     }
     let Some(items) = journal["pending_observations"].as_array() else {
