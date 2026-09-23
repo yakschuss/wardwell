@@ -254,6 +254,8 @@ pub struct ProposalListEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event")]
+// Preserve the public enum API and allocation behavior during lint cleanup.
+#[allow(clippy::large_enum_variant)]
 pub enum ProposalEvent {
     #[serde(rename = "create_proposal")]
     Create(Proposal),
@@ -536,15 +538,14 @@ fn compute_risk_flags(
                         priority_changes.push(ticket_id.clone());
                     }
                 }
-                if let Some(new_status) = status {
-                    if let Some(item) = item_map.get(ticket_id.as_str()) {
+                if let Some(new_status) = status
+                    && let Some(item) = item_map.get(ticket_id.as_str()) {
                         for sc in summary.state_changes.iter_mut() {
                             if sc.ticket_id == *ticket_id && sc.field == "status" && sc.to.as_deref() == Some(new_status.as_str()) {
                                 sc.from = Some(item.status.clone());
                             }
                         }
                     }
-                }
             }
             ChangeOperation::AppendNote { ticket_id, .. } => {
                 unique_tickets.insert(ticket_id.clone());
@@ -554,8 +555,8 @@ fn compute_risk_flags(
                 unique_tickets.insert(to_ticket_id.clone());
                 outgoing_link_in_proposal.insert(from_ticket_id.clone());
             }
-            ChangeOperation::CreateQuestion { ticket_id, .. } => {
-                if let Some(tid) = ticket_id { unique_tickets.insert(tid.clone()); }
+            ChangeOperation::CreateQuestion { ticket_id: Some(tid), .. } => {
+                unique_tickets.insert(tid.clone());
             }
             _ => {}
         }

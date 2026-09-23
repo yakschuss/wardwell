@@ -380,15 +380,14 @@ fn build_signals(
         });
     }
     for item in filtered {
-        if let Some(v) = crate::kanban::verification::latest_for_ticket(verifications, &item.ticket_id) {
-            if matches!(v.confidence, crate::kanban::verification::Confidence::Stale | crate::kanban::verification::Confidence::Contradicted) {
+        if let Some(v) = crate::kanban::verification::latest_for_ticket(verifications, &item.ticket_id)
+            && matches!(v.confidence, crate::kanban::verification::Confidence::Stale | crate::kanban::verification::Confidence::Contradicted) {
                 signals.push(Signal {
                     signal_type: format!("verification_{}", format!("{:?}", v.confidence).to_lowercase()),
                     ticket_id: v.ticket_id.clone(),
                     summary: format!("Ticket '{}' verification is {:?}", item.title, v.confidence),
                 });
             }
-        }
     }
     signals
 }
@@ -396,8 +395,8 @@ fn build_signals(
 fn build_stale_verifications(filtered: &[&KanbanItem], verifications: &[Verification]) -> Vec<VerificationSignal> {
     let mut result = vec![];
     for item in filtered {
-        if let Some(v) = crate::kanban::verification::latest_for_ticket(verifications, &item.ticket_id) {
-            if matches!(v.confidence, crate::kanban::verification::Confidence::Stale | crate::kanban::verification::Confidence::Contradicted) {
+        if let Some(v) = crate::kanban::verification::latest_for_ticket(verifications, &item.ticket_id)
+            && matches!(v.confidence, crate::kanban::verification::Confidence::Stale | crate::kanban::verification::Confidence::Contradicted) {
                 result.push(VerificationSignal {
                     ticket_id: v.ticket_id.clone(),
                     confidence: format!("{:?}", v.confidence).to_lowercase(),
@@ -405,7 +404,6 @@ fn build_stale_verifications(filtered: &[&KanbanItem], verifications: &[Verifica
                     summary: v.summary.clone(),
                 });
             }
-        }
     }
     result
 }
@@ -453,22 +451,20 @@ pub fn build_hygiene_suggestions(
     let has_ticket_ref = |text: &str| -> bool {
         let bytes = text.as_bytes();
         for i in 0..bytes.len().saturating_sub(3) {
-            if bytes[i].is_ascii_uppercase() && bytes.get(i + 1).map_or(false, |b| b.is_ascii_uppercase()) {
-                if let Some(dash_pos) = bytes[i..].iter().position(|&b| b == b'-') {
+            if bytes[i].is_ascii_uppercase() && bytes.get(i + 1).is_some_and(|b| b.is_ascii_uppercase())
+                && let Some(dash_pos) = bytes[i..].iter().position(|&b| b == b'-') {
                     let after_dash = i + dash_pos + 1;
                     if after_dash < bytes.len() && bytes[after_dash].is_ascii_digit() {
                         return true;
                     }
                 }
-            }
         }
         false
     };
 
     for item in items {
-        if let Some(epic) = epic_filter {
-            if item.epic.as_deref() != Some(epic) { continue; }
-        }
+        if let Some(epic) = epic_filter
+            && item.epic.as_deref() != Some(epic) { continue; }
         if item.status == "done" { continue; }
 
         let searchable = build_searchable_text(item);
@@ -488,8 +484,8 @@ pub fn build_hygiene_suggestions(
         }
 
         for (pattern, rel_type) in &relationship_patterns {
-            if lower.contains(pattern) {
-                if has_ticket_ref(&searchable) {
+            if lower.contains(pattern)
+                && has_ticket_ref(&searchable) {
                     let excerpt = extract_excerpt(&searchable, pattern, 120);
                     suggestions.push(HygieneSuggestion {
                         suggestion_type: "relationship_candidate".into(),
@@ -499,7 +495,6 @@ pub fn build_hygiene_suggestions(
                     });
                     break;
                 }
-            }
         }
 
         if item.epic.is_some() {
