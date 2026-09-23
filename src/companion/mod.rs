@@ -163,10 +163,20 @@ async fn execute_connected(
         }
         "consume" => {
             let id = args["id"].as_str().unwrap_or_default();
-            if let Some(pending) = journal::pending(key, id)? {
+            let compact = args
+                .get("compact")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let session = args.get("session_id").and_then(Value::as_str);
+            if let Some(pending) = journal::consume_view(key, id, compact, session)? {
                 return Ok(pending);
             }
-            let plan = remote_tool(connection, "work_plan_get", json!({"id":id})).await?;
+            let plan = remote_tool(
+                connection,
+                "work_plan_get",
+                json!({"id":id, "compact":true}),
+            )
+            .await?;
             require_plan_key(&plan, key)?;
             let mut request = json!({"id":id});
             if let Some(cursor) = journal::cursor(key, id)? {
@@ -174,7 +184,12 @@ async fn execute_connected(
             }
             let page = remote_tool(connection, "work_plan_responses", request).await?;
             require_plan_key(&page, key)?;
-            journal::stage(key, &page)
+            let staged = journal::stage(key, &page)?;
+            if compact {
+                Ok(journal::consume_view(key, id, true, session)?.unwrap_or(staged))
+            } else {
+                Ok(staged)
+            }
         }
         "acknowledge" => {
             let id = args["id"].as_str().unwrap_or_default();
@@ -421,7 +436,14 @@ fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
                 args.keys().all(|name| name == "id" || name == "compact")
                     && args.get("compact").is_none_or(Value::is_boolean)
             }
-            _ => args.len() == 1,
+            _ => {
+                args.keys()
+                    .all(|name| matches!(name.as_str(), "id" | "compact" | "session_id"))
+                    && args.get("compact").is_none_or(Value::is_boolean)
+                    && args
+                        .get("session_id")
+                        .is_none_or(|value| value.as_str().is_some())
+            }
         };
         if !valid {
             return Err("Unsupported read arguments".into());
@@ -439,7 +461,7 @@ fn local_action_schema() -> Value {
     json!({
         "consume": {
             "source_key": "required stable conversation source",
-            "arguments": {"id": "required plan UUID"},
+            "arguments": {"id": "required plan UUID", "compact": "optional boolean bounded response view", "session_id": "optional presentation session id"},
             "meaning": "durably stage the next owner-response page; does not acknowledge or execute it"
         },
         "acknowledge": {

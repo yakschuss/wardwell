@@ -191,7 +191,34 @@ async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::err
             let input = read_stdin_json::<serde_json::Value>(200_000)?;
             match command {
                 LifecycleCommand::Begin { client } => {
-                    wardwell::companion::lifecycle::begin(client.parse()?, &input)
+                    let client = client.parse()?;
+                    let mut output = wardwell::companion::lifecycle::begin(client, &input)?;
+                    let source = wardwell::companion::lifecycle::begin_source(client, &input)?;
+                    if let Some(plan_id) =
+                        wardwell::companion::lifecycle::known_plan_id_for_source(&source)?
+                    {
+                        match refresh_companion_responses(client, &input, source, plan_id).await {
+                            Ok(Some(context)) => {
+                                let additional = output["hookSpecificOutput"]["additionalContext"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_owned();
+                                output["hookSpecificOutput"]["additionalContext"] =
+                                    serde_json::Value::String(format!("{additional}\n\n{context}"));
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                output["hookSpecificOutput"]["additionalContext"] =
+                                    serde_json::Value::String(format!(
+                                        "{}\n\nCompanion reply check unavailable; pending replies are retained. Use consume to retry before relying on an absent answer.",
+                                        output["hookSpecificOutput"]["additionalContext"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                    ));
+                            }
+                        }
+                    }
+                    Ok(output)
                 }
                 LifecycleCommand::Resume { client } => {
                     refresh_companion_resume(client.parse()?, &input).await
@@ -248,7 +275,9 @@ async fn refresh_companion_resume(
             companion::execute(CompanionParams {
                 action: "consume".into(),
                 source_key: Some(source.clone()),
-                arguments: Some(serde_json::json!({"id":id})),
+                arguments: Some(
+                    serde_json::json!({"id":id, "compact":true, "session_id":input["session_id"]}),
+                ),
                 arguments_file: None,
             })
             .await?;
@@ -268,6 +297,21 @@ async fn refresh_companion_resume(
         output["systemMessage"] = serde_json::Value::String(message);
     }
     Ok(output)
+}
+
+async fn refresh_companion_responses(
+    _client: wardwell::companion::lifecycle::Client,
+    input: &serde_json::Value,
+    source: String,
+    plan_id: String,
+) -> Result<Option<String>, String> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), wardwell::companion::execute(wardwell::companion::CompanionParams {
+        action: "consume".into(),
+        source_key: Some(source),
+        arguments: Some(serde_json::json!({"id": plan_id, "compact": true, "session_id": input["session_id"]})),
+        arguments_file: None,
+    })).await.map_err(|_| "Companion response refresh exceeded the five-second startup limit".to_string())??;
+    Ok(wardwell::companion::lifecycle::response_context(&result))
 }
 
 fn read_stdin_json<T: serde::de::DeserializeOwned>(
