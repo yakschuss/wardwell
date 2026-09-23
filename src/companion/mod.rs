@@ -45,8 +45,7 @@ pub async fn connect(token: &str) -> Result<Value, String> {
 }
 
 pub async fn execute(params: CompanionParams) -> Result<Value, String> {
-    let mut args = resolve_arguments(&params)?;
-    validate(&params, &args)?;
+    let mut args = prepare_arguments(&params)?;
     let key = params.source_key.as_deref().unwrap_or_default();
     if params.action == "outbox_status" {
         return outbox::status(key);
@@ -85,6 +84,10 @@ pub async fn execute(params: CompanionParams) -> Result<Value, String> {
 
 pub fn verified_receipt(source_key: &str, receipt_id: &str) -> Result<Option<Value>, String> {
     outbox::verified_receipt(source_key, receipt_id)
+}
+
+pub fn unchanged_eligible(source_key: &str) -> Result<bool, String> {
+    outbox::unchanged_eligible(source_key)
 }
 
 pub fn verified_publish_receipt(source_key: &str, receipt_id: &str) -> Result<bool, String> {
@@ -225,6 +228,26 @@ fn resolve_arguments(params: &CompanionParams) -> Result<Value, String> {
     serde_json::from_slice(&bytes).map_err(|_| "arguments_file must contain valid JSON".to_string())
 }
 
+fn prepare_arguments(params: &CompanionParams) -> Result<Value, String> {
+    let mut arguments = resolve_arguments(params)?;
+    if let (Some(source_key), Some(arguments)) =
+        (params.source_key.as_deref(), arguments.as_object_mut())
+    {
+        let identity_field = match params.action.as_str() {
+            "capture" => Some("conversation_key"),
+            "publish" => Some("source_key"),
+            _ => None,
+        };
+        if let Some(field) = identity_field {
+            arguments
+                .entry(field)
+                .or_insert_with(|| Value::String(source_key.to_owned()));
+        }
+    }
+    validate(params, &arguments)?;
+    Ok(arguments)
+}
+
 #[cfg(unix)]
 fn open_arguments_file(path: &Path) -> Result<fs::File, String> {
     use std::os::unix::fs::MetadataExt;
@@ -330,7 +353,12 @@ fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
             .and_then(Value::as_str)
             != Some(key)
     {
-        return Err("Hosted source identity must match this conversation's source_key".into());
+        return Err(match params.action.as_str() {
+            "capture" => "Capture arguments.conversation_key must match wrapper source_key; arguments.source identifies the adapter kind, not the conversation identity",
+            "publish" => "Publish arguments.source_key must match wrapper source_key",
+            _ => unreachable!(),
+        }
+        .into());
     }
     if params.action == "publish"
         && arguments
@@ -813,6 +841,49 @@ mod tests {
     fn valid(params: &CompanionParams) -> Result<(), String> {
         let args = resolve_arguments(params)?;
         validate(params, &args)
+    }
+
+    #[test]
+    fn prepare_arguments_fills_omitted_hosted_source_identity() {
+        let capture = prepare_arguments(&params(
+            "capture",
+            "session-a",
+            json!({"source":"codex", "external_id":"turn-1"}),
+        ))
+        .unwrap();
+        assert_eq!(capture["conversation_key"], "session-a");
+        assert_eq!(capture["source"], "codex");
+
+        let publish = prepare_arguments(&params(
+            "publish",
+            "session-a",
+            json!({"expected_revision":0}),
+        ))
+        .unwrap();
+        assert_eq!(publish["source_key"], "session-a");
+    }
+
+    #[test]
+    fn prepare_arguments_never_overwrites_explicit_source_identity() {
+        let capture = prepare_arguments(&params(
+            "capture",
+            "session-a",
+            json!({"source":"session-a", "conversation_key":"session-b", "external_id":"turn-1"}),
+        ));
+        assert_eq!(
+            capture.unwrap_err(),
+            "Capture arguments.conversation_key must match wrapper source_key; arguments.source identifies the adapter kind, not the conversation identity"
+        );
+
+        let publish = prepare_arguments(&params(
+            "publish",
+            "session-a",
+            json!({"source_key":"session-b", "expected_revision":0}),
+        ));
+        assert_eq!(
+            publish.unwrap_err(),
+            "Publish arguments.source_key must match wrapper source_key"
+        );
     }
 
     #[test]
