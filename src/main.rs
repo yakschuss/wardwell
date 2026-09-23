@@ -69,6 +69,52 @@ enum CompanionCommand {
         #[arg(long, required = true)]
         token_stdin: bool,
     },
+    /// Execute one bounded Companion request from JSON on standard input
+    Request,
+    /// Install or preview native lifecycle hooks
+    Install {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        skill_file: Option<std::path::PathBuf>,
+    },
+    /// Record the current prompt's explicit handoff outcome
+    Checkpoint {
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        outcome: String,
+        #[arg(long)]
+        receipt_id: Option<String>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Native hook entry points; reads the hook event JSON from standard input
+    Lifecycle {
+        #[command(subcommand)]
+        command: LifecycleCommand,
+    },
+    /// Report locally observed lifecycle execution and checkpoint outcomes
+    Coverage {
+        #[arg(long)]
+        client: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LifecycleCommand {
+    Begin {
+        #[arg(long)]
+        client: String,
+    },
+    Resume {
+        #[arg(long)]
+        client: String,
+    },
+    Stop {
+        #[arg(long)]
+        client: String,
+    },
 }
 
 #[tokio::main]
@@ -99,22 +145,142 @@ async fn main() {
 async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::companion::{self, CompanionParams};
     let result = match command {
-        CompanionCommand::Status => companion::execute(CompanionParams {
-            action: "status".into(), source_key: None, arguments: None, arguments_file: None,
-        }).await,
+        CompanionCommand::Status => {
+            companion::execute(CompanionParams {
+                action: "status".into(),
+                source_key: None,
+                arguments: None,
+                arguments_file: None,
+            })
+            .await
+        }
         CompanionCommand::Connect { token_stdin: _ } => {
             use std::io::Read;
             let mut bytes = Vec::new();
             std::io::stdin().take(8193).read_to_end(&mut bytes)?;
-            if bytes.len() > 8192 { return Err("Installation credential exceeds size limit".into()); }
-            let token = String::from_utf8(bytes).map_err(|_| "Installation credential must be UTF-8")?;
+            if bytes.len() > 8192 {
+                return Err("Installation credential exceeds size limit".into());
+            }
+            let token =
+                String::from_utf8(bytes).map_err(|_| "Installation credential must be UTF-8")?;
             companion::connect(token.trim_end_matches(['\r', '\n'])).await
+        }
+        CompanionCommand::Request => {
+            let params = read_stdin_json::<CompanionParams>(200_000)?;
+            companion::execute(params).await
+        }
+        CompanionCommand::Install {
+            dry_run,
+            skill_file,
+        } => wardwell::companion::install::run(dry_run, skill_file.as_deref()),
+        CompanionCommand::Checkpoint {
+            token,
+            outcome,
+            receipt_id,
+            reason,
+        } => {
+            let outcome = outcome.parse::<wardwell::companion::lifecycle::Outcome>()?;
+            wardwell::companion::lifecycle::checkpoint(
+                &token,
+                outcome,
+                receipt_id.as_deref(),
+                reason.as_deref(),
+            )
+        }
+        CompanionCommand::Lifecycle { command } => {
+            let input = read_stdin_json::<serde_json::Value>(200_000)?;
+            match command {
+                LifecycleCommand::Begin { client } => {
+                    wardwell::companion::lifecycle::begin(client.parse()?, &input)
+                }
+                LifecycleCommand::Resume { client } => {
+                    refresh_companion_resume(client.parse()?, &input).await
+                }
+                LifecycleCommand::Stop { client } => {
+                    wardwell::companion::lifecycle::stop(client.parse()?, &input)
+                }
+            }
+        }
+        CompanionCommand::Coverage { client } => {
+            let client = client.map(|value| value.parse()).transpose()?;
+            wardwell::companion::lifecycle::coverage(client)
         }
     };
     match result {
-        Ok(value) => { println!("{value}"); Ok(()) },
+        Ok(value) => {
+            println!("{value}");
+            Ok(())
+        }
         Err(message) => Err(message.into()),
     }
+}
+
+async fn refresh_companion_resume(
+    client: wardwell::companion::lifecycle::Client,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use wardwell::companion::{self, CompanionParams};
+    let Some(source) = wardwell::companion::lifecycle::resume_source(client, input)? else {
+        return wardwell::companion::lifecycle::resume(client, input);
+    };
+    let refresh = async {
+        let plan_id = match wardwell::companion::lifecycle::known_plan_id(client, input, &source)? {
+            Some(id) => Some(id),
+            None => {
+                let list = companion::execute(CompanionParams {
+                    action: "list".into(),
+                    source_key: Some(source.clone()),
+                    arguments: Some(serde_json::json!({})),
+                    arguments_file: None,
+                })
+                .await?;
+                let plans = list["work_plans"]
+                    .as_array()
+                    .ok_or("Hank returned an invalid source plan list")?;
+                if plans.len() == 1 {
+                    plans[0]["id"].as_str().map(str::to_owned)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(id) = plan_id {
+            companion::execute(CompanionParams {
+                action: "consume".into(),
+                source_key: Some(source.clone()),
+                arguments: Some(serde_json::json!({"id":id})),
+                arguments_file: None,
+            })
+            .await?;
+        }
+        Ok::<(), String>(())
+    };
+    let warning = match tokio::time::timeout(std::time::Duration::from_secs(5), refresh).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("Companion response refresh was deferred: {error}")),
+        Err(_) => Some(
+            "Companion response refresh was deferred after the five-second startup limit."
+                .to_string(),
+        ),
+    };
+    let mut output = wardwell::companion::lifecycle::resume(client, input)?;
+    if let Some(message) = warning {
+        output["systemMessage"] = serde_json::Value::String(message);
+    }
+    Ok(output)
+}
+
+fn read_stdin_json<T: serde::de::DeserializeOwned>(
+    limit: u64,
+) -> Result<T, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin().take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err("standard input exceeds the 200000-byte limit".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "standard input must contain valid request JSON".into())
 }
 
 async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
