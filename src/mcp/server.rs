@@ -3577,7 +3577,8 @@ impl WardwellServer {
         if self.config.trackers.is_empty() {
             return None;
         }
-        let (domain, project) = match (&p.ticket_id, &p.project) {
+        let ticket_id = p.ticket_id.as_ref().or(p.from_ticket_id.as_ref());
+        let (domain, project) = match (ticket_id, &p.project) {
             (Some(ticket_id), _) => {
                 let (domain, project) = self.lookup_item_domain(kanban, ticket_id)?;
                 (Some(domain), project)

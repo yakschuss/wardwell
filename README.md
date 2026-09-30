@@ -364,7 +364,8 @@ modification time as the last pull. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 
 With `readonly: true`, the kanban MCP write actions (create, update, move, note,
-attach, detach, sequence, groom, proposal_apply) on that project refuse and say to
+attach, detach, sequence, groom, relationship_create, relationship_delete,
+question_create, proposal_apply) on that project refuse and say to
 edit in the tracker. Reads are unaffected.
 
 Scheduling is external. An hourly launchd agent, saved as

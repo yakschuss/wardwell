@@ -24,6 +24,7 @@ pub fn provider_label(provider: &str) -> String {
 /// binding refuses all of them; reads are unaffected.
 pub const LOCKED_KANBAN_ACTIONS: &[&str] = &[
     "create", "update", "move", "note", "attach", "detach", "sequence", "groom", "proposal_apply",
+    "relationship_create", "relationship_delete", "question_create",
 ];
 
 /// Refusal for a kanban write on a project mirrored read-only, or None when

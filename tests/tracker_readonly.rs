@@ -150,6 +150,9 @@ fn readonly_tracker_binding_refuses_kanban_writes_and_leaves_the_log_unchanged()
         json!({"action":"sequence","project":"claims","order":[id]}),
         json!({"action":"groom","ticket_id":id}),
         json!({"action":"groom","domain":"work","project":"claims"}),
+        json!({"action":"relationship_create","from_ticket_id":id,"to_ticket_id":id,"relationship_type":"blocks"}),
+        json!({"action":"relationship_delete","domain":"work","project":"claims","relationship_id":"rel-1"}),
+        json!({"action":"question_create","domain":"work","project":"claims","question_text":"Why?"}),
         json!({"action":"proposal_apply","domain":"work","project":"claims","target_id":"prop-1"}),
     ];
     for request in writes {
