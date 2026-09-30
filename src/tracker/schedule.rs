@@ -123,9 +123,14 @@ pub fn schedule(
     let parent = path.parent().ok_or("no LaunchAgents directory")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("could not create the LaunchAgents directory: {error}"))?;
     let body = launch_agent_plist(&binary, interval_seconds, &config_dir.join("tracker-pull.log"));
+    let staged = path.with_extension("plist.tmp");
+    std::fs::write(&staged, body).map_err(|error| format!("could not write {LABEL}.plist: {error}"))?;
     // Replace any existing copy cleanly; it may not be loaded, so ignore failure.
     let _ = runner.run(&argv(&["launchctl", "bootout", &format!("{}/{LABEL}", domain(uid))]));
-    std::fs::write(&path, body).map_err(|error| format!("could not write {LABEL}.plist: {error}"))?;
+    std::fs::rename(&staged, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&staged);
+        format!("could not install {LABEL}.plist: {error}")
+    })?;
     load(runner, uid, &path)?;
     Ok(format!("Scheduled tracker pull every {interval_seconds}s ({})", path.display()))
 }
@@ -256,6 +261,24 @@ mod tests {
         assert!(error.contains("bootstrap failed: already loaded"), "{error}");
         assert!(!error.contains(&home.path().display().to_string()), "{error}");
         assert_eq!(fake.calls.borrow()[3][2], "gui/501/com.wardwell.tracker-pull");
+    }
+
+    #[cfg(all(unix, target_os = "macos"))]
+    #[test]
+    fn schedule_leaves_the_old_job_untouched_when_the_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = plist_path(home.path());
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let fake = Fake::new(&[]);
+        let result = schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501);
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(fake.calls.borrow().is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
     }
 
     #[test]
