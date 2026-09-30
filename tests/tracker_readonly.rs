@@ -175,3 +175,35 @@ fn readonly_tracker_binding_refuses_kanban_writes_and_leaves_the_log_unchanged()
     ));
     assert_eq!(other["item"]["title"], "Unlocked");
 }
+
+#[test]
+fn readonly_lock_resolves_the_domain_the_store_writes_to_not_the_callers() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let vault = directory.path().join("vault");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(vault.join("work/claims")).unwrap();
+
+    write_config(&config, &vault, false);
+    let id = {
+        let mut mcp = Mcp::start(&config);
+        let created = tool_data(mcp.tool(
+            "wardwell_kanban",
+            json!({"action":"create","domain":"work","project":"claims","title":"Seeded before lock"}),
+        ));
+        created["item"]["ticket_id"].as_str().unwrap().to_string()
+    };
+
+    write_config(&config, &vault, true);
+    let log = vault.join("work/claims/kanban.jsonl");
+    let before = std::fs::read(&log).unwrap();
+    let mut mcp = Mcp::start(&config);
+
+    let body = text(&mcp.tool(
+        "wardwell_kanban",
+        json!({"action":"sequence","domain":"personal","project":"claims","order":[id]}),
+    ));
+    assert!(body.contains("read-only mirror of Linear"), "{body}");
+    assert!(body.contains("Edit it in Linear"), "{body}");
+    assert_eq!(std::fs::read(&log).unwrap(), before, "kanban.jsonl unchanged");
+}

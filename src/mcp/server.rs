@@ -3571,29 +3571,42 @@ impl WardwellServer {
         None
     }
 
-    /// Refusal when the targeted project is bound read-only to a tracker.
-    /// Resolves the project from ticket_id, else project (+domain or inferred).
+    /// Refusal when any project the action could write is bound read-only to
+    /// a tracker. Candidates: each referenced ticket's project, and a named
+    /// project under both the domain the store records for it and the domain
+    /// the handler would use (the caller's, else inferred). Unknown projects
+    /// yield no candidate, so the action fails on its own.
     fn tracker_refusal(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Option<String> {
         if self.config.trackers.is_empty() {
             return None;
         }
-        let ticket_id = p.ticket_id.as_ref().or(p.from_ticket_id.as_ref());
-        let (domain, project) = match (ticket_id, &p.project) {
-            (Some(ticket_id), _) => {
-                let (domain, project) = self.lookup_item_domain(kanban, ticket_id)?;
-                (Some(domain), project)
-            }
-            (None, Some(project)) => (
-                p.domain.clone().or_else(|| self.infer_domain_for_project(project)),
-                project.clone(),
-            ),
-            (None, None) => return None,
-        };
-        let binding = match domain {
-            Some(domain) => self.config.tracker_for(&domain, &project),
-            None => self.config.trackers.values().find(|b| b.project == project && b.readonly),
-        }?;
-        crate::tracker::readonly_refusal(binding)
+        self.write_targets(kanban, p)
+            .iter()
+            .filter_map(|(domain, project)| self.config.tracker_for(domain, project))
+            .find_map(crate::tracker::readonly_refusal)
+    }
+
+    fn write_targets(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Vec<(String, String)> {
+        let mut targets: Vec<(String, String)> = [&p.ticket_id, &p.from_ticket_id, &p.to_ticket_id]
+            .into_iter()
+            .flatten()
+            .filter_map(|ticket_id| self.lookup_item_domain(kanban, ticket_id))
+            .collect();
+        if let Some(project) = &p.project {
+            let handler_domain = p.domain.clone().or_else(|| self.infer_domain_for_project(project));
+            let domains = [self.lookup_project_domain(kanban, project), handler_domain];
+            targets.extend(domains.into_iter().flatten().map(|domain| (domain, project.clone())));
+        }
+        targets
+    }
+
+    fn lookup_project_domain(&self, kanban: &crate::kanban::store::KanbanStore, project: &str) -> Option<String> {
+        let conn = kanban.conn().ok()?;
+        conn.query_row(
+            "SELECT domain FROM kanban_projects WHERE project = ?1",
+            rusqlite::params![project],
+            |row| row.get::<_, String>(0),
+        ).ok()
     }
 
     fn lookup_item_domain(&self, kanban: &crate::kanban::store::KanbanStore, ticket_id: &str) -> Option<(String, String)> {
