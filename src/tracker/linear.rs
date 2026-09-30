@@ -14,12 +14,17 @@ const PROVIDER: &str = "linear";
 const ENDPOINT: &str = "https://api.linear.app/graphql";
 const REQUEST_LIMIT: usize = 256 * 1024;
 const RESPONSE_LIMIT: usize = 4 * 1024 * 1024;
+/// The transport's error when a reply exceeds `RESPONSE_LIMIT`. The adapter
+/// retries that page smaller instead of failing.
+const RESPONSE_TOO_LARGE: &str = "Linear response exceeds 4 MiB";
+/// Issues requested per page before any size retry.
+const PAGE_SIZE: u64 = 25;
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on pages per pull so a misbehaving cursor cannot loop forever.
 const MAX_PAGES: usize = 2_000;
 
-const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($after: String, $filter: IssueFilter) {
-  issues(first: 25, after: $after, includeArchived: true, orderBy: updatedAt, filter: $filter) {
+const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: true, orderBy: updatedAt, filter: $filter) {
     pageInfo { hasNextPage endCursor }
     nodes {
       id identifier title description url priority createdAt updatedAt archivedAt
@@ -62,6 +67,19 @@ impl<T: Transport> Linear<T> {
         }
         filter
     }
+
+    /// One page after `after`, halving the page size down to one issue while
+    /// the reply is over the response cap, so one fat page cannot wedge the pull.
+    fn fetch_page(&self, after: Option<&str>, filter: &Value) -> Result<Value, String> {
+        let mut first = PAGE_SIZE;
+        loop {
+            let body = json!({"query": ISSUES_QUERY, "variables": {"first": first, "after": after, "filter": filter}});
+            match self.transport.post(&body) {
+                Err(error) if error == RESPONSE_TOO_LARGE && first > 1 => first /= 2,
+                result => return result,
+            }
+        }
+    }
 }
 
 impl<T: Transport> Adapter for Linear<T> {
@@ -70,8 +88,7 @@ impl<T: Transport> Adapter for Linear<T> {
         let mut after: Option<String> = None;
         let mut events = Vec::new();
         for _ in 0..MAX_PAGES {
-            let body = json!({"query": ISSUES_QUERY, "variables": {"after": after, "filter": filter}});
-            let response = self.transport.post(&body)?;
+            let response = self.fetch_page(after.as_deref(), &filter)?;
             let page = issues_page(&response)?;
             for node in page.nodes {
                 events.extend(translate_issue(node)?);
@@ -317,7 +334,7 @@ async fn send(token: &str, body: Vec<u8>) -> Result<Value, String> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| "could not read the Linear response".to_string())? {
         if bytes.len().saturating_add(chunk.len()) > RESPONSE_LIMIT {
-            return Err("Linear response exceeds 4 MiB".to_string());
+            return Err(RESPONSE_TOO_LARGE.to_string());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -484,6 +501,40 @@ mod tests {
             json!({"gte": "2026-09-01T00:00:00+00:00"})
         );
         assert!(requests[1]["variables"]["filter"].get("updatedAt").is_none());
+    }
+
+    /// Reports the response-size error while the requested page size is
+    /// above `fits`, then serves one page of `issues`.
+    struct SizeLimitedTransport {
+        fits: u64,
+        requests: RefCell<Vec<u64>>,
+    }
+
+    impl Transport for &SizeLimitedTransport {
+        fn post(&self, body: &Value) -> Result<Value, String> {
+            let first = body["variables"]["first"].as_u64().unwrap();
+            self.requests.borrow_mut().push(first);
+            match first > self.fits {
+                true => Err(RESPONSE_TOO_LARGE.to_string()),
+                false => Ok(page(vec![issue("i1", "COR-12", "Big issue", "2026-09-01T14:00:00.000Z", None)], None)),
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_page_is_retried_at_half_size_until_it_fits() {
+        let transport = SizeLimitedTransport { fits: 3, requests: RefCell::new(vec![]) };
+        let events = Linear::new(&transport, "COR").pull(None, false).unwrap();
+        assert_eq!(*transport.requests.borrow(), vec![25, 12, 6, 3]);
+        assert_eq!(events[0].common().external_key, "COR-12");
+    }
+
+    #[test]
+    fn page_that_is_too_large_even_at_one_issue_fails() {
+        let transport = SizeLimitedTransport { fits: 0, requests: RefCell::new(vec![]) };
+        let error = Linear::new(&transport, "COR").pull(None, false).unwrap_err();
+        assert_eq!(error, RESPONSE_TOO_LARGE);
+        assert_eq!(*transport.requests.borrow(), vec![25, 12, 6, 3, 1]);
     }
 
     #[test]
