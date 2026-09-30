@@ -10,6 +10,7 @@ pub mod credential;
 pub mod adapter;
 pub mod linear;
 pub mod pull;
+pub mod cli;
 
 /// Display name for a provider id, for messages a person reads.
 pub fn provider_label(provider: &str) -> String {

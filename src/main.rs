@@ -57,6 +57,34 @@ enum Commands {
     },
     /// Migrate kanban attachments from ~/.wardwell/attachments/ to vault docs/
     MigrateAttachments,
+    /// Mirror external issue trackers into the vault (read-only)
+    Tracker {
+        #[command(subcommand)]
+        command: TrackerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrackerCommand {
+    /// Store a tracker API token from standard input, never a command-line argument
+    Connect {
+        /// Credential name referenced by `credential:` in config.yml
+        name: String,
+        /// Read the token from stdin
+        #[arg(long, required = true)]
+        token_stdin: bool,
+    },
+    /// Pull new tracker events into each bound project's tracker.jsonl
+    Pull {
+        /// Only this <domain>/<project>
+        #[arg(long)]
+        project: Option<String>,
+        /// Re-pull every issue and record removals
+        #[arg(long)]
+        full: bool,
+    },
+    /// Show last pull, last full resync, event count and readonly flag per project
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -135,11 +163,41 @@ async fn main() {
         Commands::Reindex => run_reindex(),
         Commands::Seed { ref target } => run_seed(target),
         Commands::MigrateAttachments => run_migrate_attachments(),
+        Commands::Tracker { command } => run_tracker(command),
     };
     if let Err(e) = result {
         eprintln!("wardwell: {e}");
         std::process::exit(1);
     }
+}
+
+fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>> {
+    use wardwell::tracker::{cli, credential::MAX_TOKEN_BYTES, pull::connect_provider};
+    let config_dir = wardwell::config::loader::config_dir();
+    let lines = match command {
+        TrackerCommand::Connect { name, token_stdin: _ } => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .take(MAX_TOKEN_BYTES as u64 + 3)
+                .read_to_end(&mut bytes)?;
+            let token = String::from_utf8(bytes).map_err(|_| "Tracker token must be UTF-8")?;
+            vec![cli::connect(&config_dir, &name, &token)?]
+        }
+        TrackerCommand::Pull { project, full } => {
+            let config = wardwell::config::loader::load(None)?;
+            let now = chrono::Utc::now();
+            cli::pull(&config, &config_dir, project.as_deref(), full, now, &connect_provider)?
+        }
+        TrackerCommand::Status => {
+            let config = wardwell::config::loader::load(None)?;
+            cli::status(&config, chrono::Utc::now())
+        }
+    };
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::error::Error>> {

@@ -57,8 +57,9 @@ pub fn default_path(name: &str) -> Result<PathBuf, String> {
 pub fn load(path: &Path) -> Result<Credential, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("<name>");
             format!(
-                "tracker credential not configured at {}; run `wardwell tracker connect <name> --token-stdin`",
+                "tracker credential not configured at {}; run `wardwell tracker connect {name} --token-stdin`",
                 path.display()
             )
         } else {
