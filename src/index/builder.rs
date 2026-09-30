@@ -455,6 +455,60 @@ mod tests {
     }
 
     #[test]
+    fn full_build_indexes_tracker_jsonl_as_history_with_event_titles() {
+        use crate::tracker::events::{Common, Event};
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::tracker::log::path_for(dir.path(), "work", "claims");
+        let event = Event::StateChanged {
+            common: Common {
+                id: "linear:history:h1:2026-09-01T12:00:00.000Z".into(),
+                provider: "linear".into(),
+                external_key: "COR-12".into(),
+                external_id: "i1".into(),
+                actor: Some("Jane Doe".into()),
+                occurred_at: chrono::DateTime::parse_from_rfc3339("2026-09-01T12:00:00Z").unwrap().into(),
+                title: "COR-12 Claims inbox shows wrong payer: state Todo to In Progress".into(),
+                raw: serde_json::Value::Null,
+            },
+            from: Some("Todo".into()),
+            to: "In Progress".into(),
+        };
+        let mut summary = crate::tracker::log::read(&path).unwrap();
+        crate::tracker::log::append_new(&path, &[event], &mut summary).unwrap();
+
+        let store = IndexStore::in_memory().unwrap();
+        let stats = IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(stats.errors, 0, "{:?}", stats.error_details);
+        assert_eq!(store.get_watermark("work/claims/tracker.jsonl").unwrap(), 1, "header skipped");
+
+        let results = store.search(&crate::index::fts::SearchQuery {
+            query: "payer".into(),
+            limit: 5,
+            ..Default::default()
+        }).unwrap();
+        assert!(results.results.iter().any(|r| r.path == "work/claims/tracker.jsonl"), "{results:?}");
+
+        let conn = store.lock().unwrap();
+        let (file_type, summary): (String, String) = conn
+            .query_row(
+                "SELECT type, summary FROM vault_meta WHERE path = 'work/claims/tracker.jsonl'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(file_type, "history");
+        assert_eq!(summary, "tracker history");
+        let heading: String = conn
+            .query_row(
+                "SELECT heading FROM vault_chunks WHERE path = 'work/claims/tracker.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(heading, "COR-12 Claims inbox shows wrong payer: state Todo to In Progress");
+    }
+
+    #[test]
     fn jsonl_incremental_only_indexes_new_lines() {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("work").join("myproject");

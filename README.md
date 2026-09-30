@@ -176,6 +176,9 @@ wardwell uninstall            Clean removal — MCP entries, hooks, markers (pre
 wardwell inject .             Output project context for a directory (used by hooks)
 wardwell reindex              Rebuild the vault search index from scratch
 wardwell seed <path>          Create domain or project folders
+wardwell tracker connect <name> --token-stdin   Store a tracker API token
+wardwell tracker pull [--project <d/p>] [--full] Mirror tracker events into the vault
+wardwell tracker status       Last pull, last full resync, event count per project
 ```
 
 ### wardwell init
@@ -311,6 +314,99 @@ exclude:
 | `exclude` | Directory/file names to skip during indexing |
 | `domains` | Optional domain config with path patterns and aliases (migration path) |
 | `ai.summarize_model` | Claude model for session summarization (default: `haiku`) |
+| `trackers` | Optional `<domain>/<project>` bindings to an issue tracker (see Tracker mirror) |
+
+## Tracker mirror
+
+Wardwell can mirror an external issue tracker into the vault as a read-only,
+append-only event log. Each bound project gets `<domain>/<project>/tracker.jsonl`
+(header `{"_schema":"tracker","_version":"1.0"}`), indexed like any other JSONL,
+so `wardwell_search` finds tracker history. Linear is the first provider.
+Wardwell never writes back to the tracker.
+
+Bind projects in `~/.wardwell/config.yml`:
+
+```yaml
+trackers:
+  work/claims:            # <domain>/<project>
+    provider: linear
+    team: COR             # Linear team key
+    credential: corr-linear
+    readonly: true        # refuse kanban writes on this project
+```
+
+Store the token (a Linear personal API key) from standard input. It is written to
+`~/.wardwell/trackers/<name>.json` with owner-only permissions and is never
+printed or logged:
+
+```sh
+pbpaste | wardwell tracker connect corr-linear --token-stdin
+```
+
+Then:
+
+```sh
+wardwell tracker pull                          # every bound project
+wardwell tracker pull --project work/claims    # one project
+wardwell tracker pull --full                   # re-pull everything, record removals
+wardwell tracker status
+```
+
+Each event carries `kind` (`issue_upserted`, `comment_upserted`, `state_changed`,
+`link_added`, `issue_removed`, `full_resync`, `pull_completed`), `provider`,
+`external_key` (e.g. `COR-12`), `external_id`, `actor`, `occurred_at`, a readable
+`title`, and the provider's payload under `raw`. There is no cursor file: each
+pull that delivers every page ends with a `pull_completed` marker whose `through`
+is the newest provider time seen, and the next incremental pull starts one hour
+before the latest marker's `through`. Pages are appended as they arrive and
+duplicate events are skipped by id, so a pull that fails part way keeps what it
+read but does not move the cursor; the next pull re-requests from the same
+point whatever order the provider returned pages in. With no marker, a pull
+starts from the beginning. `--full` re-pulls every issue (archived included),
+appends `issue_removed` for issues the tracker no longer returns, and ends with
+a `full_resync` marker that also sets the cursor. `status` reads the last pull
+time from the latest marker. The mirror is not authoritative; if the
+tracker goes away, the log stays as a searchable archive.
+
+With `readonly: true`, every kanban MCP action that appends to a file in that
+project's folder or its ticket audit log (create, update, move, note, attach,
+detach, sequence, groom, relationship_create, relationship_delete,
+question_create, question_update, question_answer, question_invalidate,
+proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
+status, and export_roadmap, which saves a PDF into the project folder) refuses
+and says to edit in the tracker. Reads are unaffected.
+
+Scheduling is external. An hourly launchd agent, saved as
+`~/Library/LaunchAgents/com.wardwell.tracker-pull.plist` and loaded with
+`launchctl load ~/Library/LaunchAgents/com.wardwell.tracker-pull.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.wardwell.tracker-pull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOU/.cargo/bin/wardwell</string>
+    <string>tracker</string>
+    <string>pull</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/wardwell-tracker-pull.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/wardwell-tracker-pull.log</string>
+</dict>
+</plist>
+```
+
+Follow-up, not in this version: importing a tracker's CSV or JSON export from a
+file instead of pulling over the API.
 
 ## Domain Scoping
 
