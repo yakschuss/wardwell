@@ -9,3 +9,12 @@ pub mod log;
 pub mod credential;
 pub mod adapter;
 pub mod linear;
+pub mod pull;
+
+/// Display name for a provider id, for messages a person reads.
+pub fn provider_label(provider: &str) -> String {
+    match provider {
+        "linear" => "Linear".to_string(),
+        other => other.to_string(),
+    }
+}

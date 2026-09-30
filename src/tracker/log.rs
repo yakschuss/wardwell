@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenIssue {
     pub external_id: String,
-    pub title: String,
+    /// The issue's own title from its latest snapshot.
+    pub issue_title: String,
 }
 
 /// Derived state of a tracker log.
@@ -42,10 +43,10 @@ impl LogSummary {
             Event::FullResync { .. } => {
                 self.last_full_resync_at = later(self.last_full_resync_at, common.occurred_at);
             }
-            Event::IssueUpserted { .. } => {
+            Event::IssueUpserted { issue, .. } => {
                 self.open_issues.insert(common.external_key.clone(), OpenIssue {
                     external_id: common.external_id.clone(),
-                    title: common.title.clone(),
+                    issue_title: issue.issue_title.clone(),
                 });
                 self.newest_provider_event_at = later(self.newest_provider_event_at, common.occurred_at);
             }
@@ -197,7 +198,7 @@ mod tests {
         assert_eq!(summary.unreadable_lines, 1);
         assert!(summary.event_ids.contains("e1") && summary.event_ids.contains("f1"));
         assert_eq!(summary.open_issues.keys().collect::<Vec<_>>(), vec!["COR-2"]);
-        assert_eq!(summary.open_issues["COR-2"].title, "COR-2 Title");
+        assert_eq!(summary.open_issues["COR-2"].issue_title, "Title");
         assert_eq!(
             summary.last_full_resync_at,
             Some(Utc.with_ymd_and_hms(2026, 9, 1, 23, 0, 0).unwrap())
