@@ -2073,9 +2073,14 @@ impl WardwellServer {
             return json_error("'body' is required for write_file — the file content to write");
         };
 
-        // Reject path traversal
+        // Reject path traversal. An absolute path is refused too: Path::join
+        // replaces the project directory with it, which would let a caller
+        // write anywhere, including over the tracker mirror.
         if rel_path.contains("..") {
             return json_error("path cannot contain '..'");
+        }
+        if std::path::Path::new(rel_path).is_absolute() {
+            return json_error("path must be relative to the project directory, not absolute");
         }
         if is_tracker_mirror(rel_path) {
             return json_error(TRACKER_MIRROR_REFUSAL);
@@ -4852,6 +4857,11 @@ mod tests {
             let result = server.action_write_file(&tracker_write_params("write_file", None, Some(path)), "test-proj");
             assert!(result.contains("tracker mirror"), "{path}: {result}");
         }
+        // An absolute path would make Path::join discard the project dir, so
+        // it is refused outright rather than matched against the mirror name.
+        let absolute = mirror.to_string_lossy().to_string();
+        let result = server.action_write_file(&tracker_write_params("write_file", None, Some(&absolute)), "test-proj");
+        assert!(result.contains("absolute"), "{absolute}: {result}");
         assert_eq!(std::fs::read(&mirror).unwrap(), before);
 
         let other = server.action_write_file(&tracker_write_params("write_file", None, Some("docs/tracker.md")), "test-proj");
