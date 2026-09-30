@@ -102,6 +102,24 @@ fn text(result: &Value) -> String {
     result["content"][0]["text"].as_str().unwrap().to_string()
 }
 
+/// Every file under `dir`, recursively, with its contents.
+fn snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            match path.is_dir() {
+                true => pending.push(path),
+                false => {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+    }
+    files
+}
+
 fn write_config(config: &std::path::Path, vault: &std::path::Path, readonly: bool) {
     let vault = serde_json::to_string(vault).unwrap();
     std::fs::write(
@@ -136,6 +154,7 @@ fn readonly_tracker_binding_refuses_kanban_writes_and_leaves_the_log_unchanged()
     write_config(&config, &vault, true);
     let log = vault.join("work/claims/kanban.jsonl");
     let before = std::fs::read(&log).unwrap();
+    let folder_before = snapshot(&vault.join("work/claims"));
     let mut mcp = Mcp::start(&config);
 
     let writes = [
@@ -153,14 +172,29 @@ fn readonly_tracker_binding_refuses_kanban_writes_and_leaves_the_log_unchanged()
         json!({"action":"relationship_create","from_ticket_id":id,"to_ticket_id":id,"relationship_type":"blocks"}),
         json!({"action":"relationship_delete","domain":"work","project":"claims","relationship_id":"rel-1"}),
         json!({"action":"question_create","domain":"work","project":"claims","question_text":"Why?"}),
+        json!({"action":"question_update","domain":"work","project":"claims","target_id":"q-1","question_text":"Why now?"}),
+        json!({"action":"question_answer","domain":"work","project":"claims","target_id":"q-1","answer":"Because"}),
+        json!({"action":"question_invalidate","domain":"work","project":"claims","target_id":"q-1"}),
+        json!({"action":"proposal_create","domain":"work","project":"claims","title":"Plan","changes":[]}),
+        json!({"action":"proposal_approve","domain":"work","project":"claims","target_id":"prop-1"}),
+        json!({"action":"proposal_reject","domain":"work","project":"claims","target_id":"prop-1"}),
         json!({"action":"proposal_apply","domain":"work","project":"claims","target_id":"prop-1"}),
+        json!({"action":"verify","ticket_id":id,"verification_source":"code","confidence":"verified"}),
+        json!({"action":"status","domain":"work","project":"claims"}),
     ];
+    let mut exercised: Vec<String> = writes.iter().map(|w| w["action"].as_str().unwrap().to_string()).collect();
+    exercised.sort();
+    exercised.dedup();
+    let mut locked: Vec<String> = wardwell::tracker::LOCKED_KANBAN_ACTIONS.iter().map(|a| a.to_string()).collect();
+    locked.sort();
+    assert_eq!(exercised, locked, "every locked action is exercised once");
     for request in writes {
         let body = text(&mcp.tool("wardwell_kanban", request.clone()));
         assert!(body.contains("read-only mirror of Linear"), "{request}: {body}");
         assert!(body.contains("Edit it in Linear"), "{request}: {body}");
     }
     assert_eq!(std::fs::read(&log).unwrap(), before, "kanban.jsonl unchanged");
+    assert_eq!(snapshot(&vault.join("work/claims")), folder_before, "project folder unchanged");
 
     // Reads still work.
     let fetched = tool_data(mcp.tool("wardwell_kanban", json!({"action":"get","ticket_id":id})));

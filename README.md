@@ -363,10 +363,12 @@ longer returns, and ends with a `full_resync` marker. `status` reads the log's
 modification time as the last pull. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 
-With `readonly: true`, the kanban MCP write actions (create, update, move, note,
-attach, detach, sequence, groom, relationship_create, relationship_delete,
-question_create, proposal_apply) on that project refuse and say to
-edit in the tracker. Reads are unaffected.
+With `readonly: true`, every kanban MCP action that appends to a file in that
+project's folder or its ticket audit log (create, update, move, note, attach,
+detach, sequence, groom, relationship_create, relationship_delete,
+question_create, question_update, question_answer, question_invalidate,
+proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
+status) refuses and says to edit in the tracker. Reads are unaffected.
 
 Scheduling is external. An hourly launchd agent, saved as
 `~/Library/LaunchAgents/com.wardwell.tracker-pull.plist` and loaded with

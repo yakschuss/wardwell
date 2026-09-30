@@ -20,11 +20,15 @@ pub fn provider_label(provider: &str) -> String {
     }
 }
 
-/// Kanban actions that write the project's ticket log. A readonly tracker
-/// binding refuses all of them; reads are unaffected.
+/// Kanban actions that append to any file under the project's folder or its
+/// ticket audit log. A readonly tracker binding refuses all of them; reads
+/// are unaffected.
 pub const LOCKED_KANBAN_ACTIONS: &[&str] = &[
-    "create", "update", "move", "note", "attach", "detach", "sequence", "groom", "proposal_apply",
-    "relationship_create", "relationship_delete", "question_create",
+    "create", "update", "move", "note", "attach", "detach", "sequence", "groom",
+    "relationship_create", "relationship_delete",
+    "question_create", "question_update", "question_answer", "question_invalidate",
+    "proposal_create", "proposal_approve", "proposal_reject", "proposal_apply",
+    "verify", "status",
 ];
 
 /// Refusal for a kanban write on a project mirrored read-only, or None when
