@@ -39,6 +39,7 @@ const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($after: String, $filter:
 /// Posts one GraphQL body and returns the decoded JSON response.
 /// Exists so tests can inject canned responses.
 pub trait Transport {
+    /// Send `body` to the provider and return its decoded JSON reply.
     fn post(&self, body: &Value) -> Result<Value, String>;
 }
 
@@ -49,6 +50,7 @@ pub struct Linear<T: Transport> {
 }
 
 impl<T: Transport> Linear<T> {
+    /// An adapter for the Linear team with key `team`, sending through `transport`.
     pub fn new(transport: T, team: &str) -> Self {
         Self { transport, team: team.to_string() }
     }
@@ -264,6 +266,7 @@ pub struct HttpTransport {
 }
 
 impl HttpTransport {
+    /// A transport that authenticates with `token`.
     pub fn new(token: String) -> Self {
         Self { token }
     }

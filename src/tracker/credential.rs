@@ -7,10 +7,13 @@
 use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_FILE_BYTES: u64 = 64 * 1024;
+/// Longest token `save` accepts and `wardwell tracker connect` reads.
 pub const MAX_TOKEN_BYTES: usize = 8 * 1024;
 const DIRECTORY: &str = "trackers";
 
@@ -25,6 +28,7 @@ pub struct Credential {
 }
 
 impl Credential {
+    /// The secret itself; pass it only to the provider transport.
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -54,6 +58,8 @@ pub fn default_path(name: &str) -> Result<PathBuf, String> {
     path_in(&crate::config::loader::config_dir(), name)
 }
 
+/// Read and validate the credential at `path`. Errors never include file
+/// contents.
 pub fn load(path: &Path) -> Result<Credential, String> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -84,6 +90,7 @@ pub fn load(path: &Path) -> Result<Credential, String> {
     Ok(Credential { token: parsed.token })
 }
 
+/// Write `token` to `path` atomically with owner-only permissions.
 pub fn save(path: &Path, token: &str) -> Result<(), String> {
     validate_token(token)?;
     let parent = path
@@ -175,9 +182,6 @@ fn validate_directory_metadata(metadata: &fs::Metadata) -> Result<(), String> {
     }
     Ok(())
 }
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 #[cfg(unix)]
 fn set_file_mode(file: &File, mode: u32) -> Result<(), String> {

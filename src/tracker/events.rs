@@ -77,6 +77,7 @@ pub enum Event {
 }
 
 impl Event {
+    /// The fields every event kind carries.
     pub fn common(&self) -> &Common {
         match self {
             Event::IssueUpserted { common, .. }
@@ -132,6 +133,7 @@ pub enum StateCategory {
 }
 
 impl StateCategory {
+    /// Maps a provider workflow-state type name; unrecognised names are `Unknown`.
     pub fn from_type(value: &str) -> Self {
         match value {
             "triage" => Self::Triage,

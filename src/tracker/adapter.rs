@@ -6,6 +6,7 @@
 use crate::tracker::events::Event;
 use chrono::{DateTime, Utc};
 
+/// A read-only source of Wardwell events for one provider team.
 pub trait Adapter {
     /// Return events for issues updated at or after `since`; every issue
     /// (including archived) when `full` is true or `since` is None.
