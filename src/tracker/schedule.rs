@@ -167,7 +167,7 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
 pub fn schedule_status(home: &Path) -> Option<u32> {
     let body = std::fs::read_to_string(plist_path(home)).ok()?;
     let after = body.split("<key>StartInterval</key>").nth(1)?;
-    let value = after.split("<integer>").nth(1)?.split("</integer>").next()?;
+    let value = after.trim_start().strip_prefix("<integer>")?.split("</integer>").next()?;
     value.trim().parse().ok()
 }
 
@@ -342,5 +342,20 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, launch_agent_plist(Path::new("/w"), 7200, Path::new("/l"))).unwrap();
         assert_eq!(schedule_status(home.path()), Some(7200));
+    }
+
+    #[test]
+    fn status_ignores_calendar_intervals_and_non_integer_values() {
+        let home = tempfile::tempdir().unwrap();
+        let path = plist_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let calendar = "<dict><key>StartCalendarInterval</key><dict><key>Minute</key><integer>5</integer></dict></dict>";
+        std::fs::write(&path, calendar).unwrap();
+        assert_eq!(schedule_status(home.path()), None);
+        let string = "<key>StartInterval</key>\n  <string>900</string>\n<key>Other</key><integer>5</integer>";
+        std::fs::write(&path, string).unwrap();
+        assert_eq!(schedule_status(home.path()), None);
+        std::fs::write(&path, "<key>StartInterval</key>\n\t <integer>900</integer>").unwrap();
+        assert_eq!(schedule_status(home.path()), Some(900));
     }
 }

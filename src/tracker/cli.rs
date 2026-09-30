@@ -75,7 +75,7 @@ pub fn status(config: &WardwellConfig, now: DateTime<Utc>, scheduled: Option<u32
 
 fn schedule_line(scheduled: Option<u32>) -> String {
     match scheduled {
-        Some(seconds) => format!("pull schedule: every {seconds} s"),
+        Some(seconds) => format!("pull schedule: every {seconds} s (plist on disk)"),
         None => "pull schedule: not scheduled".to_string(),
     }
 }
@@ -231,6 +231,6 @@ mod tests {
     fn status_ends_with_the_schedule_line() {
         let (_dir, config) = setup(false);
         assert_eq!(status(&config, now(), None).last().unwrap(), "pull schedule: not scheduled");
-        assert_eq!(status(&config, now(), Some(900)).last().unwrap(), "pull schedule: every 900 s");
+        assert_eq!(status(&config, now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
     }
 }
