@@ -132,9 +132,19 @@ pub fn schedule(
 
 fn load(runner: &dyn LaunchctlRunner, uid: u32, path: &Path) -> Result<(), String> {
     let plist = path.display().to_string();
+    let first_error = match runner.run(&argv(&["launchctl", "bootstrap", &domain(uid), &plist])) {
+        Ok(()) => None,
+        Err(bootstrap) => {
+            runner.run(&argv(&["launchctl", "load", &plist])).map_err(|load| format!("{bootstrap}; {load}"))?;
+            Some(bootstrap)
+        }
+    };
     runner
-        .run(&argv(&["launchctl", "bootstrap", &domain(uid), &plist]))
-        .or_else(|_| runner.run(&argv(&["launchctl", "load", &plist])))
+        .run(&argv(&["launchctl", "print", &format!("{}/{LABEL}", domain(uid))]))
+        .map_err(|print| match first_error {
+            Some(bootstrap) => format!("{LABEL} is not loaded after scheduling ({print}); first error: {bootstrap}"),
+            None => format!("{LABEL} is not loaded after scheduling ({print})"),
+        })
 }
 
 /// Unload the agent and delete its plist. A missing file is not an error.
@@ -180,7 +190,7 @@ mod tests {
         fn run(&self, argv: &[String]) -> Result<(), String> {
             self.calls.borrow_mut().push(argv.to_vec());
             match self.fail.contains(&argv[1].as_str()) {
-                true => Err("failed".to_string()),
+                true => Err(format!("{} failed: already loaded", argv[1])),
                 false => Ok(()),
             }
         }
@@ -209,7 +219,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&[]);
         schedule(home.path(), Path::new("/cfg"), 1800, &fake, Path::new("/bin/wardwell"), 501).unwrap();
-        assert_eq!(fake.verbs(), vec!["bootout", "bootstrap"]);
+        assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "print"]);
         let calls = fake.calls.borrow();
         assert_eq!(calls[0][2], "gui/501/com.wardwell.tracker-pull");
         assert_eq!(calls[1][2], "gui/501");
@@ -225,7 +235,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&["bootout", "bootstrap"]);
         schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
-        assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "load"]);
+        assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "load", "print"]);
     }
 
     #[cfg(target_os = "macos")]
@@ -234,6 +244,18 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&["bootstrap", "load"]);
         assert!(schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_fails_when_load_succeeds_but_the_job_is_not_loaded() {
+        let home = tempfile::tempdir().unwrap();
+        let fake = Fake::new(&["bootout", "bootstrap", "print"]);
+        let error = schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
+        assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "load", "print"]);
+        assert!(error.contains("bootstrap failed: already loaded"), "{error}");
+        assert!(!error.contains(&home.path().display().to_string()), "{error}");
+        assert_eq!(fake.calls.borrow()[3][2], "gui/501/com.wardwell.tracker-pull");
     }
 
     #[test]
