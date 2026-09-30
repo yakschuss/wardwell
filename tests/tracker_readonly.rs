@@ -181,6 +181,7 @@ fn readonly_tracker_binding_refuses_kanban_writes_and_leaves_the_log_unchanged()
         json!({"action":"proposal_apply","domain":"work","project":"claims","target_id":"prop-1"}),
         json!({"action":"verify","ticket_id":id,"verification_source":"code","confidence":"verified"}),
         json!({"action":"status","domain":"work","project":"claims"}),
+        json!({"action":"export_roadmap","project":"claims"}),
     ];
     let mut exercised: Vec<String> = writes.iter().map(|w| w["action"].as_str().unwrap().to_string()).collect();
     exercised.sort();

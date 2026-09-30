@@ -373,7 +373,8 @@ project's folder or its ticket audit log (create, update, move, note, attach,
 detach, sequence, groom, relationship_create, relationship_delete,
 question_create, question_update, question_answer, question_invalidate,
 proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
-status) refuses and says to edit in the tracker. Reads are unaffected.
+status, and export_roadmap, which saves a PDF into the project folder) refuses
+and says to edit in the tracker. Reads are unaffected.
 
 Scheduling is external. An hourly launchd agent, saved as
 `~/Library/LaunchAgents/com.wardwell.tracker-pull.plist` and loaded with
