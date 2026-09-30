@@ -31,10 +31,11 @@ pub fn pull(
     for (key, binding) in bindings {
         match pull_binding(&config.vault_path, config_dir, binding, full, now, connect) {
             Ok(outcome) => lines.push(format!(
-                "{key}: {} pull appended {} events, {} removed",
+                "{key}: {} pull appended {} events, {} removed{}",
                 if outcome.full { "full" } else { "incremental" },
                 outcome.appended,
-                outcome.removed
+                outcome.removed,
+                outcome.note.map_or(String::new(), |note| format!(" ({note})"))
             )),
             Err(error) => failures.push(format!("{key}: {error}")),
         }
@@ -171,6 +172,21 @@ mod tests {
         let lines = pull(&config, dir.path(), Some("work/claims"), true, now(), &fake_connect).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("work/claims") && lines[0].contains("full"), "{}", lines[0]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_line_carries_the_note_when_the_pull_time_cannot_be_recorded() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let lines = pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(lines[0].contains("incremental pull appended 0 events"), "{}", lines[0]);
+        assert!(lines[0].contains("could not record the pull time"), "{}", lines[0]);
     }
 
     #[test]

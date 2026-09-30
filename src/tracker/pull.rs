@@ -7,7 +7,7 @@
 use crate::config::loader::TrackerBinding;
 use crate::tracker::adapter::Adapter;
 use crate::tracker::credential::{self, Credential};
-use crate::tracker::events::{Common, Event};
+use crate::tracker::events::{Common, Event, SCHEMA_HEADER};
 use crate::tracker::linear::{HttpTransport, Linear};
 use crate::tracker::{log, provider_label};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -24,6 +24,9 @@ pub struct PullOutcome {
     pub appended: usize,
     pub removed: usize,
     pub full: bool,
+    /// Something the pull could not do that does not fail it, for the
+    /// printed result line. Never carries a token or a path.
+    pub note: Option<String>,
 }
 
 /// Builds the adapter for a binding. Injected so tests never reach a network.
@@ -77,8 +80,8 @@ pub fn pull_project(
         removed = markers.len().saturating_sub(1);
         appended += log::append_new(&path, &markers, &mut summary)?;
     }
-    mark_pulled(&path, now);
-    Ok(PullOutcome { appended, removed, full })
+    let note = mark_pulled(&path, now);
+    Ok(PullOutcome { appended, removed, full, note })
 }
 
 /// `issue_removed` for each open key the full result no longer contains,
@@ -136,10 +139,19 @@ fn local_common(binding: &TrackerBinding, id: String, key: &str, external_id: &s
 }
 
 /// Stamp the log's modification time so `status` can report the last pull
-/// even when it found nothing new. Content is untouched.
-fn mark_pulled(path: &Path, now: DateTime<Utc>) {
-    if let Ok(file) = std::fs::File::options().append(true).open(path) {
-        let _ = file.set_modified(now.into());
+/// even when it found nothing new. A missing log is created with its header
+/// first. Content is otherwise untouched. Returns a note when it fails.
+fn mark_pulled(path: &Path, now: DateTime<Utc>) -> Option<String> {
+    let stamped = ensure_log(path).and_then(|()| {
+        std::fs::File::options().append(true).open(path)?.set_modified(now.into())
+    });
+    stamped.err().map(|_| "could not record the pull time; status may show an older pull".to_string())
+}
+
+fn ensure_log(path: &Path) -> std::io::Result<()> {
+    match path.exists() {
+        true => Ok(()),
+        false => crate::kanban::jsonl::append_line(path, None, SCHEMA_HEADER),
     }
 }
 
@@ -258,6 +270,36 @@ mod tests {
         let summary = log::read(&path).unwrap();
         assert_eq!(summary.last_full_resync_at, Some(at(14)));
         assert_eq!(summary.newest_provider_event_at, Some(at(10)), "local markers do not move the cursor");
+    }
+
+    #[test]
+    fn empty_first_pull_creates_the_log_with_its_header_and_stamps_it() {
+        let vault = tempfile::tempdir().unwrap();
+        let outcome = pull_project(vault.path(), &binding(), &fake(vec![]), false, at(12)).unwrap();
+        assert_eq!(outcome.appended, 0);
+        assert_eq!(outcome.note, None);
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", crate::tracker::events::SCHEMA_HEADER)
+        );
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(DateTime::<Utc>::from(modified), at(12));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrecordable_pull_time_is_reported_as_a_note() {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = tempfile::tempdir().unwrap();
+        pull_project(vault.path(), &binding(), &fake(vec![]), false, at(12)).unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let outcome = pull_project(vault.path(), &binding(), &fake(vec![]), false, at(13)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let note = outcome.note.unwrap_or_default();
+        assert!(note.contains("could not record the pull time"), "{note}");
+        assert!(!note.contains(&vault.path().display().to_string()), "{note}");
     }
 
     #[test]
