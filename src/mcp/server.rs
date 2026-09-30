@@ -1994,6 +1994,9 @@ impl WardwellServer {
         }
 
         // Reserved names — use the dedicated actions instead
+        if is_tracker_mirror(&format!("{list_name}.jsonl")) {
+            return json_error(TRACKER_MIRROR_REFUSAL);
+        }
         if matches!(list_name.as_str(), "history" | "lessons") {
             return json_error(&format!("'{list_name}' is a built-in list. Use action '{}'.", if list_name == "history" { "append_history" } else { "lesson" }));
         }
@@ -2073,6 +2076,9 @@ impl WardwellServer {
         // Reject path traversal
         if rel_path.contains("..") {
             return json_error("path cannot contain '..'");
+        }
+        if is_tracker_mirror(rel_path) {
+            return json_error(TRACKER_MIRROR_REFUSAL);
         }
 
         let project_dir = self.vault_root.join(&p.domain).join(project);
@@ -3821,6 +3827,20 @@ impl WardwellServer {
 
 // -- Helpers --
 
+const TRACKER_MIRROR_REFUSAL: &str =
+    "tracker.jsonl is the tracker mirror, written only by `wardwell tracker pull`.";
+
+/// True when a project-relative path names the tracker mirror log. The
+/// comparison ignores case because the vault's filesystem may.
+fn is_tracker_mirror(rel_path: &str) -> bool {
+    let components: Vec<_> = std::path::Path::new(rel_path)
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    matches!(components.as_slice(), [std::path::Component::Normal(name)]
+        if name.to_string_lossy().eq_ignore_ascii_case(crate::tracker::events::FILE_NAME))
+}
+
 fn json_error(msg: &str) -> String {
     serde_json::to_string(&serde_json::json!({"error": msg})).unwrap_or_default()
 }
@@ -4795,6 +4815,47 @@ mod tests {
         assert!(result.contains("built-in list"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn tracker_write_params(action: &str, list: Option<&str>, path: Option<&str>) -> WriteParams {
+        WriteParams {
+            action: action.to_string(),
+            domain: "personal".to_string(),
+            project: Some("test-proj".to_string()),
+            list: list.map(str::to_string),
+            confirmed: Some(true),
+            title: Some("Forged".to_string()),
+            body: Some("{}".to_string()),
+            status: None, focus: None, why_this_matters: None, next_action: None,
+            open_questions: None, blockers: None, waiting_on: None, commit_message: None,
+            what_happened: None, root_cause: None, prevention: None,
+            path: path.map(str::to_string),
+            source: None,
+        }
+    }
+
+    #[test]
+    fn append_and_write_file_refuse_the_tracker_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("personal").join("test-proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let mirror = project_dir.join("tracker.jsonl");
+        std::fs::write(&mirror, "{\"_schema\":\"tracker\",\"_version\":\"1.0\"}\n").unwrap();
+        let before = std::fs::read(&mirror).unwrap();
+        let server = make_test_server(tmp.path());
+
+        for list in ["tracker", "Tracker"] {
+            let result = server.action_append_list(&tracker_write_params("append", Some(list), None), "test-proj", None);
+            assert!(result.contains("tracker mirror"), "{list}: {result}");
+        }
+        for path in ["tracker.jsonl", "./tracker.jsonl", "TRACKER.jsonl"] {
+            let result = server.action_write_file(&tracker_write_params("write_file", None, Some(path)), "test-proj");
+            assert!(result.contains("tracker mirror"), "{path}: {result}");
+        }
+        assert_eq!(std::fs::read(&mirror).unwrap(), before);
+
+        let other = server.action_write_file(&tracker_write_params("write_file", None, Some("docs/tracker.md")), "test-proj");
+        assert!(other.contains("\"written\":true"), "{other}");
     }
 
     #[test]
