@@ -167,9 +167,12 @@ struct IssueRef {
 }
 
 impl IssueRef {
-    fn common(&self, kind: &str, entity: &Value, stamp: (DateTime<Utc>, String), actor: Option<String>, title: String) -> Common {
-        Common {
-            id: format!("{PROVIDER}:{kind}:{}:{}", text(entity, "id").unwrap_or_default(), stamp.1),
+    /// Fails when `entity` has no id: the event id would collide with any
+    /// other id-less sibling updated at the same time.
+    fn common(&self, kind: &str, entity: &Value, stamp: (DateTime<Utc>, String), actor: Option<String>, title: String) -> Result<Common, String> {
+        let entity_id = text(entity, "id").ok_or_else(|| format!("Linear {kind} on {} is missing its id", self.key))?;
+        Ok(Common {
+            id: format!("{PROVIDER}:{kind}:{entity_id}:{}", stamp.1),
             provider: PROVIDER.to_string(),
             external_key: self.key.clone(),
             external_id: self.id.clone(),
@@ -177,7 +180,7 @@ impl IssueRef {
             occurred_at: stamp.0,
             title,
             raw: entity.clone(),
-        }
+        })
     }
 }
 
@@ -217,7 +220,7 @@ fn snapshot_event(issue: &IssueRef, node: &Value, issue_title: String) -> Result
             object.remove(child);
         }
     }
-    let mut common = issue.common("issue", node, required_time(node, "updatedAt")?, None, title);
+    let mut common = issue.common("issue", node, required_time(node, "updatedAt")?, None, title)?;
     common.raw = raw;
     Ok(Event::IssueUpserted {
         common,
@@ -243,7 +246,7 @@ fn comment_event(issue: &IssueRef, comment: &Value) -> Result<Event, String> {
     let actor = name_of(comment, "user");
     let title = format!("{}: comment by {}", issue.heading, actor.as_deref().unwrap_or("someone"));
     Ok(Event::CommentUpserted {
-        common: issue.common("comment", comment, required_time(comment, "updatedAt")?, actor, title),
+        common: issue.common("comment", comment, required_time(comment, "updatedAt")?, actor, title)?,
         body: text(comment, "body").unwrap_or_default(),
     })
 }
@@ -259,7 +262,7 @@ fn state_event(issue: &IssueRef, entry: &Value) -> Result<Option<Event>, String>
     };
     let actor = name_of(entry, "actor");
     Ok(Some(Event::StateChanged {
-        common: issue.common("history", entry, required_time(entry, "createdAt")?, actor, title),
+        common: issue.common("history", entry, required_time(entry, "createdAt")?, actor, title)?,
         from,
         to,
     }))
@@ -271,7 +274,7 @@ fn link_event(issue: &IssueRef, attachment: &Value) -> Result<Event, String> {
     let title = format!("{}: link {}", issue.heading, link_title.as_deref().unwrap_or(&url));
     let actor = name_of(attachment, "creator");
     Ok(Event::LinkAdded {
-        common: issue.common("attachment", attachment, required_time(attachment, "updatedAt")?, actor, title),
+        common: issue.common("attachment", attachment, required_time(attachment, "updatedAt")?, actor, title)?,
         url,
         link_title,
     })
@@ -562,6 +565,17 @@ mod tests {
         let error = collect(&Linear::new(&transport, "COR"), None, false).unwrap_err();
         assert_eq!(error, RESPONSE_TOO_LARGE);
         assert_eq!(*transport.requests.borrow(), vec![25, 12, 6, 3, 1]);
+    }
+
+    #[test]
+    fn child_without_an_id_fails_the_pull_like_an_issue_without_one() {
+        for child in ["comments", "history", "attachments"] {
+            let mut node = issue("i1", "COR-12", "Claims inbox", "2026-09-01T14:00:00.000Z", None);
+            node[child]["nodes"][0].as_object_mut().unwrap().remove("id");
+            let transport = FakeTransport::new(vec![page(vec![node], None)]);
+            let error = collect(&Linear::new(&transport, "COR"), None, false).unwrap_err();
+            assert!(error.contains("missing its id"), "{child}: {error}");
+        }
     }
 
     #[test]
