@@ -6,9 +6,13 @@
 use crate::tracker::events::Event;
 use chrono::{DateTime, Utc};
 
+/// Receives one page of events as the adapter reads it. An error stops the pull.
+pub type Sink<'a> = dyn FnMut(Vec<Event>) -> Result<(), String> + 'a;
+
 /// A read-only source of Wardwell events for one provider team.
 pub trait Adapter {
-    /// Return events for issues updated at or after `since`; every issue
-    /// (including archived) when `full` is true or `since` is None.
-    fn pull(&self, since: Option<DateTime<Utc>>, full: bool) -> Result<Vec<Event>, String>;
+    /// Hand `sink` the events for issues updated at or after `since`, page by
+    /// page; every issue (including archived) when `full` is true or `since`
+    /// is None. Ok means every page was delivered.
+    fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String>;
 }

@@ -72,11 +72,19 @@ pub fn pull_project(
         true => None,
         false => summary.newest_provider_event_at.map(|t| t - CURSOR_OVERLAP),
     };
-    let events = adapter.pull(since, full)?;
-    let mut appended = log::append_new(&path, &events, &mut summary)?;
+    let mut appended = 0;
+    let mut returned: HashSet<String> = HashSet::new();
+    // Each page is appended as it arrives (event ids make re-pulls
+    // idempotent), so a failure keeps the pages already read.
+    adapter.pull(since, full, &mut |page| {
+        returned.extend(upserted_keys(&page));
+        appended += log::append_new(&path, &page, &mut summary)?;
+        Ok(())
+    })?;
+    // Removals are only knowable after every page arrived.
     let mut removed = 0;
     if full {
-        let markers = resync_markers(binding, &events, &summary, now);
+        let markers = resync_markers(binding, &returned, &summary, now);
         removed = markers.len().saturating_sub(1);
         appended += log::append_new(&path, &markers, &mut summary)?;
     }
@@ -86,12 +94,7 @@ pub fn pull_project(
 
 /// `issue_removed` for each open key the full result no longer contains,
 /// followed by one `full_resync` marker with the counts.
-fn resync_markers(binding: &TrackerBinding, events: &[Event], summary: &log::LogSummary, now: DateTime<Utc>) -> Vec<Event> {
-    let returned: HashSet<&str> = events
-        .iter()
-        .filter(|e| matches!(e, Event::IssueUpserted { .. }))
-        .map(|e| e.common().external_key.as_str())
-        .collect();
+fn resync_markers(binding: &TrackerBinding, returned: &HashSet<String>, summary: &log::LogSummary, now: DateTime<Utc>) -> Vec<Event> {
     let label = provider_label(&binding.provider);
     let stamp = now.to_rfc3339();
     let mut markers: Vec<Event> = summary
@@ -138,6 +141,13 @@ fn local_common(binding: &TrackerBinding, id: String, key: &str, external_id: &s
     }
 }
 
+fn upserted_keys(events: &[Event]) -> impl Iterator<Item = String> + '_ {
+    events
+        .iter()
+        .filter(|e| matches!(e, Event::IssueUpserted { .. }))
+        .map(|e| e.common().external_key.clone())
+}
+
 /// Stamp the log's modification time so `status` can report the last pull
 /// even when it found nothing new. A missing log is created with its header
 /// first. Content is otherwise untouched. Returns a note when it fails.
@@ -159,19 +169,25 @@ fn ensure_log(path: &Path) -> std::io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::tracker::adapter::Sink;
     use crate::tracker::events::{Common, IssueSnapshot, Priority, StateCategory};
     use chrono::TimeZone;
     use std::cell::RefCell;
 
+    /// Delivers `pages` in order, then fails if `fail_after` is set.
     struct FakeAdapter {
-        events: Vec<Event>,
+        pages: Vec<Vec<Event>>,
+        fail_after: Option<&'static str>,
         calls: RefCell<Vec<(Option<DateTime<Utc>>, bool)>>,
     }
 
     impl Adapter for FakeAdapter {
-        fn pull(&self, since: Option<DateTime<Utc>>, full: bool) -> Result<Vec<Event>, String> {
+        fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
             self.calls.borrow_mut().push((since, full));
-            Ok(self.events.clone())
+            for page in &self.pages {
+                sink(page.clone())?;
+            }
+            self.fail_after.map_or(Ok(()), |error| Err(error.to_string()))
         }
     }
 
@@ -221,7 +237,31 @@ mod tests {
     }
 
     fn fake(events: Vec<Event>) -> FakeAdapter {
-        FakeAdapter { events, calls: RefCell::new(vec![]) }
+        FakeAdapter { pages: vec![events], fail_after: None, calls: RefCell::new(vec![]) }
+    }
+
+    #[test]
+    fn failed_full_pull_keeps_earlier_pages_and_removes_nothing() {
+        let vault = tempfile::tempdir().unwrap();
+        let first = fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 10)]);
+        pull_project(vault.path(), &binding(), &first, false, at(12)).unwrap();
+
+        let broken = FakeAdapter {
+            pages: vec![vec![snapshot("COR-2", 11)]],
+            fail_after: Some("Linear request failed"),
+            calls: RefCell::new(vec![]),
+        };
+        let error = pull_project(vault.path(), &binding(), &broken, true, at(14)).unwrap_err();
+        assert_eq!(error, "Linear request failed");
+
+        let path = log::path_for(vault.path(), "work", "claims");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("linear:issue:COR-2:11"), "page 1 is on disk: {content}");
+        assert!(!content.contains("issue_removed"), "{content}");
+        assert!(!content.contains("full_resync"), "{content}");
+        let summary = log::read(&path).unwrap();
+        assert!(summary.open_issues.contains_key("COR-1"));
+        assert_eq!(summary.last_full_resync_at, None);
     }
 
     #[test]

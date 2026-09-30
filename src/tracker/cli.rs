@@ -111,14 +111,13 @@ fn age(delta: chrono::TimeDelta) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::tracker::adapter::Adapter;
-    use crate::tracker::events::Event;
+    use crate::tracker::adapter::{Adapter, Sink};
     use chrono::TimeZone;
 
     struct Empty;
     impl Adapter for Empty {
-        fn pull(&self, _: Option<DateTime<Utc>>, _: bool) -> Result<Vec<Event>, String> {
-            Ok(vec![])
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            Ok(())
         }
     }
 

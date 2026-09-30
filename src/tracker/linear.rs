@@ -4,7 +4,7 @@
 //!
 //! Does NOT write to Linear, decide the cursor, or touch the vault.
 
-use crate::tracker::adapter::Adapter;
+use crate::tracker::adapter::{Adapter, Sink};
 use crate::tracker::events::{Common, Event, IssueSnapshot, Priority, StateCategory};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -83,19 +83,20 @@ impl<T: Transport> Linear<T> {
 }
 
 impl<T: Transport> Adapter for Linear<T> {
-    fn pull(&self, since: Option<DateTime<Utc>>, full: bool) -> Result<Vec<Event>, String> {
+    fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
         let filter = self.filter(since, full);
         let mut after: Option<String> = None;
-        let mut events = Vec::new();
         for _ in 0..MAX_PAGES {
             let response = self.fetch_page(after.as_deref(), &filter)?;
             let page = issues_page(&response)?;
+            let mut events = Vec::new();
             for node in page.nodes {
                 events.extend(translate_issue(node)?);
             }
+            sink(events)?;
             match page.next {
                 Some(cursor) => after = Some(cursor),
-                None => return Ok(events),
+                None => return Ok(()),
             }
         }
         Err(format!("Linear pagination exceeded {MAX_PAGES} pages"))
@@ -420,6 +421,32 @@ mod tests {
         }}})
     }
 
+    /// Run a pull and gather every page's events in order.
+    fn collect(adapter: &dyn Adapter, since: Option<DateTime<Utc>>, full: bool) -> Result<Vec<Event>, String> {
+        let mut events = Vec::new();
+        adapter.pull(since, full, &mut |page| {
+            events.extend(page);
+            Ok(())
+        })?;
+        Ok(events)
+    }
+
+    #[test]
+    fn each_page_reaches_the_sink_before_a_later_page_fails() {
+        let transport = FakeTransport::new(vec![page(
+            vec![issue("i1", "COR-12", "Claims inbox shows wrong payer", "2026-09-01T14:00:00.000Z", None)],
+            Some("cursor-1"),
+        )]);
+        let mut delivered: Vec<Vec<Event>> = Vec::new();
+        let result = Linear::new(&transport, "COR").pull(None, false, &mut |page| {
+            delivered.push(page);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err(), "no canned response");
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].len(), 4);
+    }
+
     #[test]
     fn follows_pagination_and_translates_every_kind() {
         let transport = FakeTransport::new(vec![
@@ -427,7 +454,7 @@ mod tests {
             page(vec![issue("i2", "COR-13", "Old export", "2026-09-02T09:00:00.000Z", Some("2026-09-02T09:00:00.000Z"))], None),
         ]);
         let adapter = Linear::new(&transport, "COR");
-        let events = adapter.pull(None, false).unwrap();
+        let events = collect(&adapter, None, false).unwrap();
 
         let requests = transport.requests.borrow();
         assert_eq!(requests.len(), 2);
@@ -482,7 +509,7 @@ mod tests {
             vec![issue("i2", "COR-13", "Old export", "2026-09-02T09:00:00.000Z", Some("2026-09-02T09:00:00.000Z"))],
             None,
         )]);
-        let events = Linear::new(&transport, "COR").pull(None, true).unwrap();
+        let events = collect(&Linear::new(&transport, "COR"), None, true).unwrap();
         let Event::IssueUpserted { common, issue } = &events[0] else { panic!("snapshot") };
         assert_eq!(issue.archived_at, Some(Utc.with_ymd_and_hms(2026, 9, 2, 9, 0, 0).unwrap()));
         assert_eq!(common.title, "COR-13 Old export: archived (In Progress)");
@@ -493,8 +520,8 @@ mod tests {
         let since = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
         let transport = FakeTransport::new(vec![page(vec![], None), page(vec![], None)]);
         let adapter = Linear::new(&transport, "COR");
-        adapter.pull(Some(since), false).unwrap();
-        adapter.pull(Some(since), true).unwrap();
+        collect(&adapter, Some(since), false).unwrap();
+        collect(&adapter, Some(since), true).unwrap();
         let requests = transport.requests.borrow();
         assert_eq!(
             requests[0]["variables"]["filter"]["updatedAt"],
@@ -524,7 +551,7 @@ mod tests {
     #[test]
     fn oversized_page_is_retried_at_half_size_until_it_fits() {
         let transport = SizeLimitedTransport { fits: 3, requests: RefCell::new(vec![]) };
-        let events = Linear::new(&transport, "COR").pull(None, false).unwrap();
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
         assert_eq!(*transport.requests.borrow(), vec![25, 12, 6, 3]);
         assert_eq!(events[0].common().external_key, "COR-12");
     }
@@ -532,7 +559,7 @@ mod tests {
     #[test]
     fn page_that_is_too_large_even_at_one_issue_fails() {
         let transport = SizeLimitedTransport { fits: 0, requests: RefCell::new(vec![]) };
-        let error = Linear::new(&transport, "COR").pull(None, false).unwrap_err();
+        let error = collect(&Linear::new(&transport, "COR"), None, false).unwrap_err();
         assert_eq!(error, RESPONSE_TOO_LARGE);
         assert_eq!(*transport.requests.borrow(), vec![25, 12, 6, 3, 1]);
     }
@@ -540,14 +567,14 @@ mod tests {
     #[test]
     fn graphql_errors_fail_the_pull() {
         let transport = FakeTransport::new(vec![json!({"errors": [{"message": "Team not found"}]})]);
-        let error = Linear::new(&transport, "NOPE").pull(None, false).unwrap_err();
+        let error = collect(&Linear::new(&transport, "NOPE"), None, false).unwrap_err();
         assert!(error.contains("Team not found"), "{error}");
     }
 
     #[test]
     fn malformed_page_fails_instead_of_looping() {
         let transport = FakeTransport::new(vec![json!({"data": {"issues": {"nodes": []}}})]);
-        assert!(Linear::new(&transport, "COR").pull(None, false).is_err());
+        assert!(collect(&Linear::new(&transport, "COR"), None, false).is_err());
     }
 
     #[test]
