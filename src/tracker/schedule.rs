@@ -88,8 +88,8 @@ fn xml_escape(text: &str) -> String {
 /// The cron time fields for an interval, and whether they only approximate it.
 fn cron_fields(interval_seconds: u32) -> (String, bool) {
     let hours = interval_seconds / 3600;
-    let whole_minutes = interval_seconds % 60 == 0;
-    match (interval_seconds % 3600 == 0, hours, whole_minutes) {
+    let whole_minutes = interval_seconds.is_multiple_of(60);
+    match (interval_seconds.is_multiple_of(3600), hours, whole_minutes) {
         (true, 1, _) => ("0 * * * *".to_string(), false),
         (true, 2..=24, _) => (format!("0 */{hours} * * *"), false),
         (_, _, true) if interval_seconds / 60 < 60 => (format!("*/{} * * * *", interval_seconds / 60), false),
@@ -143,6 +143,7 @@ pub fn schedule(
     let parent = path.parent().ok_or("no LaunchAgents directory")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("could not create the LaunchAgents directory: {error}"))?;
     let body = launch_agent_plist(&binary, interval_seconds, &config_dir.join("tracker-pull.log"));
+    std::fs::create_dir_all(config_dir).map_err(|error| format!("could not create the config directory: {error}"))?;
     let staged = path.with_extension("plist.tmp");
     std::fs::write(&staged, body).map_err(|error| format!("could not write {LABEL}.plist: {error}"))?;
     // Replace any existing copy cleanly; it may not be loaded, so ignore failure.
@@ -243,7 +244,7 @@ mod tests {
     fn schedule_writes_the_plist_boots_out_first_then_bootstraps() {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&[]);
-        schedule(home.path(), Path::new("/cfg"), 1800, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        schedule(home.path(), &home.path().join("cfg"), 1800, &fake, Path::new("/bin/wardwell"), 501).unwrap();
         assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "print"]);
         let calls = fake.calls.borrow();
         assert_eq!(calls[0][2], "gui/501/com.wardwell.tracker-pull");
@@ -251,7 +252,7 @@ mod tests {
         assert!(calls[1][3].ends_with("Library/LaunchAgents/com.wardwell.tracker-pull.plist"));
         assert_eq!(schedule_status(home.path()), Some(1800));
         let body = std::fs::read_to_string(plist_path(home.path())).unwrap();
-        assert!(body.contains("/cfg/tracker-pull.log"));
+        assert!(body.contains("cfg/tracker-pull.log"));
     }
 
     #[cfg(target_os = "macos")]
@@ -259,7 +260,7 @@ mod tests {
     fn schedule_ignores_bootout_failure_and_falls_back_to_load() {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&["bootout", "bootstrap"]);
-        schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        schedule(home.path(), &home.path().join("cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
         assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "load", "print"]);
     }
 
@@ -276,7 +277,7 @@ mod tests {
     fn schedule_fails_when_load_succeeds_but_the_job_is_not_loaded() {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&["bootout", "bootstrap", "print"]);
-        let error = schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
+        let error = schedule(home.path(), &home.path().join("cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
         assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "load", "print"]);
         assert!(error.contains("bootstrap failed: already loaded"), "{error}");
         assert!(!error.contains(&home.path().display().to_string()), "{error}");
@@ -301,12 +302,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_creates_the_config_dir_so_launchd_can_open_the_log() {
+        let home = tempfile::tempdir().unwrap();
+        let config_dir = home.path().join(".wardwell/nested");
+        let fake = Fake::new(&[]);
+        schedule(home.path(), &config_dir, 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        assert!(config_dir.is_dir());
+    }
+
     #[test]
     fn schedule_rejects_intervals_outside_the_bounds_and_writes_nothing() {
         for interval in [0, 1, 59, 2_147_483_648, u32::MAX] {
             let home = tempfile::tempdir().unwrap();
             let fake = Fake::new(&[]);
-            let error = schedule(home.path(), Path::new("/cfg"), interval, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
+            let error = schedule(home.path(), &home.path().join("cfg"), interval, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
             assert!(error.contains("60") && error.contains("2147483647"), "{error}");
             assert!(fake.calls.borrow().is_empty());
             assert!(!plist_path(home.path()).exists());
@@ -319,7 +330,7 @@ mod tests {
         for interval in [60, 2_147_483_647] {
             let home = tempfile::tempdir().unwrap();
             let fake = Fake::new(&[]);
-            schedule(home.path(), Path::new("/cfg"), interval, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+            schedule(home.path(), &home.path().join("cfg"), interval, &fake, Path::new("/bin/wardwell"), 501).unwrap();
             assert_eq!(schedule_status(home.path()), Some(interval));
         }
     }
