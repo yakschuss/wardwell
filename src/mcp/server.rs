@@ -440,6 +440,11 @@ impl WardwellServer {
             return json_error("kanban is disabled — set kanban.enabled: true in ~/.wardwell/config.yml");
         };
         let p = params.0;
+        if crate::tracker::LOCKED_KANBAN_ACTIONS.contains(&p.action.as_str())
+            && let Some(refusal) = self.tracker_refusal(kanban, &p)
+        {
+            return json_error(&refusal);
+        }
         match p.action.as_str() {
             "list" => self.kanban_list(kanban, &p),
             "create" => self.kanban_create(kanban, &p),
@@ -3564,6 +3569,30 @@ impl WardwellServer {
             }
         }
         None
+    }
+
+    /// Refusal when the targeted project is bound read-only to a tracker.
+    /// Resolves the project from ticket_id, else project (+domain or inferred).
+    fn tracker_refusal(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Option<String> {
+        if self.config.trackers.is_empty() {
+            return None;
+        }
+        let (domain, project) = match (&p.ticket_id, &p.project) {
+            (Some(ticket_id), _) => {
+                let (domain, project) = self.lookup_item_domain(kanban, ticket_id)?;
+                (Some(domain), project)
+            }
+            (None, Some(project)) => (
+                p.domain.clone().or_else(|| self.infer_domain_for_project(project)),
+                project.clone(),
+            ),
+            (None, None) => return None,
+        };
+        let binding = match domain {
+            Some(domain) => self.config.tracker_for(&domain, &project),
+            None => self.config.trackers.values().find(|b| b.project == project && b.readonly),
+        }?;
+        crate::tracker::readonly_refusal(binding)
     }
 
     fn lookup_item_domain(&self, kanban: &crate::kanban::store::KanbanStore, ticket_id: &str) -> Option<(String, String)> {
