@@ -2,7 +2,7 @@ use crate::config::types::{ConfigError, DomainName, PathGlob};
 use crate::domain::model::Domain;
 use crate::domain::registry::DomainRegistry;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Feature flags for optional MCP capabilities.
@@ -43,6 +43,30 @@ pub struct WardwellConfig {
     pub kanban_prefixes: HashMap<String, String>,
     /// Feature flags for optional MCP capabilities.
     pub features: FeatureFlags,
+    /// Tracker mirrors keyed by `<domain>/<project>`.
+    pub trackers: BTreeMap<String, TrackerBinding>,
+}
+
+impl WardwellConfig {
+    /// The tracker binding for a vault project, if one is configured.
+    pub fn tracker_for(&self, domain: &str, project: &str) -> Option<&TrackerBinding> {
+        self.trackers.get(&format!("{domain}/{project}"))
+    }
+}
+
+/// Binds one vault project to an external tracker it mirrors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerBinding {
+    pub domain: String,
+    pub project: String,
+    /// Adapter name, e.g. `linear`.
+    pub provider: String,
+    /// Provider team key the project mirrors, e.g. `COR`.
+    pub team: String,
+    /// Name of the credential file under `~/.wardwell/trackers/`.
+    pub credential: String,
+    /// When true, kanban write actions on this project are refused.
+    pub readonly: bool,
 }
 
 /// AI configuration for session summarization.
@@ -90,6 +114,17 @@ struct RawConfig {
     kanban: Option<RawKanbanConfig>,
     #[serde(default)]
     features: Option<RawFeatureFlags>,
+    #[serde(default)]
+    trackers: HashMap<String, RawTrackerBinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTrackerBinding {
+    provider: String,
+    team: String,
+    credential: String,
+    #[serde(default)]
+    readonly: bool,
 }
 
 fn default_true() -> bool {
@@ -209,6 +244,8 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         None => FeatureFlags::default(),
     };
 
+    let trackers = tracker_bindings(raw.trackers)?;
+
     Ok(WardwellConfig {
         vault_path,
         registry,
@@ -220,7 +257,39 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         kanban_queries,
         kanban_prefixes,
         features,
+        trackers,
     })
+}
+
+fn tracker_bindings(
+    raw: HashMap<String, RawTrackerBinding>,
+) -> Result<BTreeMap<String, TrackerBinding>, ConfigError> {
+    let mut bindings = BTreeMap::new();
+    for (key, entry) in raw {
+        let (domain, project) = split_project_key(&key)?;
+        bindings.insert(key.clone(), TrackerBinding {
+            domain,
+            project,
+            provider: entry.provider,
+            team: entry.team,
+            credential: entry.credential,
+            readonly: entry.readonly,
+        });
+    }
+    Ok(bindings)
+}
+
+fn split_project_key(key: &str) -> Result<(String, String), ConfigError> {
+    let parts: Vec<&str> = key.split('/').collect();
+    match parts.as_slice() {
+        [domain, project] if !domain.is_empty() && !project.is_empty() => {
+            Ok(((*domain).to_string(), (*project).to_string()))
+        }
+        _ => Err(ConfigError::InvalidTrackerBinding {
+            key: key.to_string(),
+            reason: "key must be <domain>/<project>".to_string(),
+        }),
+    }
 }
 
 /// Resolve the wardwell config directory. Defaults to ~/.wardwell.
@@ -401,5 +470,52 @@ kanban:
         assert_eq!(config.kanban_queries.get("active").unwrap(), "status:active type:project");
         assert_eq!(config.kanban_prefixes.get("P-").unwrap(), "project");
         assert_eq!(config.kanban_prefixes.get("T-").unwrap(), "task");
+    }
+    #[test]
+    fn trackers_absent_defaults_to_empty() {
+        let yaml = "vault_path: /tmp/test-vault\nsession_sources: []\n";
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert!(config.trackers.is_empty());
+    }
+
+    #[test]
+    fn trackers_section_binds_projects() {
+        let yaml = r#"
+vault_path: /tmp/test-vault
+session_sources: []
+trackers:
+  work/claims:
+    provider: linear
+    team: COR
+    credential: corr-linear
+    readonly: true
+  work/other:
+    provider: linear
+    team: OTH
+    credential: corr-linear
+"#;
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        let claims = config.trackers.get("work/claims").unwrap();
+        assert_eq!(claims.domain, "work");
+        assert_eq!(claims.project, "claims");
+        assert_eq!(claims.provider, "linear");
+        assert_eq!(claims.team, "COR");
+        assert_eq!(claims.credential, "corr-linear");
+        assert!(claims.readonly);
+        assert!(!config.trackers.get("work/other").unwrap().readonly);
+        assert_eq!(config.tracker_for("work", "claims").map(|b| b.team.as_str()), Some("COR"));
+        assert!(config.tracker_for("work", "missing").is_none());
+    }
+
+    #[test]
+    fn trackers_reject_malformed_project_key() {
+        for key in ["claims", "work/claims/extra", "/claims", "work/"] {
+            let yaml = format!("vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  \"{key}\":\n    provider: linear\n    team: COR\n    credential: c\n");
+            let f = write_config(&yaml).unwrap();
+            let error = load(Some(f.path())).err().expect("malformed key");
+            assert!(error.to_string().contains(key), "{error}");
+        }
     }
 }

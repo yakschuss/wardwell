@@ -166,6 +166,9 @@ pub enum ConfigError {
 
     #[error("empty domain configuration")]
     EmptyConfig,
+
+    #[error("invalid tracker binding '{key}': {reason}")]
+    InvalidTrackerBinding { key: String, reason: String },
 }
 
 fn dirs_home() -> Option<PathBuf> {
