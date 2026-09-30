@@ -8,6 +8,11 @@ use std::process::Command;
 /// The launchd label, which also names the plist file.
 pub const LABEL: &str = "com.wardwell.tracker-pull";
 
+/// Shortest interval accepted; anything faster hammers the provider.
+pub const MIN_INTERVAL_SECONDS: u32 = 60;
+/// Longest interval accepted; launchd's StartInterval is a signed 32-bit integer.
+pub const MAX_INTERVAL_SECONDS: u32 = 2_147_483_647;
+
 /// Runs one launchctl argv (program first).
 pub trait LaunchctlRunner {
     fn run(&self, argv: &[String]) -> Result<(), String>;
@@ -102,8 +107,10 @@ pub fn schedule(
     current_exe: &Path,
     uid: u32,
 ) -> Result<String, String> {
-    if interval_seconds == 0 {
-        return Err("interval must be at least 1 second".to_string());
+    if !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&interval_seconds) {
+        return Err(format!(
+            "interval must be between {MIN_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS} seconds"
+        ));
     }
     let binary = current_exe.canonicalize().unwrap_or_else(|_| current_exe.to_path_buf());
     if !cfg!(target_os = "macos") {
@@ -230,12 +237,26 @@ mod tests {
     }
 
     #[test]
-    fn schedule_rejects_a_zero_interval_and_writes_nothing() {
-        let home = tempfile::tempdir().unwrap();
-        let fake = Fake::new(&[]);
-        assert!(schedule(home.path(), Path::new("/cfg"), 0, &fake, Path::new("/bin/wardwell"), 501).is_err());
-        assert!(fake.calls.borrow().is_empty());
-        assert!(!plist_path(home.path()).exists());
+    fn schedule_rejects_intervals_outside_the_bounds_and_writes_nothing() {
+        for interval in [0, 1, 59, 2_147_483_648, u32::MAX] {
+            let home = tempfile::tempdir().unwrap();
+            let fake = Fake::new(&[]);
+            let error = schedule(home.path(), Path::new("/cfg"), interval, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
+            assert!(error.contains("60") && error.contains("2147483647"), "{error}");
+            assert!(fake.calls.borrow().is_empty());
+            assert!(!plist_path(home.path()).exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_accepts_both_edges_of_the_interval_bounds() {
+        for interval in [60, 2_147_483_647] {
+            let home = tempfile::tempdir().unwrap();
+            let fake = Fake::new(&[]);
+            schedule(home.path(), Path::new("/cfg"), interval, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+            assert_eq!(schedule_status(home.path()), Some(interval));
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
