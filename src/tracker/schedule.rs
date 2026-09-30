@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The launchd label, which also names the plist file.
 pub const LABEL: &str = "com.wardwell.tracker-pull";
 
 /// Runs one launchctl argv (program first).
@@ -21,10 +22,10 @@ impl LaunchctlRunner for SystemRunner {
         let output = Command::new(program)
             .args(args)
             .output()
-            .map_err(|error| format!("{program}: {error}"))?;
+            .map_err(|error| format!("{program} could not start: {error}"))?;
         match output.status.success() {
             true => Ok(()),
-            false => Err(format!("{program} {}: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim())),
+            false => Err(format!("{program} failed: {}", String::from_utf8_lossy(&output.stderr).trim())),
         }
     }
 }
@@ -113,11 +114,11 @@ pub fn schedule(
     }
     let path = plist_path(home);
     let parent = path.parent().ok_or("no LaunchAgents directory")?;
-    std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("could not create the LaunchAgents directory: {error}"))?;
     let body = launch_agent_plist(&binary, interval_seconds, &config_dir.join("tracker-pull.log"));
     // Replace any existing copy cleanly; it may not be loaded, so ignore failure.
     let _ = runner.run(&argv(&["launchctl", "bootout", &format!("{}/{LABEL}", domain(uid))]));
-    std::fs::write(&path, body).map_err(|error| format!("{}: {error}", path.display()))?;
+    std::fs::write(&path, body).map_err(|error| format!("could not write {LABEL}.plist: {error}"))?;
     load(runner, uid, &path)?;
     Ok(format!("Scheduled tracker pull every {interval_seconds}s ({})", path.display()))
 }
@@ -136,7 +137,7 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(format!("Removed {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("Tracker pull was not scheduled".to_string()),
-        Err(error) => Err(format!("{}: {error}", path.display())),
+        Err(error) => Err(format!("could not remove {LABEL}.plist: {error}")),
     }
 }
 
