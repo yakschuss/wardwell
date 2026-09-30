@@ -85,9 +85,29 @@ fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// The cron time fields for an interval, and whether they only approximate it.
+fn cron_fields(interval_seconds: u32) -> (String, bool) {
+    let hours = interval_seconds / 3600;
+    let whole_minutes = interval_seconds % 60 == 0;
+    match (interval_seconds % 3600 == 0, hours, whole_minutes) {
+        (true, 1, _) => ("0 * * * *".to_string(), false),
+        (true, 2..=24, _) => (format!("0 */{hours} * * *"), false),
+        (_, _, true) if interval_seconds / 60 < 60 => (format!("*/{} * * * *", interval_seconds / 60), false),
+        _ => {
+            let minutes = ((interval_seconds + 30) / 60).clamp(1, 59);
+            (format!("*/{minutes} * * * *"), true)
+        }
+    }
+}
+
+/// The crontab line for non-macOS hosts, with a note when it is approximate.
 fn cron_line(binary: &Path, interval_seconds: u32) -> String {
-    let minutes = (interval_seconds / 60).max(1);
-    format!("*/{minutes} * * * * {} tracker pull", binary.display())
+    let (fields, approximate) = cron_fields(interval_seconds);
+    let line = format!("{fields} {} tracker pull", binary.display());
+    match approximate {
+        true => format!("{line}\nThis is approximate: cron cannot express every {interval_seconds} seconds."),
+        false => line,
+    }
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -310,15 +330,24 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let fake = Fake::new(&[]);
         let error = schedule(home.path(), Path::new("/cfg"), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap_err();
-        assert!(error.contains("*/60 * * * * /bin/wardwell tracker pull"), "{error}");
+        assert!(error.contains("0 * * * * /bin/wardwell tracker pull"), "{error}");
         assert!(!plist_path(home.path()).exists());
         assert!(fake.calls.borrow().is_empty());
     }
 
     #[test]
-    fn cron_line_converts_seconds_to_minutes() {
-        assert_eq!(cron_line(Path::new("/w"), 3600), "*/60 * * * * /w tracker pull");
-        assert_eq!(cron_line(Path::new("/w"), 10), "*/1 * * * * /w tracker pull");
+    fn cron_line_uses_hours_minutes_or_a_marked_approximation() {
+        let line = |seconds| cron_line(Path::new("/w"), seconds);
+        assert_eq!(line(3600), "0 * * * * /w tracker pull");
+        assert_eq!(line(7200), "0 */2 * * * /w tracker pull");
+        assert_eq!(line(86_400), "0 */24 * * * /w tracker pull");
+        assert_eq!(line(60), "*/1 * * * * /w tracker pull");
+        assert_eq!(line(900), "*/15 * * * * /w tracker pull");
+        assert_eq!(line(3540), "*/59 * * * * /w tracker pull");
+        assert!(line(90).starts_with("*/2 * * * * /w tracker pull\n"));
+        assert!(line(90).contains("approximate"));
+        assert!(line(5400).starts_with("*/59 * * * * /w tracker pull\n"));
+        assert!(line(90_000).contains("approximate"));
     }
 
     #[test]
