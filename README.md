@@ -376,34 +376,18 @@ proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
 status, and export_roadmap, which saves a PDF into the project folder) refuses
 and says to edit in the tracker. Reads are unaffected.
 
-Scheduling is external. An hourly launchd agent, saved as
-`~/Library/LaunchAgents/com.wardwell.tracker-pull.plist` and loaded with
-`launchctl load ~/Library/LaunchAgents/com.wardwell.tracker-pull.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.wardwell.tracker-pull</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/YOU/.cargo/bin/wardwell</string>
-    <string>tracker</string>
-    <string>pull</string>
-  </array>
-  <key>StartInterval</key>
-  <integer>3600</integer>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/wardwell-tracker-pull.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/wardwell-tracker-pull.log</string>
-</dict>
-</plist>
+```sh
+wardwell tracker schedule [--interval-seconds 3600]
+wardwell tracker unschedule
 ```
+
+`schedule` installs a launchd agent (macOS) that runs `wardwell tracker pull` at
+load and every interval, using the binary you ran it with, and replaces any
+existing agent of the same label; output goes to `~/.wardwell/tracker-pull.log`.
+The interval must be 60 to 2147483647 seconds. On other hosts `schedule` prints a
+crontab line instead, marked approximate when cron cannot express the interval.
+`unschedule` stops the agent and removes its plist. `status` reports the interval
+read from the plist on disk, not whether launchd has the job loaded.
 
 Follow-up, not in this version: importing a tracker's CSV or JSON export from a
 file instead of pulling over the API.

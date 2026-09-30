@@ -4,6 +4,7 @@
 
 use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::pull::{Connect, pull_binding};
+use crate::tracker::schedule::{self, LaunchctlRunner};
 use crate::tracker::{credential, log};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
@@ -57,16 +58,43 @@ fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(&
 }
 
 /// One line per bound project: provider, last pull and its age, last full
-/// resync, event count, readonly flag.
-pub fn status(config: &WardwellConfig, now: DateTime<Utc>) -> Vec<String> {
-    if config.trackers.is_empty() {
-        return vec!["No trackers bound. Add a trackers section to config.yml.".to_string()];
+/// resync, event count, readonly flag; then one line on the pull schedule
+/// (`scheduled` is the interval from the installed plist, if any).
+pub fn status(config: &WardwellConfig, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
+    let mut lines = match config.trackers.is_empty() {
+        true => vec!["No trackers bound. Add a trackers section to config.yml.".to_string()],
+        false => config
+            .trackers
+            .iter()
+            .map(|(key, binding)| status_line(&config.vault_path, key, binding, now))
+            .collect(),
+    };
+    lines.push(schedule_line(scheduled));
+    lines
+}
+
+fn schedule_line(scheduled: Option<u32>) -> String {
+    match scheduled {
+        Some(seconds) => format!("pull schedule: every {seconds} s (plist on disk)"),
+        None => "pull schedule: not scheduled".to_string(),
     }
-    config
-        .trackers
-        .iter()
-        .map(|(key, binding)| status_line(&config.vault_path, key, binding, now))
-        .collect()
+}
+
+/// Install the launchd agent that runs `tracker pull` every `interval_seconds`.
+pub fn schedule(
+    home: &Path,
+    config_dir: &Path,
+    interval_seconds: u32,
+    runner: &dyn LaunchctlRunner,
+    current_exe: &Path,
+    uid: u32,
+) -> Result<String, String> {
+    schedule::schedule(home, config_dir, interval_seconds, runner, current_exe, uid)
+}
+
+/// Remove the launchd agent.
+pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result<String, String> {
+    schedule::unschedule(home, runner, uid)
 }
 
 fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>) -> String {
@@ -175,7 +203,7 @@ mod tests {
         pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(5);
         pull(&config, dir.path(), None, false, later, &fake_connect).unwrap();
-        let line = &status(&config, later)[0];
+        let line = &status(&config, later, None)[0];
         assert!(line.contains("last pull 2026-09-01T12:05:00Z (0m ago)"), "{line}");
         assert!(line.contains("last full resync never"), "{line}");
     }
@@ -183,13 +211,13 @@ mod tests {
     #[test]
     fn status_shows_pull_age_resync_count_and_readonly() {
         let (dir, config) = setup(true);
-        let before = status(&config, now());
+        let before = status(&config, now(), None);
         assert!(before[0].contains("never pulled"), "{}", before[0]);
 
         connect(dir.path(), "corr-linear", "lin_api_secret").unwrap();
         pull(&config, dir.path(), None, true, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(90);
-        let lines = status(&config, later);
+        let lines = status(&config, later, None);
         let line = &lines[0];
         assert!(line.contains("work/claims"), "{line}");
         assert!(line.contains("readonly"), "{line}");
@@ -197,5 +225,12 @@ mod tests {
         assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "{line}");
         assert!(line.contains("1 events"), "{line}");
         assert!(!line.contains("lin_api_secret"));
+    }
+
+    #[test]
+    fn status_ends_with_the_schedule_line() {
+        let (_dir, config) = setup(false);
+        assert_eq!(status(&config, now(), None).last().unwrap(), "pull schedule: not scheduled");
+        assert_eq!(status(&config, now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
     }
 }

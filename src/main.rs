@@ -85,6 +85,14 @@ enum TrackerCommand {
     },
     /// Show last pull, last full resync, event count and readonly flag per project
     Status,
+    /// Run `tracker pull` on a launchd interval (macOS), replacing any existing agent
+    Schedule {
+        /// Seconds between pulls
+        #[arg(long, default_value_t = 3600)]
+        interval_seconds: u32,
+    },
+    /// Stop the scheduled pull and remove its launchd agent
+    Unschedule,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +181,8 @@ async fn main() {
 
 fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::tracker::{cli, credential::MAX_TOKEN_BYTES, pull::connect_provider};
+    use wardwell::tracker::schedule::{SystemRunner, current_uid, schedule_status};
+    let home = || dirs::home_dir().ok_or("no home directory");
     let config_dir = wardwell::config::loader::config_dir();
     let lines = match command {
         TrackerCommand::Connect { name, token_stdin: _ } => {
@@ -191,8 +201,13 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         }
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;
-            cli::status(&config, chrono::Utc::now())
+            cli::status(&config, chrono::Utc::now(), schedule_status(&home()?))
         }
+        TrackerCommand::Schedule { interval_seconds } => {
+            let exe = std::env::current_exe()?;
+            vec![cli::schedule(&home()?, &config_dir, interval_seconds, &SystemRunner, &exe, current_uid()?)?]
+        }
+        TrackerCommand::Unschedule => vec![cli::unschedule(&home()?, &SystemRunner, current_uid()?)?],
     };
     for line in lines {
         println!("{line}");

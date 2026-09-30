@@ -11,6 +11,7 @@ pub mod events;
 pub mod linear;
 pub mod log;
 pub mod pull;
+pub mod schedule;
 
 /// Display name for a provider id, for messages a person reads.
 pub fn provider_label(provider: &str) -> String {
