@@ -31,11 +31,10 @@ pub fn pull(
     for (key, binding) in bindings {
         match pull_binding(&config.vault_path, config_dir, binding, full, now, connect) {
             Ok(outcome) => lines.push(format!(
-                "{key}: {} pull appended {} events, {} removed{}",
+                "{key}: {} pull appended {} events, {} removed",
                 if outcome.full { "full" } else { "incremental" },
                 outcome.appended,
                 outcome.removed,
-                outcome.note.map_or(String::new(), |note| format!(" ({note})"))
             )),
             Err(error) => failures.push(format!("{key}: {error}")),
         }
@@ -74,12 +73,12 @@ fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: Date
     let mode = if binding.readonly { "readonly" } else { "writable" };
     let head = format!("{key}: {} {} ({mode})", binding.provider, binding.team);
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let Some(pulled) = last_pull(&path) else {
-        return format!("{head}, never pulled");
-    };
     let summary = match log::read(&path) {
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
+    };
+    let Some(pulled) = summary.last_pull_at else {
+        return format!("{head}, never pulled");
     };
     let resync = summary.last_full_resync_at.map_or("never".to_string(), stamp);
     format!(
@@ -88,10 +87,6 @@ fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: Date
         age(now - pulled),
         summary.event_count
     )
-}
-
-fn last_pull(path: &Path) -> Option<DateTime<Utc>> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok().map(DateTime::<Utc>::from)
 }
 
 fn stamp(time: DateTime<Utc>) -> String {
@@ -173,19 +168,16 @@ mod tests {
         assert!(lines[0].contains("work/claims") && lines[0].contains("full"), "{}", lines[0]);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn pull_line_carries_the_note_when_the_pull_time_cannot_be_recorded() {
-        use std::os::unix::fs::PermissionsExt;
+    fn status_reads_the_last_pull_from_a_pull_that_found_nothing() {
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
         pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
-        let path = log::path_for(&config.vault_path, "work", "claims");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let lines = pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(lines[0].contains("incremental pull appended 0 events"), "{}", lines[0]);
-        assert!(lines[0].contains("could not record the pull time"), "{}", lines[0]);
+        let later = now() + chrono::TimeDelta::minutes(5);
+        pull(&config, dir.path(), None, false, later, &fake_connect).unwrap();
+        let line = &status(&config, later)[0];
+        assert!(line.contains("last pull 2026-09-01T12:05:00Z (0m ago)"), "{line}");
+        assert!(line.contains("last full resync never"), "{line}");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Reads and appends the per-project `tracker.jsonl` event log.
 //!
-//! The log is its own cursor: the reader derives the newest provider time,
-//! the known event ids, and the issues still open in the mirror. Appends go
+//! The log is its own cursor: the reader derives the cursor from the latest
+//! completed-pull or full-resync marker, the known event ids, and the issues
+//! still open in the mirror. Appends go
 //! only through `kanban::jsonl::append_line`. Does NOT talk to any provider.
 
 use crate::kanban::jsonl::append_line;
@@ -21,9 +22,12 @@ pub struct OpenIssue {
 /// Derived state of a tracker log.
 #[derive(Debug, Default, Clone)]
 pub struct LogSummary {
-    /// Newest `occurred_at` among provider-originated events. Local markers
-    /// (issue_removed, full_resync) are excluded so they never move the cursor.
-    pub newest_provider_event_at: Option<DateTime<Utc>>,
+    /// `through` of the latest pull_completed or full_resync marker in file
+    /// order. Provider events never move it, so a pull that failed part way
+    /// leaves it where the last completed pull put it.
+    pub cursor: Option<DateTime<Utc>>,
+    /// When the latest pull_completed or full_resync marker was written.
+    pub last_pull_at: Option<DateTime<Utc>>,
     pub last_full_resync_at: Option<DateTime<Utc>>,
     pub event_ids: HashSet<String>,
     pub open_issues: BTreeMap<String, OpenIssue>,
@@ -40,24 +44,29 @@ impl LogSummary {
             Event::IssueRemoved { .. } => {
                 self.open_issues.remove(&common.external_key);
             }
-            Event::FullResync { .. } => {
+            Event::FullResync { through, .. } => {
                 self.last_full_resync_at = later(self.last_full_resync_at, common.occurred_at);
+                self.mark_pull(common.occurred_at, *through);
             }
+            Event::PullCompleted { through, .. } => self.mark_pull(common.occurred_at, *through),
             Event::IssueUpserted { issue, .. } => {
                 self.open_issues.insert(common.external_key.clone(), OpenIssue {
                     external_id: common.external_id.clone(),
                     issue_title: issue.issue_title.clone(),
                 });
-                self.newest_provider_event_at = later(self.newest_provider_event_at, common.occurred_at);
             }
-            _ => {
-                self.newest_provider_event_at = later(self.newest_provider_event_at, common.occurred_at);
-            }
+            _ => {}
         }
+    }
+
+    fn mark_pull(&mut self, at: DateTime<Utc>, through: Option<DateTime<Utc>>) {
+        self.last_pull_at = Some(at);
+        self.cursor = through;
     }
 }
 
-fn later(current: Option<DateTime<Utc>>, candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
+/// The later of an optional time and a candidate.
+pub fn later(current: Option<DateTime<Utc>>, candidate: DateTime<Utc>) -> Option<DateTime<Utc>> {
     Some(current.map_or(candidate, |c| c.max(candidate)))
 }
 
@@ -149,7 +158,8 @@ mod tests {
     fn missing_file_reads_as_empty() {
         let dir = tempfile::tempdir().unwrap();
         let summary = read(&dir.path().join("tracker.jsonl")).unwrap();
-        assert!(summary.newest_provider_event_at.is_none());
+        assert!(summary.cursor.is_none());
+        assert!(summary.last_pull_at.is_none());
         assert!(summary.event_ids.is_empty());
         assert_eq!(summary.event_count, 0);
     }
@@ -180,7 +190,8 @@ mod tests {
             upsert("e1", "COR-1", 9),
             upsert("e2", "COR-2", 11),
             Event::IssueRemoved { common: common("r1", "COR-1", 23) },
-            Event::FullResync { common: common("f1", "COR", 23), issues: 1, removed: 1 },
+            Event::FullResync { common: common("f1", "COR", 23), issues: 1, removed: 1, through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },
+            upsert("e3", "COR-2", 22),
         ];
         append_new(&path, &events, &mut summary).unwrap();
         std::fs::OpenOptions::new().append(true).open(&path).and_then(|mut f| {
@@ -190,11 +201,12 @@ mod tests {
 
         let summary = read(&path).unwrap();
         assert_eq!(
-            summary.newest_provider_event_at,
+            summary.cursor,
             Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()),
-            "removals and resync markers are local, not provider time"
+            "the cursor is the latest marker's through; provider events alone do not move it"
         );
-        assert_eq!(summary.event_count, 4);
+        assert_eq!(summary.last_pull_at, Some(Utc.with_ymd_and_hms(2026, 9, 1, 23, 0, 0).unwrap()));
+        assert_eq!(summary.event_count, 5);
         assert_eq!(summary.unreadable_lines, 1);
         assert!(summary.event_ids.contains("e1") && summary.event_ids.contains("f1"));
         assert_eq!(summary.open_issues.keys().collect::<Vec<_>>(), vec!["COR-2"]);
@@ -203,6 +215,24 @@ mod tests {
             summary.last_full_resync_at,
             Some(Utc.with_ymd_and_hms(2026, 9, 1, 23, 0, 0).unwrap())
         );
+    }
+
+    #[test]
+    fn latest_marker_in_file_order_sets_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        let mut summary = read(&path).unwrap();
+        let hour = |h| Utc.with_ymd_and_hms(2026, 9, 1, h, 0, 0).unwrap();
+        let events = vec![
+            Event::PullCompleted { common: common("p1", "COR", 12), through: Some(hour(10)) },
+            Event::FullResync { common: common("f1", "COR", 14), issues: 2, removed: 0, through: Some(hour(11)) },
+            Event::PullCompleted { common: common("p2", "COR", 15), through: Some(hour(13)) },
+        ];
+        append_new(&path, &events, &mut summary).unwrap();
+        let summary = read(&path).unwrap();
+        assert_eq!(summary.cursor, Some(hour(13)));
+        assert_eq!(summary.last_pull_at, Some(hour(15)));
+        assert_eq!(summary.last_full_resync_at, Some(hour(14)));
     }
 
     #[test]

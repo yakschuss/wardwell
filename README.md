@@ -353,14 +353,19 @@ wardwell tracker status
 ```
 
 Each event carries `kind` (`issue_upserted`, `comment_upserted`, `state_changed`,
-`link_added`, `issue_removed`, `full_resync`), `provider`, `external_key`
-(e.g. `COR-12`), `external_id`, `actor`, `occurred_at`, a readable `title`, and
-the provider's payload under `raw`. There is no cursor file: an incremental pull
-starts one hour before the newest event already in the log, and duplicate events
-are skipped by id. A missing file pulls from the beginning. `--full` re-pulls every
-issue (archived included), appends `issue_removed` for issues the tracker no
-longer returns, and ends with a `full_resync` marker. `status` reads the log's
-modification time as the last pull. The mirror is not authoritative; if the
+`link_added`, `issue_removed`, `full_resync`, `pull_completed`), `provider`,
+`external_key` (e.g. `COR-12`), `external_id`, `actor`, `occurred_at`, a readable
+`title`, and the provider's payload under `raw`. There is no cursor file: each
+pull that delivers every page ends with a `pull_completed` marker whose `through`
+is the newest provider time seen, and the next incremental pull starts one hour
+before the latest marker's `through`. Pages are appended as they arrive and
+duplicate events are skipped by id, so a pull that fails part way keeps what it
+read but does not move the cursor; the next pull re-requests from the same
+point whatever order the provider returned pages in. With no marker, a pull
+starts from the beginning. `--full` re-pulls every issue (archived included),
+appends `issue_removed` for issues the tracker no longer returns, and ends with
+a `full_resync` marker that also sets the cursor. `status` reads the last pull
+time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 
 With `readonly: true`, every kanban MCP action that appends to a file in that

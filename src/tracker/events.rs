@@ -67,12 +67,24 @@ pub enum Event {
         #[serde(flatten)]
         common: Common,
     },
-    /// Marks the end of a full resync, with counts.
+    /// Marks the end of a full resync, with counts. Also a cursor marker:
+    /// `through` is the newest provider time the resync saw.
     FullResync {
         #[serde(flatten)]
         common: Common,
         issues: usize,
         removed: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        through: Option<DateTime<Utc>>,
+    },
+    /// Marks an incremental pull that delivered every page. The next pull
+    /// starts from `through`, the newest provider time seen so far; None
+    /// means nothing has been seen and the next pull starts from the beginning.
+    PullCompleted {
+        #[serde(flatten)]
+        common: Common,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        through: Option<DateTime<Utc>>,
     },
 }
 
@@ -85,7 +97,8 @@ impl Event {
             | Event::StateChanged { common, .. }
             | Event::LinkAdded { common, .. }
             | Event::IssueRemoved { common }
-            | Event::FullResync { common, .. } => common,
+            | Event::FullResync { common, .. }
+            | Event::PullCompleted { common, .. } => common,
         }
     }
 }
@@ -229,7 +242,8 @@ mod tests {
             Event::StateChanged { common: common("c"), from: None, to: "Todo".into() },
             Event::LinkAdded { common: common("d"), url: "https://example.com".into(), link_title: Some("PR".into()) },
             Event::IssueRemoved { common: common("e") },
-            Event::FullResync { common: common("f"), issues: 3, removed: 1 },
+            Event::FullResync { common: common("f"), issues: 3, removed: 1, through: None },
+            Event::PullCompleted { common: common("g"), through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },
         ];
         for event in events {
             let line = serde_json::to_string(&event).unwrap();
