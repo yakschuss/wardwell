@@ -53,11 +53,6 @@ pub fn path_in(config_dir: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(config_dir.join(DIRECTORY).join(format!("{name}.json")))
 }
 
-/// The credential path under the Wardwell config directory.
-pub fn default_path(name: &str) -> Result<PathBuf, String> {
-    path_in(&crate::config::loader::config_dir(), name)
-}
-
 /// Read and validate the credential at `path`. Errors never include file
 /// contents.
 pub fn load(path: &Path) -> Result<Credential, String> {
