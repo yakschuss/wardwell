@@ -384,8 +384,10 @@ wardwell tracker unschedule
 `schedule` installs a launchd agent (macOS) that runs `wardwell tracker pull` at
 load and every interval, using the binary you ran it with, and replaces any
 existing agent of the same label; output goes to `~/.wardwell/tracker-pull.log`.
-`unschedule` stops the agent and removes its plist. `status` reports whether the
-pull is scheduled and its interval.
+The interval must be 60 to 2147483647 seconds. On other hosts `schedule` prints a
+crontab line instead, marked approximate when cron cannot express the interval.
+`unschedule` stops the agent and removes its plist. `status` reports the interval
+read from the plist on disk, not whether launchd has the job loaded.
 
 Follow-up, not in this version: importing a tracker's CSV or JSON export from a
 file instead of pulling over the API.
