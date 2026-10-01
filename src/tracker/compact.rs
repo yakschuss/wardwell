@@ -107,31 +107,31 @@ impl Plan {
             inline_raw: HashMap::new(),
             to_move: Vec::new(),
         };
-        let mut kept: HashMap<String, Vec<(Event, Value)>> = HashMap::new();
+        let mut kept: HashMap<String, Vec<(Value, Value)>> = HashMap::new();
         let mut ids: HashSet<String> = HashSet::new();
         for line in original.lines() {
-            let trimmed = line.trim();
-            let parsed = match trimmed.starts_with("{\"_schema\"") {
-                true => None,
-                false => serde_json::from_str::<Event>(trimmed).ok(),
-            };
-            let Some(event) = parsed else {
+            let Some((id, light, inline)) = parse_row(line) else {
                 // Headers, blank and unreadable lines are kept as they are.
                 plan.push_line(line);
                 continue;
             };
-            let (light, raw) = log::split_raw(event);
-            let id = light.common().id.clone();
             ids.insert(id.clone());
+            let raw = inline.clone().unwrap_or(Value::Null);
             let same_id = kept.entry(id.clone()).or_default();
-            if same_id.iter().any(|(e, r)| *e == light && *r == raw) {
+            if same_id.iter().any(|(l, r)| *l == light && *r == raw) {
                 plan.duplicates += 1;
                 continue;
             }
-            same_id.push((light.clone(), raw.clone()));
-            plan.take_raw(&id, raw, sidecar);
-            let encoded = serde_json::to_string(&light).map_err(|_| "could not encode tracker event".to_string())?;
-            plan.push_line(&encoded);
+            same_id.push((light.clone(), raw));
+            match inline {
+                // Without an inline raw the row is kept byte for byte.
+                None => plan.push_line(line),
+                Some(raw) => {
+                    plan.take_raw(&id, raw, sidecar);
+                    let encoded = serde_json::to_string(&light).map_err(|_| "could not encode tracker event".to_string())?;
+                    plan.push_line(&encoded);
+                }
+            }
             plan.events += 1;
         }
         plan.unique_ids = ids.len();
@@ -168,6 +168,20 @@ impl Plan {
             n => Err(format!("compact stopped: {n} raw payloads are not readable from the sidecar; the log is left as it was")),
         }
     }
+}
+
+/// A tracker event row as its id, the row without its `raw` key, and the
+/// inline raw when the row has the key. Every other field, known to this
+/// build or not, stays in the row. None for headers and unreadable lines.
+fn parse_row(line: &str) -> Option<(String, Value, Option<Value>)> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("{\"_schema\"") {
+        return None;
+    }
+    let event = serde_json::from_str::<Event>(trimmed).ok()?;
+    let mut light = serde_json::from_str::<Value>(trimmed).ok()?;
+    let inline = light.as_object_mut()?.remove("raw");
+    Some((event.common().id.clone(), light, inline))
 }
 
 /// Write `content` beside the log, link the old log to `.bak.new`, rename
@@ -431,6 +445,45 @@ mod tests {
         assert!(outcome.changed);
         assert_eq!(std::fs::read(backup_path_for(&path)).unwrap(), log_before, "the backup is the log just replaced");
         assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
+    }
+
+    /// A row a newer writer produced: an unknown top-level field and an
+    /// unknown field inside `issue`, keys in an order serde would not write.
+    fn newer_row(id: &str, key: &str, raw: Option<Value>) -> String {
+        let mut value: Value = serde_json::from_str(&row(id, key, Value::Null)).unwrap();
+        value.as_object_mut().unwrap().remove("raw");
+        value["grooming_note"] = json!("keep me");
+        value["issue"]["estimate"] = json!(5);
+        let mut text = format!("{{\"zz_first\":true,{}", &value.to_string()[1..]);
+        if let Some(raw) = raw {
+            text = format!("{},\"raw\":{raw}}}", &text[..text.len() - 1]);
+        }
+        text
+    }
+
+    #[test]
+    fn compact_keeps_fields_this_build_does_not_know() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log::path_for(dir.path(), "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let light = newer_row("e1", "COR-1", None);
+        let heavy = newer_row("e2", "COR-2", Some(json!({"body": "payload"})));
+        std::fs::write(&path, format!("{SCHEMA_HEADER}\n{light}\n{heavy}\n")).unwrap();
+
+        let outcome = compact(&path, false, Duration::ZERO).unwrap();
+        assert_eq!(outcome.moved_raw, 1);
+        let after = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        assert_eq!(lines[1], light, "a row without inline raw is kept byte for byte");
+        let moved: Value = serde_json::from_str(lines[2]).unwrap();
+        let mut expected: Value = serde_json::from_str(&heavy).unwrap();
+        expected.as_object_mut().unwrap().remove("raw");
+        assert_eq!(moved, expected, "only the raw key goes");
+        assert_eq!(moved["grooming_note"], "keep me");
+        assert_eq!(moved["zz_first"], true);
+        assert_eq!(moved["issue"]["estimate"], 5);
+        assert_eq!(log::read_raw(&log::raw_path_for(&path)).unwrap()["e2"], json!({"body": "payload"}));
+        assert!(!compact(&path, false, Duration::ZERO).unwrap().changed, "second run is a no-op");
     }
 
     #[test]
