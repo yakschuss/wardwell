@@ -4,9 +4,11 @@
 //! The only code that rewrites a tracker log, and only `tracker.jsonl`: the
 //! log is a re-pullable mirror, not a system of record. Under the project
 //! lock it writes the sidecar first, verifies, writes the new log beside the
-//! old one, keeps the old one as `tracker.jsonl.bak`, then renames.
+//! old one, links the old one to `tracker.jsonl.bak.new`, renames the new
+//! log into place, then renames `.bak.new` over `tracker.jsonl.bak`.
 //! Does NOT pull, and does NOT touch any other vault file.
 
+use crate::kanban::jsonl::retry_transient;
 use crate::tracker::events::Event;
 use crate::tracker::{lock, log};
 use serde_json::Value;
@@ -40,6 +42,13 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// Compact the log at `log_path`. A compact log is left alone. Refuses when
 /// a backup from an earlier compaction exists, unless `force`.
 pub fn compact(log_path: &Path, force: bool, wait: Duration) -> Result<CompactOutcome, String> {
+    compact_with(log_path, force, wait, &|from, to| std::fs::rename(from, to))
+}
+
+/// Renames one file over another. Injected so tests can make a rename fail.
+type Rename<'a> = dyn Fn(&Path, &Path) -> std::io::Result<()> + 'a;
+
+fn compact_with(log_path: &Path, force: bool, wait: Duration, rename: &Rename<'_>) -> Result<CompactOutcome, String> {
     let _lock = lock::acquire(log_path, wait)?;
     let original = match std::fs::read_to_string(log_path) {
         Ok(content) => content,
@@ -62,7 +71,7 @@ pub fn compact(log_path: &Path, force: bool, wait: Duration) -> Result<CompactOu
         log::append_raw(&raw_path, id, raw.clone())?;
     }
     plan.verify(&log::read_raw(&raw_path)?)?;
-    replace_log(log_path, &plan.content, &backup)?;
+    replace_log(log_path, &plan.content, &backup, rename)?;
     Ok(CompactOutcome {
         changed: true,
         events: plan.events,
@@ -161,23 +170,46 @@ impl Plan {
     }
 }
 
-/// Write `content` beside the log, keep the old log as `backup`, then
-/// rename the new file into place.
-fn replace_log(log_path: &Path, content: &str, backup: &Path) -> Result<(), String> {
+/// Write `content` beside the log, link the old log to `.bak.new`, rename
+/// the new file over the log, then `.bak.new` over `backup`. On any failure
+/// the temp files go and the log and the old backup stay as they were.
+fn replace_log(log_path: &Path, content: &str, backup: &Path, rename: &Rename<'_>) -> Result<(), String> {
     let temp = with_suffix(log_path, ".compact");
+    let next_backup = with_suffix(log_path, ".bak.new");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&next_backup);
+    };
     let written = std::fs::File::create(&temp)
         .and_then(|mut file| file.write_all(content.as_bytes()).and_then(|_| file.sync_all()));
     if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        cleanup();
         return Err(format!("could not write {}", temp.display()));
     }
-    let _ = std::fs::remove_file(backup);
-    let backed_up = std::fs::hard_link(log_path, backup).or_else(|_| std::fs::copy(log_path, backup).map(|_| ()));
-    if backed_up.is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return Err(format!("could not keep a backup at {}", backup.display()));
+    let _ = std::fs::remove_file(&next_backup);
+    let linked = std::fs::hard_link(log_path, &next_backup).or_else(|_| std::fs::copy(log_path, &next_backup).map(|_| ()));
+    if linked.is_err() {
+        cleanup();
+        return Err(format!("could not keep a backup at {}", next_backup.display()));
     }
-    std::fs::rename(&temp, log_path).map_err(|_| format!("could not replace {}", log_path.display()))
+    if retry_transient(log_path, || rename(&temp, log_path)).is_err() {
+        cleanup();
+        return Err(format!("could not replace {}; the log and the old backup are as they were", log_path.display()));
+    }
+    if retry_transient(backup, || rename(&next_backup, backup)).is_err() {
+        // Put the old log back so the log and its backup stay a pair.
+        let restored = retry_transient(log_path, || rename(&next_backup, log_path));
+        let _ = std::fs::remove_file(&temp);
+        return Err(match restored {
+            Ok(()) => format!("could not keep a backup at {}; the log and the old backup are as they were", backup.display()),
+            Err(_) => format!(
+                "could not keep a backup at {}; the log is compacted, the old backup is unchanged, and the log before this compact is at {}",
+                backup.display(),
+                next_backup.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -328,6 +360,77 @@ mod tests {
         let error = compact(&path, false, Duration::from_millis(100)).unwrap_err();
         assert!(error.contains(lock::LOCK_BUSY), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A log with inline raw, an older backup beside it, and the content of both.
+    fn forced_setup(dir: &Path) -> (PathBuf, Vec<u8>, String) {
+        let path = old_log(dir);
+        std::fs::write(backup_path_for(&path), "older backup").unwrap();
+        (path.clone(), std::fs::read(&path).unwrap(), "older backup".to_string())
+    }
+
+    fn leftovers(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".compact") || n.ends_with(".bak.new"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn failed_rename_over_the_log_keeps_the_old_backup_and_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, log_before, backup_before) = forced_setup(dir.path());
+        let failing = |from: &Path, to: &Path| -> std::io::Result<()> {
+            match to.file_name().and_then(|n| n.to_str()) == Some("tracker.jsonl") && from.to_string_lossy().ends_with(".compact") {
+                true => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                false => std::fs::rename(from, to),
+            }
+        };
+        let error = compact_with(&path, true, Duration::ZERO, &failing).unwrap_err();
+        assert!(error.contains("could not replace"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), log_before);
+        assert_eq!(std::fs::read_to_string(backup_path_for(&path)).unwrap(), backup_before);
+        assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
+    }
+
+    #[test]
+    fn failed_rename_of_the_new_backup_restores_the_log_and_keeps_the_old_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, log_before, backup_before) = forced_setup(dir.path());
+        let failing = |from: &Path, to: &Path| -> std::io::Result<()> {
+            match to.to_string_lossy().ends_with(".bak") {
+                true => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                false => std::fs::rename(from, to),
+            }
+        };
+        let error = compact_with(&path, true, Duration::ZERO, &failing).unwrap_err();
+        assert!(error.contains("could not keep a backup"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), log_before);
+        assert_eq!(std::fs::read_to_string(backup_path_for(&path)).unwrap(), backup_before);
+        assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
+    }
+
+    #[test]
+    fn a_transient_eperm_on_rename_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, log_before, _) = forced_setup(dir.path());
+        let failures = std::cell::Cell::new(0);
+        let flaky = |from: &Path, to: &Path| -> std::io::Result<()> {
+            match failures.get() {
+                0 => {
+                    failures.set(1);
+                    Err(std::io::Error::from_raw_os_error(1))
+                }
+                _ => std::fs::rename(from, to),
+            }
+        };
+        let outcome = compact_with(&path, true, Duration::ZERO, &flaky).unwrap();
+        assert!(outcome.changed);
+        assert_eq!(std::fs::read(backup_path_for(&path)).unwrap(), log_before, "the backup is the log just replaced");
+        assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
     }
 
     #[test]

@@ -62,6 +62,27 @@ pub fn write_file(path: &Path, contents: &str) -> io::Result<()> {
     }
 }
 
+/// Run `op` on `path` with the same materialize+retry-on-EPERM resilience as
+/// `append_line`. Used for renames on the iCloud vault.
+pub fn retry_transient<T>(path: &Path, mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut backoff = INITIAL_BACKOFF;
+    let mut attempt = 0u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                attempt += 1;
+                if !is_transient(&e) || attempt >= MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                materialize(path);
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
+}
+
 fn try_write(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
