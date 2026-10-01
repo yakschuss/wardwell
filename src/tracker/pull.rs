@@ -829,6 +829,17 @@ mod tests {
         assert_eq!(seen.borrow().last(), Some(&true), "a stored token reaches the adapter");
     }
 
+    #[test]
+    fn a_token_saved_by_connect_github_reaches_a_github_binding_without_a_credential_field() {
+        let config = tempfile::tempdir().unwrap();
+        assert!(load_credential(config.path(), &github()).unwrap().is_none());
+        let message = crate::tracker::cli::connect(config.path(), "github", "ghp_secret\n").unwrap();
+        assert!(!message.contains("ghp_secret"), "{message}");
+        let stored = load_credential(config.path(), &github()).unwrap().unwrap();
+        assert_eq!(stored.token(), "ghp_secret");
+        assert!(!format!("{stored:?}").contains("ghp_secret"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_github_token_with_loose_permissions_fails_before_the_log() {

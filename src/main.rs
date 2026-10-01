@@ -103,7 +103,7 @@ enum ProjectCommand {
 enum TrackerCommand {
     /// Store a tracker API token from standard input, never a command-line argument
     Connect {
-        /// Credential name referenced by `credential:` in config.yml
+        /// Credential name referenced by `credential:` in config.yml; `github` for a github binding without one
         name: String,
         /// Read the token from stdin
         #[arg(long, required = true)]
