@@ -35,6 +35,9 @@ pub const AUTOMATIC_FULL_RETRY_AFTER: TimeDelta = TimeDelta::hours(6);
 pub enum Mode {
     /// From the cursor; runs full when a full resync is due.
     Incremental,
+    /// From the cursor, never escalating to a full pull. The kanban on-miss
+    /// refresh uses it so a lookup never waits on a full resync.
+    IncrementalOnly,
     /// Every issue; records removals. Fails on an empty result while the
     /// mirror holds open issues.
     Full,
@@ -48,7 +51,7 @@ pub enum Mode {
 
 impl Mode {
     fn is_full(self) -> bool {
-        !matches!(self, Mode::Incremental)
+        !matches!(self, Mode::Incremental | Mode::IncrementalOnly)
     }
 }
 
@@ -741,6 +744,20 @@ mod tests {
         assert_eq!(outcome.resync_due, Some(ResyncDue::Stale));
         let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
         assert_eq!(summary.last_full_resync_at, Some(stale));
+    }
+
+    #[test]
+    fn an_incremental_only_pull_never_runs_full_even_when_a_resync_is_due() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![snapshot("COR-1", 9)]))) };
+        let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::IncrementalOnly, at(12), &connect).unwrap();
+        assert!(!outcome.full);
+        assert_eq!(outcome.resync_due, None);
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_full_resync_at, None, "no full resync ran");
+        assert!(summary.open_issues.contains_key("COR-1"));
+        assert_eq!(summary.last_pull_at, Some(at(12)));
     }
 
     #[test]

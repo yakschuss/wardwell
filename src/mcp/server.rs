@@ -32,7 +32,16 @@ pub struct WardwellServer {
     allowed_domains: Vec<String>,
     kanban: Option<Arc<crate::kanban::store::KanbanStore>>,
     kanban_queries: std::collections::HashMap<String, String>,
+    /// Where tracker credentials live, for the kanban `get` on-miss refresh.
+    tracker_config_dir: PathBuf,
+    /// Builds the adapter for an on-miss refresh. Replaced in tests.
+    tracker_connect: Arc<TrackerConnect>,
+    /// When each binding last ran an on-miss refresh.
+    refresh_cooldown: Arc<Mutex<crate::tracker::refresh::Cooldown>>,
 }
+
+/// `pull::Connect`, shareable across the server's clones.
+type TrackerConnect = dyn Fn(&crate::config::loader::TrackerBinding, &crate::tracker::credential::Credential) -> Result<Box<dyn crate::tracker::adapter::Adapter>, String> + Send + Sync;
 
 // -- Tool parameter types --
 
@@ -353,6 +362,9 @@ impl WardwellServer {
             allowed_domains,
             kanban,
             kanban_queries,
+            tracker_config_dir: crate::config::loader::config_dir(),
+            tracker_connect: Arc::new(crate::tracker::pull::connect_provider),
+            refresh_cooldown: Arc::new(Mutex::new(crate::tracker::refresh::Cooldown::default())),
         }
     }
 
@@ -2185,10 +2197,18 @@ impl WardwellServer {
             }
         match kanban.get_item(ticket_id) {
             Ok(item) => serde_json::to_string(&serde_json::json!({"item": crate::tracker::items::native(&item)})).unwrap_or_default(),
-            Err(crate::kanban::store::KanbanError::NotFound(missing)) => match self.mirror_get(ticket_id, p.project.as_deref()) {
-                Some(item) => serde_json::to_string(&serde_json::json!({"item": item, "refreshed": false})).unwrap_or_default(),
-                None => json_error(&crate::kanban::store::KanbanError::NotFound(missing).to_string()),
-            },
+            Err(crate::kanban::store::KanbanError::NotFound(missing)) => {
+                let (found, reason) = self.mirror_lookup(ticket_id, p.project.as_deref());
+                let mut response = match found {
+                    Some(item) => serde_json::json!({"item": item}),
+                    None => serde_json::json!({"error": crate::kanban::store::KanbanError::NotFound(missing).to_string()}),
+                };
+                response["refreshed"] = serde_json::json!(reason.is_some_and(|r| r.refreshed()));
+                if let Some(reason) = reason {
+                    response["refresh_reason"] = serde_json::json!(reason.label());
+                }
+                serde_json::to_string(&response).unwrap_or_default()
+            }
             Err(e) => json_error(&e.to_string()),
         }
     }
@@ -3653,6 +3673,52 @@ impl WardwellServer {
             let view = self.mirror_view(binding)?;
             view.get(key).map(|issue| crate::tracker::items::mirrored(binding, &view, issue, now))
         })
+    }
+
+    /// The mirrored issue under `key`. On a miss, one labeled refresh and a
+    /// second look; the reason is None when the first look found it.
+    fn mirror_lookup(&self, key: &str, project: Option<&str>) -> (Option<serde_json::Value>, Option<crate::tracker::refresh::Reason>) {
+        use crate::tracker::refresh::Reason;
+        if let Some(item) = self.mirror_get(key, project) {
+            return (Some(item), None);
+        }
+        if let Err(reason) = self.refresh_on_miss(key, project) {
+            return (None, Some(reason));
+        }
+        match self.mirror_get(key, project) {
+            Some(item) => (Some(item), Some(Reason::FoundAfterPull)),
+            None => (None, Some(Reason::StillMissing)),
+        }
+    }
+
+    /// One incremental pull for the binding that would hold `key`, unless
+    /// none does or it pulled within the cooldown. Never a full pull.
+    fn refresh_on_miss(&self, key: &str, project: Option<&str>) -> Result<(), crate::tracker::refresh::Reason> {
+        use crate::tracker::refresh::Reason;
+        let bindings = self.read_bindings(project);
+        let Some(binding) = crate::tracker::refresh::target(&bindings, key, project) else {
+            return Err(Reason::NoBinding);
+        };
+        let binding_key = format!("{}/{}", binding.domain, binding.project);
+        let started = self
+            .refresh_cooldown
+            .lock()
+            .is_ok_and(|mut cooldown| cooldown.try_start(&binding_key, std::time::Instant::now()));
+        if !started {
+            return Err(Reason::Cooldown);
+        }
+        let connect = |b: &crate::config::loader::TrackerBinding, c: &crate::tracker::credential::Credential| (self.tracker_connect)(b, c);
+        match crate::tracker::pull::pull_binding(
+            &self.vault_root,
+            &self.tracker_config_dir,
+            binding,
+            crate::tracker::pull::Mode::IncrementalOnly,
+            chrono::Utc::now(),
+            &connect,
+        ) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(Reason::PullFailed(error.code)),
+        }
     }
 
     fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {

@@ -15,6 +15,7 @@ pub mod linear;
 pub mod lock;
 pub mod log;
 pub mod pull;
+pub mod refresh;
 pub mod schedule;
 pub mod view;
 

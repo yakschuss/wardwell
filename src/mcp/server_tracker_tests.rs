@@ -206,3 +206,91 @@ fn writes_stay_refused_on_a_readonly_project() {
     let writable = fixture(&standard_mirror(), false);
     assert!(writable.server.tracker_refusal(writable.server.kanban.as_ref().unwrap(), &params).is_none());
 }
+
+/// Hands each pull `events`, or fails with `error`; counts pulls and
+/// records whether each asked for a full pull.
+struct FakeAdapter {
+    events: Vec<Event>,
+    error: Option<String>,
+    calls: Arc<Mutex<Vec<bool>>>,
+}
+
+impl crate::tracker::adapter::Adapter for FakeAdapter {
+    fn pull(&self, _: Option<chrono::DateTime<chrono::Utc>>, full: bool, sink: &mut crate::tracker::adapter::Sink<'_>) -> Result<(), String> {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(full);
+        }
+        sink(self.events.clone())?;
+        self.error.clone().map_or(Ok(()), Err)
+    }
+}
+
+/// `fixture` with a saved credential and a fake adapter behind the
+/// server's connect seam. Returns the recorded pulls.
+fn refresh_fixture(events: Vec<Event>, error: Option<&str>) -> (Fixture, Arc<Mutex<Vec<bool>>>) {
+    let mut f = fixture(&standard_mirror(), true);
+    let config_dir = f._dir.path().join("config");
+    let path = crate::tracker::credential::path_in(&config_dir, "corr-linear").unwrap();
+    crate::tracker::credential::save(&path, "t").unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let error = error.map(str::to_string);
+    f.server.tracker_config_dir = config_dir;
+    f.server.tracker_connect = Arc::new(move |_, _| {
+        Ok(Box::new(FakeAdapter { events: events.clone(), error: error.clone(), calls: recorded.clone() }) as Box<dyn crate::tracker::adapter::Adapter>)
+    });
+    (f, calls)
+}
+
+#[test]
+fn get_on_a_miss_pulls_once_incrementally_and_finds_the_issue() {
+    let now = chrono::Utc::now();
+    let (f, calls) = refresh_fixture(vec![snapshot("COR-99", "New issue", "Todo", StateCategory::Unstarted, now)], None);
+    let response = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-99"}));
+    assert_eq!(response["refreshed"], true, "{response}");
+    assert_eq!(response["refresh_reason"], "found_after_pull");
+    assert_eq!(response["item"]["origin"], "tracker");
+    assert_eq!(response["item"]["title"], "New issue");
+    assert_eq!(*calls.lock().unwrap(), vec![false], "one incremental pull, never full, though no full resync is on record");
+}
+
+#[test]
+fn a_second_miss_within_the_cooldown_does_not_pull() {
+    let (f, calls) = refresh_fixture(vec![], None);
+    let first = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-98"}));
+    assert_eq!(first["refreshed"], true, "{first}");
+    assert_eq!(first["refresh_reason"], "still_missing");
+    assert!(first["error"].as_str().unwrap().contains("COR-98"));
+    let second = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-97"}));
+    assert_eq!(second["refreshed"], false);
+    assert_eq!(second["refresh_reason"], "cooldown");
+    assert!(second["error"].is_string());
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_failed_refresh_returns_the_miss_with_the_code() {
+    let (f, _) = refresh_fixture(vec![], Some("Linear request failed"));
+    let response = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-96"}));
+    assert_eq!(response["refreshed"], false, "{response}");
+    assert_eq!(response["refresh_reason"], "pull_failed:provider");
+    assert!(response["error"].is_string());
+}
+
+#[test]
+fn a_key_no_binding_owns_does_not_pull() {
+    let (f, calls) = refresh_fixture(vec![], None);
+    let response = kanban(&f.server, json!({"action": "get", "ticket_id": "XYZ-1"}));
+    assert_eq!(response["refreshed"], false);
+    assert_eq!(response["refresh_reason"], "no_binding");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn list_query_and_search_never_pull() {
+    let (f, calls) = refresh_fixture(vec![], None);
+    kanban(&f.server, json!({"action": "list", "project": "claims"}));
+    kanban(&f.server, json!({"action": "search", "query": "COR-95"}));
+    kanban(&f.server, json!({"action": "query", "question": "recent"}));
+    assert!(calls.lock().unwrap().is_empty());
+}
