@@ -180,6 +180,7 @@ fn common_mut(event: &mut Event) -> &mut crate::tracker::events::Common {
         | Event::CommentUpserted { common, .. }
         | Event::StateChanged { common, .. }
         | Event::LinkAdded { common, .. }
+        | Event::ChangeMerged { common, .. }
         | Event::IssueRemoved { common }
         | Event::FullResync { common, .. }
         | Event::PullCompleted { common, .. }

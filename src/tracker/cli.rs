@@ -216,7 +216,7 @@ mod tests {
         }
     }
 
-    fn fake_connect(_: &TrackerBinding, _: &crate::tracker::credential::Credential) -> Result<Box<dyn Adapter>, String> {
+    fn fake_connect(_: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>) -> Result<Box<dyn Adapter>, String> {
         Ok(Box::new(Empty))
     }
 
@@ -295,7 +295,7 @@ mod tests {
                 }
             }
         }
-        let full_fails = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails)) };
+        let full_fails = |_: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails)) };
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
         let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &full_fails).unwrap_err();
@@ -382,7 +382,7 @@ mod tests {
         (dir, config)
     }
 
-    fn claims_breaks(binding: &TrackerBinding, _: &crate::tracker::credential::Credential) -> Result<Box<dyn Adapter>, String> {
+    fn claims_breaks(binding: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>) -> Result<Box<dyn Adapter>, String> {
         match binding.team.as_str() {
             "COR" => Ok(Box::new(Broken)),
             _ => Ok(Box::new(Empty)),
@@ -445,7 +445,7 @@ mod tests {
                 Err(format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED))
             }
         }
-        let revoked = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Revoked)) };
+        let revoked = |_: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Revoked)) };
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
         let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &revoked).unwrap_err();

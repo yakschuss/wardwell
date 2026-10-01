@@ -39,7 +39,7 @@ pub struct WardwellServer {
 }
 
 /// `pull::Connect`, shareable across the server's clones.
-type TrackerConnect = dyn Fn(&crate::config::loader::TrackerBinding, &crate::tracker::credential::Credential) -> Result<Box<dyn crate::tracker::adapter::Adapter>, String> + Send + Sync;
+type TrackerConnect = dyn Fn(&crate::config::loader::TrackerBinding, Option<&crate::tracker::credential::Credential>) -> Result<Box<dyn crate::tracker::adapter::Adapter>, String> + Send + Sync;
 
 // -- Tool parameter types --
 
@@ -3768,7 +3768,7 @@ impl WardwellServer {
         }
         let now = chrono::Utc::now();
         crate::tracker::refresh::check(&view, now)?;
-        let connect = |b: &crate::config::loader::TrackerBinding, c: &crate::tracker::credential::Credential| (self.tracker_connect)(b, c);
+        let connect = |b: &crate::config::loader::TrackerBinding, c: Option<&crate::tracker::credential::Credential>| (self.tracker_connect)(b, c);
         crate::tracker::pull::pull_binding_held(&self.vault_root, &self.tracker_config_dir, binding, now, &connect, &lock)
             .map(|_| ())
             .map_err(|error| Reason::PullFailed(error.code))

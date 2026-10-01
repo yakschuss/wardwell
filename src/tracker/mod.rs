@@ -10,6 +10,7 @@ pub mod compact;
 pub mod credential;
 pub mod doctor;
 pub mod events;
+pub mod github;
 pub mod items;
 pub mod linear;
 pub mod lock;

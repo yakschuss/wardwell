@@ -79,6 +79,12 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         link_title: Option<String>,
     },
+    /// A change merged into a repository, such as a merged pull request.
+    ChangeMerged {
+        #[serde(flatten)]
+        common: Common,
+        change: Box<MergedChange>,
+    },
     /// Emitted by a full resync for an issue the tracker no longer returns.
     IssueRemoved {
         #[serde(flatten)]
@@ -171,12 +177,36 @@ impl Event {
             | Event::CommentUpserted { common, .. }
             | Event::StateChanged { common, .. }
             | Event::LinkAdded { common, .. }
+            | Event::ChangeMerged { common, .. }
             | Event::IssueRemoved { common }
             | Event::FullResync { common, .. }
             | Event::PullCompleted { common, .. }
             | Event::PullFailed { common, .. } => common,
         }
     }
+}
+
+/// A merged change as Wardwell holds it. The event's `occurred_at` is the
+/// merge time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MergedChange {
+    /// The change's number in its repository.
+    pub number: u64,
+    /// The change's own title.
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub merged_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The branch the change merged into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Ticket keys in the title, in the pattern search quotes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
 }
 
 /// Full field snapshot of an issue at `occurred_at`.
@@ -369,6 +399,19 @@ mod tests {
             Event::CommentUpserted { common: common("b"), body: "looks wrong".into() },
             Event::StateChanged { common: common("c"), from: None, to: "Todo".into() },
             Event::LinkAdded { common: common("d"), url: "https://example.com".into(), link_title: Some("PR".into()) },
+            Event::ChangeMerged {
+                common: common("m"),
+                change: Box::new(MergedChange {
+                    number: 42,
+                    title: "COR-12 Fix the claims inbox".into(),
+                    body: Some("Body".into()),
+                    author: Some("jdoe".into()),
+                    merged_at: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap(),
+                    url: Some("https://github.com/acme/app/pull/42".into()),
+                    base_branch: Some("main".into()),
+                    keys: vec!["COR-12".into()],
+                }),
+            },
             Event::IssueRemoved { common: common("e") },
             Event::FullResync { common: common("f"), issues: 3, removed: 1, through: None },
             Event::PullCompleted { common: common("g"), through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },
