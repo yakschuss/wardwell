@@ -197,7 +197,7 @@ impl Draft {
     fn read(path: PathBuf, removing: bool) -> Result<Draft, String> {
         if let Ok(target) = std::fs::read_link(&path) {
             return Err(format!(
-                "{} is a symbolic link to {}. Run setup against the real file, or replace the link with a regular file. No files changed.",
+                "{} is a symbolic link to {}. Replace the link with a regular file, or edit the link's target by hand. No files changed.",
                 path.display(),
                 target.display()
             ));
@@ -978,7 +978,7 @@ mod tests {
         let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &BTreeMap::new(), claude_code: true, launchd: false };
         let error = plan(&inputs).unwrap_err();
         assert!(error.contains(&real.display().to_string()), "{error}");
-        assert!(error.contains("Run setup against the real file, or replace the link"), "{error}");
+        assert!(error.contains(&format!("is a symbolic link to {}. Replace the link with a regular file, or edit the link's target by hand.", real.display())), "{error}");
         assert!(!uninstall_plan(&h.home, &h.cfg).failures.is_empty());
         assert_eq!(fs::read_to_string(&real).unwrap(), "{}");
     }

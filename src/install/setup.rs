@@ -86,18 +86,22 @@ pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // The installer stages and renames its files first. Only when that phase
+    // succeeds are the connection entries written, so "nothing was written"
+    // is true when it says so, and no outcome prints before it.
     println!();
-    for client in clients {
-        let result = reconcile(client, &paths, &binary_path, false)?;
-        print_applied(client, &result);
-    }
-    match installer::apply(&plan, &SystemRunner, &current_uid) {
-        Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+    let installed = match installer::apply(&plan, &SystemRunner, &current_uid) {
+        Ok(lines) => lines,
         Err(failed) => {
             failed.lines.iter().for_each(|line| println!("{line}"));
             return Err(failed.message.into());
         }
+    };
+    for client in clients {
+        let result = reconcile(client, &paths, &binary_path, false)?;
+        print_applied(client, &result);
     }
+    installed.iter().for_each(|line| println!("{line}"));
 
     println!();
     for note in plan.activation() {
