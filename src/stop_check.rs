@@ -71,7 +71,7 @@ impl Check<'_> {
             return None;
         }
         let start = started_at(session)?;
-        let commits = crate::inject::git::commits_since(&cwd, start, deadline).filter(|n| *n > 0)?;
+        let commits = crate::inject::git::commits_made_since(&cwd, start, deadline).filter(|n| *n > 0)?;
         if history_since(&project_dir, start) {
             return None;
         }
@@ -164,10 +164,16 @@ mod tests {
         project: PathBuf,
     }
 
-    const START: i64 = 1_800_000_000;
+    /// The session start: two minutes before the first test asked, in whole
+    /// seconds. Work the tests do happens now, after it; the fixture's own
+    /// commit is dated long before it.
+    fn start_secs() -> i64 {
+        static START: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *START.get_or_init(|| Utc::now().timestamp() - 120)
+    }
 
     fn start() -> DateTime<Utc> {
-        DateTime::from_timestamp(START, 0).unwrap()
+        DateTime::from_timestamp(start_secs(), 0).unwrap()
     }
 
     /// A mapped repo with one commit before the session start, and the
@@ -177,7 +183,7 @@ mod tests {
         let code = tmp.path().join("code/corrtex");
         std::fs::create_dir_all(&code).unwrap();
         git(&code, &["init", "-q", "-b", "main"]);
-        commit_at(&code, "before", Some(&format!("@{} +0000", START - 3600)));
+        commit_at(&code, "before", Some("@1700000000 +0000"));
         let project = tmp.path().join("vault/personal/corr-platform");
         std::fs::create_dir_all(&project).unwrap();
         let yaml = format!("vault_path: {}\nsession_sources: []\nprojects:\n  personal/corr-platform:\n    paths: [\"{}\"]\n", tmp.path().join("vault").display(), code.display());
@@ -188,7 +194,7 @@ mod tests {
 
     fn after_start(f: &Fixture, n: i64) {
         for i in 0..n {
-            commit_at(&f.code, "work", Some(&format!("@{} +0000", START + 60 + i)));
+            commit_at(&f.code, &format!("work {i}"), None);
         }
     }
 
@@ -260,9 +266,9 @@ mod tests {
     fn an_entry_written_since_the_start_allows_and_an_older_one_does_not() {
         let f = fixture();
         after_start(&f, 1);
-        std::fs::write(f.project.join("history.jsonl"), format!("{{\"date\":\"{}\",\"title\":\"old\"}}\n", DateTime::from_timestamp(START - 60, 0).unwrap().to_rfc3339())).unwrap();
+        std::fs::write(f.project.join("history.jsonl"), format!("{{\"date\":\"{}\",\"title\":\"old\"}}\n", DateTime::from_timestamp(start_secs() - 60, 0).unwrap().to_rfc3339())).unwrap();
         assert!(eval(&f, "s-1").is_some());
-        std::fs::write(f.project.join("history.jsonl"), format!("{{\"date\":\"{}\",\"title\":\"new\"}}\n", DateTime::from_timestamp(START + 120, 0).unwrap().to_rfc3339())).unwrap();
+        std::fs::write(f.project.join("history.jsonl"), format!("{{\"date\":\"{}\",\"title\":\"new\"}}\n", DateTime::from_timestamp(start_secs() + 120, 0).unwrap().to_rfc3339())).unwrap();
         assert_eq!(eval(&f, "s-2"), None);
     }
 
@@ -283,10 +289,50 @@ mod tests {
         let f = fixture();
         let linked = f.code.parent().unwrap().join("corrtex-wt");
         git(&f.code, &["worktree", "add", "-q", "-b", "wt", linked.to_str().unwrap()]);
-        commit_at(&linked, "work", Some(&format!("@{} +0000", START + 60)));
+        commit_at(&linked, "work", None);
         let mut p = payload(&f, "s-1", false);
         p["cwd"] = json!(linked);
         assert!(check(&f, true).evaluate(&p, |_| Some(start())).is_some_and(|r| r.starts_with("1 commit since")));
+    }
+
+    #[test]
+    fn a_read_only_session_after_pulling_another_authors_commit_is_allowed() {
+        let f = fixture();
+        let root = f.code.parent().unwrap();
+        let up = root.join("up.git");
+        git(root, &["clone", "-q", "--bare", f.code.to_str().unwrap(), up.to_str().unwrap()]);
+        git(&f.code, &["remote", "add", "origin", up.to_str().unwrap()]);
+        git(&f.code, &["fetch", "-q", "origin"]);
+        let mate = root.join("mate");
+        git(root, &["clone", "-q", up.to_str().unwrap(), mate.to_str().unwrap()]);
+        commit_at(&mate, "teammate work", None);
+        git(&mate, &["push", "-q", "origin", "HEAD:main"]);
+        git(&f.code, &["pull", "-q", "--ff-only", "origin", "main"]);
+        assert_eq!(eval(&f, "s-1"), None);
+    }
+
+    #[test]
+    fn a_read_only_session_after_checking_out_a_branch_with_new_commits_is_allowed() {
+        let f = fixture();
+        let wt = f.code.parent().unwrap().join("builder");
+        git(&f.code, &["worktree", "add", "-q", "-b", "pr", wt.to_str().unwrap()]);
+        commit_at(&wt, "builder commit 1", None);
+        commit_at(&wt, "builder commit 2", None);
+        git(&f.code, &["checkout", "-q", "--detach", "pr"]);
+        assert_eq!(eval(&f, "s-1"), None);
+    }
+
+    #[test]
+    fn a_linked_worktree_rebased_onto_another_sessions_commit_is_allowed() {
+        let f = fixture();
+        let wt = f.code.parent().unwrap().join("corrtex-wt");
+        git(&f.code, &["worktree", "add", "-q", "-b", "wt", wt.to_str().unwrap()]);
+        commit_at(&f.code, "other session's work on main", None);
+        git(&wt, &["rebase", "-q", "main"]);
+        let mut p = payload(&f, "s-1", false);
+        p["cwd"] = json!(wt);
+        assert_eq!(check(&f, true).evaluate(&p, |_| Some(start())), None);
+        assert!(eval(&f, "s-2").is_some(), "the session in main that committed is blocked");
     }
 
     #[test]

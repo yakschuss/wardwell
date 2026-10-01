@@ -127,7 +127,7 @@ Runs inside the Stop hook: `wardwell companion lifecycle stop` when the Companio
 
 - Resolves the project with the same mapping as session start. Allows when there is no mapped project or no vault folder.
 - Start time: the earliest lifecycle generation of the session id. Claude Code's Stop payload carries no start time.
-- Counts commits authored since the start with local `git log`. Allows on any git error. The whole check has a 1.2 second budget.
+- Counts entries in this worktree's HEAD reflog since the start whose subject begins with `commit`. Allows on any git error. The whole check has a 1.2 second budget.
 - Blocks when there are commits and no history entry since the start. One line names the count, the start time, and the command to run.
 - Blocks at most once per session id, using a marker under `~/.wardwell/stop-check/blocked/`. Honours `stop_hook_active`.
 - Logs each block to `~/.wardwell/stop-check/blocks.jsonl`.

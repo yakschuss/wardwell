@@ -183,7 +183,7 @@ The command adds the directory under `projects:` in config.yml. Comments and oth
 
 ## Stop check
 
-When a session stops, Wardwell checks that work was recorded. In a mapped project with a vault folder, it counts the commits authored in the session's repository since the session began. With commits and no history entry written since then, it blocks the stop once with one line, for example:
+When a session stops, Wardwell checks that work was recorded. In a mapped project with a vault folder, it counts the commits this worktree made since the session began. It reads the worktree's own HEAD reflog. A pull, a checkout, a rebase or a merge does not count, so other people's commits never do. With commits and no history entry written since then, it blocks the stop once with one line, for example:
 
 ```
 2 commits since 14:02, no history entry. Run wardwell_write append_history for personal/corr-platform, or set WARDWELL_STOP_CHECK=off.
@@ -195,6 +195,7 @@ The session begins at its first prompt that the Companion lifecycle hooks record
 - It allows when the agent is already continuing from a Stop block.
 - It allows on any error or timeout, and when the project has no vault folder.
 - It reads only the local git repository. Merged pull requests are not counted.
+- Two sessions that share one checkout cannot be told apart. A commit by either counts for both. Give each session its own worktree.
 - Each block is logged to `~/.wardwell/stop-check/blocks.jsonl`. `wardwell doctor` shows the last one per project.
 - `WARDWELL_STOP_CHECK=off` turns it off. So does `stop_hook: false` in config.yml.
 
