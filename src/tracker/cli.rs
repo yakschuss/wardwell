@@ -44,6 +44,13 @@ pub fn pull_providers(
     connect: &Connect<'_>,
 ) -> Result<Vec<String>, String> {
     let mut bindings = selected(config, only)?;
+    if let Some(missing) = providers.iter().find(|p| !bindings.iter().any(|(_, b)| &b.provider == *p)) {
+        release_claims(config_dir, &bindings);
+        let mut known: Vec<&str> = bindings.iter().map(|(_, b)| b.provider.as_str()).collect();
+        known.dedup();
+        let whose = only.map_or("No bound project".to_string(), str::to_string);
+        return Err(format!("{whose} has no {missing} binding; its providers are {}.", known.join(", ")));
+    }
     bindings.retain(|(_, b)| providers.is_empty() || providers.contains(&b.provider));
     let mut lines = Vec::new();
     let mut failures = Vec::new();
@@ -383,6 +390,18 @@ mod tests {
         let outcome = crate::tracker::trigger::refresh(&places, "work", "claims", Utc::now() + chrono::TimeDelta::minutes(2), &Never(&spawned), &probes);
         assert_eq!(outcome, crate::tracker::trigger::Outcome::NotDue);
         assert!(!spawned.get(), "the next session start spawns nothing");
+    }
+
+    #[test]
+    fn a_provider_with_no_binding_fails_with_one_sentence_and_releases_the_claim() {
+        let (dir, config) = linear_and_github();
+        let claim = crate::tracker::state::claim_path(dir.path(), "work", "claims");
+        assert!(crate::tracker::state::claim(&claim, Utc::now()));
+        let error = pull_providers(&config, dir.path(), Some("work/claims"), &["jira".to_string()], Mode::Incremental, now(), &fake_connect).unwrap_err();
+        assert_eq!(error, "work/claims has no jira binding; its providers are linear, github.");
+        assert!(!claim.exists(), "the claim is released on this path too");
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        assert!(!path.exists(), "nothing pulled");
     }
 
     #[test]
