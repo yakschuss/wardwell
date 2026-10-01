@@ -187,7 +187,9 @@ impl Event {
 }
 
 /// A merged change as Wardwell holds it. The event's `occurred_at` is the
-/// merge time.
+/// pull request's update time when it was read, for the first event and for
+/// every revision alike; `merged_at` holds the merge time. The update time
+/// is never earlier than the merge time.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MergedChange {
     /// The change's number in its repository.
