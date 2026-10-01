@@ -33,6 +33,8 @@ pub enum Action {
     Remove,
     /// A Wardwell-generated file deleted; nothing of the user's is in it.
     Delete,
+    /// A step not taken because its input could not be read.
+    Skipped,
     Unchanged,
     Off,
     Manual,
@@ -46,6 +48,7 @@ impl Action {
             Action::Update => "UPDATE",
             Action::Remove => "REMOVE + BACKUP",
             Action::Delete => "REMOVE",
+            Action::Skipped => "SKIPPED",
             Action::Unchanged => "UNCHANGED",
             Action::Off => "OFF",
             Action::Manual => "MANUAL",
@@ -132,12 +135,19 @@ pub struct Plan {
     pull: Pull,
     policy: bool,
     settings: bool,
+    /// Steps that cannot be taken, each a sentence that says what to do.
+    pub failures: Vec<String>,
 }
 
 impl Plan {
     /// True when applying would change nothing.
     pub fn is_noop(&self) -> bool {
         self.changes.is_empty() && matches!(self.pull, Pull::Keep | Pull::Manual)
+    }
+
+    /// Labels of the lines that remove something, for a summary after apply.
+    pub fn removals(&self) -> Vec<String> {
+        self.lines.iter().filter(|line| matches!(line.action, Action::Remove | Action::Delete)).map(|line| line.label.clone()).collect()
     }
 
     /// What the user must do before the change is active, said honestly.
@@ -281,7 +291,7 @@ pub fn plan(inputs: &Inputs) -> Result<Plan, String> {
         changes.extend(manifest_change(inputs.config_dir, recorded, &next, &mut lines)?);
     }
     let pull = pull_step(inputs, &mut lines);
-    Ok(Plan { lines, changes, pull, policy: policy && inputs.claude_code, settings: inputs.claude_code })
+    Ok(Plan { lines, changes, pull, policy: policy && inputs.claude_code, settings: inputs.claude_code, failures: Vec::new() })
 }
 
 /// Tier one: the session-start hook and the Stop hook.
@@ -394,24 +404,25 @@ fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
 /// the install record lists and only those, and the pull service. The
 /// Companion install is left whole: its hooks, skills, command and blocks. The
 /// Wardwell folder is never removed; the install record is emptied, not deleted.
-pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Result<Plan, String> {
+pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Plan {
     let mut lines = Vec::new();
     let mut changes = Vec::new();
-    let recorded = manifest::read(config_dir)?;
-    let mut draft = Draft::read(settings_path(home), true)?;
-    let denies = recorded.as_ref().map(|(_, m)| m.claude_permissions_deny.clone()).unwrap_or_default();
-    for (label, spec) in [("Session start hook", &SESSION_START), ("Stop hook", &STOP), ("Linear gate", &GATE)] {
-        draft.step(&mut lines, label.into(), |v| {
-            client_hooks::remove(v, spec);
-            Ok(())
-        })?;
+    let mut failures = Vec::new();
+    let path = settings_path(home);
+    match Draft::read(path.clone(), true) {
+        Ok(draft) => {
+            if let Err(error) = settings_removal(draft, config_dir, &mut lines, &mut changes) {
+                failures.push(format!("Claude Code hooks were not removed: {error} Fix the file, then run `wardwell uninstall` again."));
+            }
+        }
+        Err(error) => {
+            lines.push(Line { action: Action::Skipped, label: "Claude Code hooks and deny entries: settings could not be edited".into(), path: Some(path) });
+            failures.push(format!("Claude Code hooks were not removed: {error} Fix or replace the file, then run `wardwell uninstall` again."));
+        }
     }
-    draft.step(&mut lines, format!("Deny entries Wardwell added ({})", denies.len()), |v| {
-        client_hooks::remove_denies(v, &denies);
-        Ok(())
-    })?;
-    changes.extend(draft.into_change()?);
-    changes.extend(manifest_change(config_dir, recorded, &Manifest::default(), &mut lines)?);
+    if let Some(skipped) = lines.iter().find(|line| line.action == Action::Skipped && line.label.starts_with(DENY_LABEL)) {
+        failures.push(skipped.label.clone());
+    }
     lines.push(Line {
         action: Action::Unchanged,
         label: "The Companion install was not removed: its hooks, skills, command and instructions stay. Remove it separately if you want.".into(),
@@ -425,7 +436,41 @@ pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Result<Plan, String> {
         }
         false => Pull::Keep,
     };
-    Ok(Plan { lines, changes, pull, policy: false, settings: false })
+    Plan { lines, changes, pull, policy: false, settings: false, failures }
+}
+
+const DENY_LABEL: &str = "Deny entries Wardwell added";
+
+/// The settings part of uninstall. An install record that cannot be read
+/// skips only the deny step: hooks are matched by shape and still go.
+fn settings_removal(mut draft: Draft, config_dir: &Path, lines: &mut Vec<Line>, changes: &mut Vec<Change>) -> Result<(), String> {
+    for (label, spec) in [("Session start hook", &SESSION_START), ("Stop hook", &STOP), ("Linear gate", &GATE)] {
+        draft.step(lines, label.into(), |v| {
+            client_hooks::remove(v, spec);
+            Ok(())
+        })?;
+    }
+    let recorded = match manifest::read(config_dir) {
+        Ok(recorded) => Some(recorded),
+        Err(error) => {
+            let error = error.trim_end_matches('.');
+            let label = format!("{DENY_LABEL}: {error}; deny entries left in place. Remove them by hand, or fix the record and run uninstall again.");
+            lines.push(Line { action: Action::Skipped, label, path: Some(manifest::path(config_dir)) });
+            None
+        }
+    };
+    if let Some(recorded) = &recorded {
+        let denies = recorded.as_ref().map(|(_, m)| m.claude_permissions_deny.clone()).unwrap_or_default();
+        draft.step(lines, format!("{DENY_LABEL} ({})", denies.len()), |v| {
+            client_hooks::remove_denies(v, &denies);
+            Ok(())
+        })?;
+    }
+    changes.extend(draft.into_change()?);
+    if let Some(recorded) = recorded {
+        changes.extend(manifest_change(config_dir, recorded, &Manifest::default(), lines)?);
+    }
+    Ok(())
 }
 
 /// An apply that stopped: the lines of the steps that ran, and why it stopped.
@@ -794,7 +839,7 @@ mod tests {
         assert_eq!(client_hooks::commands(&s, &SESSION_START), vec![format!("'{BIN}' inject \"$(pwd)\"")]);
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
         assert!(plan_for(&h, &binding("linear", true), false).is_noop());
-        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        let plan = uninstall_plan(&h.home, &h.cfg);
         apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), USER_TEXT);
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
@@ -824,7 +869,7 @@ mod tests {
         let error = plan(&inputs).unwrap_err();
         assert!(error.contains(&real.display().to_string()), "{error}");
         assert!(error.contains("Run setup against the real file, or replace the link"), "{error}");
-        assert!(uninstall_plan(&h.home, &h.cfg).is_err());
+        assert!(!uninstall_plan(&h.home, &h.cfg).failures.is_empty());
         assert_eq!(fs::read_to_string(&real).unwrap(), "{}");
     }
 
@@ -980,7 +1025,7 @@ mod tests {
         let plist = schedule::plist_path(&h.home);
         fs::create_dir_all(plist.parent().unwrap()).unwrap();
         fs::write(&plist, "x").unwrap();
-        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        let plan = uninstall_plan(&h.home, &h.cfg);
         assert_eq!(action_of(&plan, "Linear gate"), Action::Remove);
         let fake = Fake::new(&[]);
         apply(&plan, &fake, &|| Ok(501)).unwrap();
@@ -993,7 +1038,7 @@ mod tests {
             "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle begin --client claude"}]}]}));
         assert!(h.cfg.is_dir());
         assert!(manifest::read(&h.cfg).unwrap().unwrap().1.claude_permissions_deny.is_empty());
-        let again = uninstall_plan(&h.home, &h.cfg).unwrap();
+        let again = uninstall_plan(&h.home, &h.cfg);
         assert!(again.is_noop(), "{}", rendered(&again));
     }
 
@@ -1017,7 +1062,7 @@ mod tests {
             fs::create_dir_all(h.home.join(relative).parent().unwrap()).unwrap();
             fs::write(h.home.join(relative), text).unwrap();
         }
-        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        let plan = uninstall_plan(&h.home, &h.cfg);
         assert!(rendered(&plan).contains("Companion install was not removed"), "{}", rendered(&plan));
         apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
         assert_eq!(settings(&h), companion);
@@ -1029,7 +1074,7 @@ mod tests {
     #[test]
     fn uninstall_on_a_clean_home_writes_nothing() {
         let h = home();
-        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        let plan = uninstall_plan(&h.home, &h.cfg);
         assert!(plan.is_noop());
         assert!(plan.lines.iter().all(|l| l.action == Action::Unchanged));
         apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();

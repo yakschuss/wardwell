@@ -4,25 +4,17 @@ use crate::install::installer;
 use crate::tracker::schedule::{SystemRunner, current_uid};
 use crate::install::mcp_config::{self, McpConfigPaths, RemovalResult};
 
-/// Clean removal. Reverse of init.
+/// Removes only Wardwell's entries, never the Wardwell folder. The summary
+/// is built from what happened; any failed step makes the command fail.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("wardwell uninstall\n");
+    let mut report = Report::default();
 
-    // 1. Remove MCP config entries
+    // 1. Remove connection entries
     let mcp_paths = McpConfigPaths::detect();
-
-    print_removal(
-        "Claude Code connection entries",
-        mcp_config::remove_owned_json_entries(&mcp_paths.claude_code, true),
-    );
-    print_removal(
-        "Claude Desktop connection entries",
-        mcp_config::remove_owned_json_entries(&mcp_paths.claude_desktop, true),
-    );
-    print_removal(
-        "Codex connection entries",
-        mcp_config::remove_owned_codex_entries(&mcp_paths.codex),
-    );
+    report.removal("Claude Code connection entries", mcp_config::remove_owned_json_entries(&mcp_paths.claude_code, true));
+    report.removal("Claude Desktop connection entries", mcp_config::remove_owned_json_entries(&mcp_paths.claude_desktop, true));
+    report.removal("Codex connection entries", mcp_config::remove_owned_codex_entries(&mcp_paths.codex));
 
     // 2. Remove CLAUDE.md markers
     let config = loader::load(Some(&config_dir().join("config.yml"))).ok();
@@ -36,14 +28,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect()
         })
         .unwrap_or_default();
-
-    let claude_md_files = detect::find_claude_md_files(&domain_paths);
     println!("  Removing CLAUDE.md markers...");
-    for path in &claude_md_files {
+    for path in &detect::find_claude_md_files(&domain_paths) {
         match remove_markers(path) {
-            Ok(true) => println!("    cleaned {}", path.display()),
+            Ok(true) => {
+                println!("    cleaned {}", path.display());
+                report.done.push(format!("CLAUDE.md markers in {}", path.display()));
+            }
             Ok(false) => println!("    no markers in {}", path.display()),
-            Err(e) => println!("    error {}: {e}", path.display()),
+            Err(e) => {
+                println!("    error {}: {e}", path.display());
+                report.failed.push(format!("CLAUDE.md markers in {}: {e}", path.display()));
+            }
         }
     }
 
@@ -51,20 +47,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // service, matched exactly, with a backup. The Wardwell folder stays.
     let home = dirs::home_dir().unwrap_or_default();
     println!("  Removing hooks, Wardwell's deny entries, and the tracker pull...");
-    match installer::uninstall_plan(&home, &config_dir()) {
-        Ok(plan) => {
-            for line in &plan.lines {
-                println!("{}", line.render());
-            }
-            match installer::apply(&plan, &SystemRunner, &current_uid) {
-                Ok(report) => report.iter().for_each(|line| println!("{line}")),
-                Err(failed) => {
-                    failed.lines.iter().for_each(|line| println!("{line}"));
-                    println!("    unchanged: {}", failed.message);
-                }
-            }
+    let plan = installer::uninstall_plan(&home, &config_dir());
+    for line in &plan.lines {
+        println!("{}", line.render());
+    }
+    report.failed.extend(plan.failures.iter().cloned());
+    match installer::apply(&plan, &SystemRunner, &current_uid) {
+        Ok(lines) => {
+            lines.iter().for_each(|line| println!("{line}"));
+            report.done.extend(plan.removals());
         }
-        Err(error) => println!("    unchanged: {error}"),
+        Err(failed) => {
+            failed.lines.iter().for_each(|line| println!("{line}"));
+            println!("    unchanged: {}", failed.message);
+            report.failed.push(failed.message);
+        }
     }
 
     // Also clean up legacy hook script if it exists
@@ -74,58 +71,88 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 4. Remove generated databases (not user content)
-    let index_db = config_dir().join("index.db");
-    let sessions_db = config_dir().join("sessions.db");
-    print!("  Removing index.db...                ");
-    if index_db.exists() {
-        match std::fs::remove_file(&index_db) {
-            Ok(()) => println!("removed"),
-            Err(e) => println!("error: {e}"),
-        }
-        // Also remove WAL/SHM files
-        let _ = std::fs::remove_file(config_dir().join("index.db-wal"));
-        let _ = std::fs::remove_file(config_dir().join("index.db-shm"));
-    } else {
-        println!("not found (ok)");
+    for name in ["index.db", "sessions.db"] {
+        report.database(name);
     }
 
-    print!("  Removing sessions.db...             ");
-    if sessions_db.exists() {
-        match std::fs::remove_file(&sessions_db) {
-            Ok(()) => println!("removed"),
-            Err(e) => println!("error: {e}"),
-        }
-        let _ = std::fs::remove_file(config_dir().join("sessions.db-wal"));
-        let _ = std::fs::remove_file(config_dir().join("sessions.db-shm"));
-    } else {
-        println!("not found (ok)");
-    }
-
-    println!();
-    println!("  Removed connection entries, hooks, deny entries Wardwell added, the tracker pull, markers, and databases.");
-    println!("  Sessions already running keep their hooks until they end.");
-    println!(
-        "  Your vault and config preserved at {}.",
-        config_dir().display()
-    );
-
-    Ok(())
+    report.finish()
 }
 
-fn print_removal(label: &str, result: Result<RemovalResult, std::io::Error>) {
+/// What uninstall did and what failed, for the closing summary.
+#[derive(Default)]
+struct Report {
+    done: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl Report {
+    fn removal(&mut self, label: &str, result: Result<RemovalResult, std::io::Error>) {
+        if let Some(error) = print_removal(label, &result) {
+            self.failed.push(format!("{label}: {error}"));
+        } else if result.is_ok_and(|r| r.removed) {
+            self.done.push(label.to_string());
+        }
+    }
+
+    fn database(&mut self, name: &str) {
+        let path = config_dir().join(name);
+        print!("  Removing {name}...{:width$}", "", width = 20usize.saturating_sub(name.len()));
+        if !path.exists() {
+            println!("not found (ok)");
+            return;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!("removed");
+                self.done.push(name.to_string());
+            }
+            Err(e) => {
+                println!("error: {e}");
+                self.failed.push(format!("{name}: {e}"));
+            }
+        }
+        let _ = std::fs::remove_file(config_dir().join(format!("{name}-wal")));
+        let _ = std::fs::remove_file(config_dir().join(format!("{name}-shm")));
+    }
+
+    fn finish(self) -> Result<(), Box<dyn std::error::Error>> {
+        println!();
+        match self.done.is_empty() {
+            true => println!("  Removed nothing; no Wardwell entries were found to remove."),
+            false => println!("  Removed: {}.", self.done.join(", ")),
+        }
+        println!("  Sessions already running keep their hooks until they end.");
+        println!("  Your vault and config preserved at {}.", config_dir().display());
+        if self.failed.is_empty() {
+            return Ok(());
+        }
+        println!("\n  Uninstall did not finish. These steps failed:");
+        for failure in &self.failed {
+            println!("    - {failure}");
+        }
+        Err(format!("uninstall did not finish: {} step(s) failed", self.failed.len()).into())
+    }
+}
+
+/// Print one connection-removal outcome; the error text when it failed.
+fn print_removal(label: &str, result: &Result<RemovalResult, std::io::Error>) -> Option<String> {
     print!("  Removing {label}...  ");
     match result {
-        Ok(RemovalResult {
-            removed: true,
-            backup_path,
-        }) => {
+        Ok(RemovalResult { removed: true, backup_path }) => {
             println!("removed");
             if let Some(backup) = backup_path {
                 println!("    backup: {}", backup.display());
             }
+            None
         }
-        Ok(RemovalResult { removed: false, .. }) => println!("not found (ok)"),
-        Err(error) => println!("unchanged: {error}"),
+        Ok(RemovalResult { removed: false, .. }) => {
+            println!("not found (ok)");
+            None
+        }
+        Err(error) => {
+            println!("unchanged: {error}");
+            Some(error.to_string())
+        }
     }
 }
 
