@@ -301,31 +301,34 @@ fn index_jsonl_incremental(
     Ok(if new_embedded > 0 { new_embedded } else { offset_chunks.len() })
 }
 
-/// True when the file is shorter than the watermark, or its first or last
-/// indexed line differs from the chunk stored for it.
+/// True when the file is shorter than the watermark, or any indexed line
+/// differs from the chunk stored for it. Every indexed line is compared
+/// against its stored chunk hash, so a rewrite that keeps the first and last
+/// lines is still caught.
 fn was_rewritten(store: &IndexStore, rel_path: &str, lines: &[&str], watermark: usize) -> Result<bool, IndexError> {
     if lines.len() < watermark {
         return Ok(true);
     }
-    for index in [0, watermark - 1] {
-        let stored = stored_chunk_hash(store, rel_path, index)?;
-        if stored.as_deref() != Some(compute_hash(lines[index].trim()).as_str()) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let stored = stored_chunk_hashes(store, rel_path)?;
+    let changed = lines[..watermark]
+        .iter()
+        .enumerate()
+        .any(|(index, line)| stored.get(&index).map(String::as_str) != Some(compute_hash(line.trim()).as_str()));
+    Ok(changed)
 }
 
-fn stored_chunk_hash(store: &IndexStore, rel_path: &str, index: usize) -> Result<Option<String>, IndexError> {
+fn stored_chunk_hashes(store: &IndexStore, rel_path: &str) -> Result<std::collections::HashMap<usize, String>, IndexError> {
     let conn = store.lock()?;
-    let hash = conn
-        .query_row(
-            "SELECT body_hash FROM vault_chunks WHERE chunk_id = ?1",
-            rusqlite::params![format!("{rel_path}::{index}")],
-            |row| row.get::<_, String>(0),
-        )
-        .ok();
-    Ok(hash)
+    let mut statement = conn.prepare("SELECT chunk_index, body_hash FROM vault_chunks WHERE path = ?1")?;
+    let rows = statement.query_map(rusqlite::params![rel_path], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut hashes = std::collections::HashMap::new();
+    for row in rows {
+        let (index, hash) = row?;
+        hashes.insert(usize::try_from(index).unwrap_or(usize::MAX), hash);
+    }
+    Ok(hashes)
 }
 
 #[cfg(test)]
@@ -657,6 +660,39 @@ mod tests {
         assert_eq!(count_chunks(&store), 2);
         assert_eq!(store.get_watermark("work/claims/tracker.jsonl").unwrap(), 2);
         assert_eq!(store.chunk_fts_search("c", 10, None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn compact_that_keeps_the_first_and_last_lines_is_still_reindexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::tracker::log::path_for(dir.path(), "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let row = |id: &str, raw: &str| format!(
+            "{{\"kind\":\"pull_completed\",\"id\":\"{id}\",\"provider\":\"linear\",\"external_key\":\"COR\",\"external_id\":\"COR\",\"occurred_at\":\"2026-09-01T12:00:00Z\",\"title\":\"COR pull {id}\"{raw}}}"
+        );
+        let light_first = row("p1", "");
+        let light_last = row("p3", "");
+        std::fs::write(
+            &path,
+            format!("{}\n{light_first}\n{}\n{light_last}\n", crate::tracker::events::SCHEMA_HEADER, row("p2", ",\"raw\":{\"note\":\"zebrapayload\"}")),
+        )
+        .unwrap();
+        let zebra = |store: &IndexStore| {
+            (
+                store.chunk_fts_search("zebrapayload", 10, None).unwrap().len(),
+                store.search(&crate::index::fts::SearchQuery { query: "zebrapayload".into(), limit: 5, ..Default::default() }).unwrap().total,
+            )
+        };
+        let store = IndexStore::in_memory().unwrap();
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(zebra(&store), (1, 1));
+
+        crate::tracker::compact::compact(&path, false, std::time::Duration::ZERO).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = after.lines().collect();
+        assert_eq!((lines[1], lines[3]), (light_first.as_str(), light_last.as_str()), "first and last lines unchanged");
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(zebra(&store), (0, 0), "raw text is gone from both FTS tables");
     }
 
     #[test]
