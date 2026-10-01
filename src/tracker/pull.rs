@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(minute(10)));
 
         nodes.borrow_mut()[0] = pr(42, "COR-77 Fix the claims inbox", "Body", minute(10), minute(90));
-        let gh = DatasetGh { nodes: nodes.clone(), replies: replies.clone() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: replies.clone(), ..Default::default() };
         let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(100)).unwrap();
         assert_eq!(outcome.appended, 1, "the retitle is a new revision");
         assert!(replies.borrow().last().unwrap().0.join(" ").contains("--search is:merged updated:>=2026-08-31T23:10:00Z sort:updated-desc"), "{:?}", replies.borrow());
@@ -859,7 +859,7 @@ mod tests {
         let (gh, nodes, _) = DatasetGh::new(vec![pr(42, "COR-12 Fix", "Body", minute(10), minute(10))]);
         pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
         nodes.borrow_mut()[0] = pr(42, "COR-12 Fix", "Body", minute(10), minute(50));
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(60)).unwrap();
         assert_eq!(outcome.appended, 0, "a comment moves the update time, not the content");
         assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(minute(50)));
@@ -867,18 +867,18 @@ mod tests {
         // Keys behind the cursor, as an earlier build parsed them, are out
         // of reach of an incremental pull; --full repairs them.
         nodes.borrow_mut().push(pr(43, "Later", "Body", minute(300), minute(300)));
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(310)).unwrap();
         nodes.borrow_mut()[0] = pr(42, "COR-12 COR-13 Fix", "Body", minute(10), minute(50));
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         let missed = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(320)).unwrap();
         assert_eq!(missed.appended, 0);
         assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12"]);
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         let full = pull_project(vault.path(), &github(), &dataset_adapter(gh), true, minute(330)).unwrap();
         assert_eq!(full.appended, 1);
         assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12", "COR-13"]);
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         assert_eq!(pull_project(vault.path(), &github(), &dataset_adapter(gh), true, minute(340)).unwrap().appended, 0);
     }
 
@@ -897,7 +897,7 @@ mod tests {
         nodes.borrow_mut()[49] = pr(50, "COR-50 Change 50", "Body", minute(50), minute(500));
         nodes.borrow_mut()[199] = pr(200, "Change 200", "New body", minute(200), minute(501));
         nodes.borrow_mut().push(pr(301, "Change 301", "Body", minute(502), minute(502)));
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(600)).unwrap();
 
         let mirrored = log::read_for(&path, "github").unwrap().changes;
@@ -912,6 +912,62 @@ mod tests {
         }
     }
 
+    /// A log with #1 pulled at minute 10, and 400 more merged pull requests
+    /// updated one a minute from minute 20.
+    fn cursor_then_400(vault: &Path) -> std::rc::Rc<RefCell<Vec<serde_json::Value>>> {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let (gh, nodes, _) = DatasetGh::new(vec![pr(1, "One", "Body", minute(10), minute(10))]);
+        pull_project(vault, &github(), &dataset_adapter(gh), false, minute(15)).unwrap();
+        nodes.borrow_mut().extend((2..=401).map(|n| pr(n, "Change", "Body", minute(n as i64 + 18), minute(n as i64 + 18))));
+        nodes
+    }
+
+    #[test]
+    fn a_failure_on_the_fifth_window_keeps_four_windows_of_rows_and_the_next_pull_appends_the_rest() {
+        use crate::tracker::github::tests::DatasetGh;
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let nodes = cursor_then_400(vault.path());
+        let replies = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let failing = DatasetGh { nodes: nodes.clone(), replies: replies.clone(), fail_window: Some(5), ..Default::default() };
+        let error = pull_project(vault.path(), &github(), &dataset_adapter(failing), false, minute(500)).unwrap_err();
+        assert_eq!((error.message.as_str(), error.code), ("gh exited with status 1", FailureCode::Provider));
+        let windows: Vec<usize> = replies.borrow().iter().map(|(_, rows, _)| *rows).filter(|rows| (1..100).contains(rows)).collect();
+        assert_eq!(windows.len(), 4, "{:?}", replies.borrow().iter().map(|r| r.1).collect::<Vec<_>>());
+        let kept: usize = windows.iter().sum();
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.changes.len(), 1 + kept, "the first four windows' rows are in the log");
+        assert_eq!((summary.cursor, summary.last_pull_at), (Some(minute(10)), Some(minute(15))), "no marker");
+
+        let gh = DatasetGh { nodes: nodes.clone(), ..Default::default() };
+        let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(510)).unwrap();
+        assert_eq!(outcome.appended, 400 - kept, "only the rest");
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.changes.len(), 401);
+        assert_eq!(summary.last_pull_at, Some(minute(510)));
+    }
+
+    #[test]
+    fn the_budget_stops_a_slow_read_keeps_its_rows_and_releases_the_lock() {
+        use crate::tracker::github::tests::DatasetGh;
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let nodes = cursor_then_400(vault.path());
+        let slow = DatasetGh { nodes: nodes.clone(), delay: Duration::from_millis(250), ..Default::default() };
+        let adapter = dataset_adapter(slow).with_budget(Duration::from_secs(2));
+        let started = std::time::Instant::now();
+        let error = pull_project(vault.path(), &github(), &adapter, false, minute(500)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert_eq!(
+            (error.message.as_str(), error.code),
+            ("the read did not finish in 2 seconds; rows read so far are kept; run the pull again", FailureCode::Provider)
+        );
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.last_pull_at, Some(minute(15)), "no marker");
+        assert_eq!(summary.last_failure.map(|(_, c)| c), Some(FailureCode::Provider));
+        lock::acquire(&path, lock::TEST_FREE_WAIT).unwrap();
+    }
+
     #[test]
     fn a_gh_reply_at_the_limit_in_one_second_writes_no_pull_completed() {
         use crate::tracker::github::tests::{DatasetGh, pr};
@@ -920,7 +976,7 @@ mod tests {
         let (gh, nodes, _) = DatasetGh::new(vec![pr(1, "One", "Body", minute(10), minute(10))]);
         pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
         nodes.borrow_mut().extend((2..=101).map(|n| pr(n, "Same second", "Body", minute(30), minute(40))));
-        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
         let error = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(50)).unwrap_err();
         assert_eq!(error.code, FailureCode::Provider, "{error}");
         let summary = log::read_for(&path, "github").unwrap();

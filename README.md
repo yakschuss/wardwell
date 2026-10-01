@@ -801,6 +801,13 @@ limit. Without one, it fails with `provider` and a sentence that says to run
 written. `--full` always reads this way, from 2008 to
 now, so no reply nears the 16 MiB cap.
 
+Each window, and each REST page, goes into the log as soon as it is read. A
+pull that fails part way keeps those rows and writes no `pull_completed`.
+The next pull reads the range again and appends nothing for rows already
+logged. One provider's pull may read for 10 minutes in all. Past that it
+stops with `provider` and says: "the read did not finish in 10 minutes; rows
+read so far are kept; run the pull again".
+
 `gh` runs in its own process group. A read that runs past 120 seconds has
 the whole group stopped. A timeout, output over 16 MiB, a non-zero exit, or
 output that is not a list each fail with their own sentence and the code

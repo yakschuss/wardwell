@@ -63,7 +63,47 @@ enum GhFailure {
     Absent(Option<&'static str>),
     /// `gh` ran and failed, with the sentence that says how.
     Failed(String),
+    /// The pull must stop here, with no other reader: the budget ran out,
+    /// or the rows read could not be kept.
+    Final(String),
 }
+
+/// One provider's pull may read for this long in all.
+pub const PULL_BUDGET: Duration = Duration::from_secs(600);
+
+/// The sentence for a pull that ran past `budget`.
+pub fn budget_sentence(budget: Duration) -> String {
+    let seconds = budget.as_secs();
+    let spent = match (seconds >= 60, seconds % 60) {
+        (true, 0) => format!("{} minutes", seconds / 60),
+        _ => format!("{seconds} seconds"),
+    };
+    format!("the read did not finish in {spent}; rows read so far are kept; run the pull again")
+}
+
+/// The end of one pull's reading time.
+struct Budget {
+    deadline: Instant,
+    allowed: Duration,
+}
+
+impl Budget {
+    fn starting_now(allowed: Duration) -> Self {
+        Self { deadline: Instant::now() + allowed, allowed }
+    }
+
+    /// The budget sentence once the deadline has passed.
+    fn check(&self) -> Result<(), String> {
+        match Instant::now() < self.deadline {
+            true => Ok(()),
+            false => Err(budget_sentence(self.allowed)),
+        }
+    }
+}
+
+/// Receives the merged pull request nodes of one window or page as soon as
+/// it is read, so a later failure keeps them.
+type Emit<'a> = dyn FnMut(&[Value], Source) -> Result<(), String> + 'a;
 
 impl GhFailure {
     fn from(outcome: GhOutcome) -> Self {
@@ -82,7 +122,7 @@ impl GhFailure {
     fn sentence(&self) -> Option<String> {
         match self {
             Self::Absent(why) => why.map(str::to_string),
-            Self::Failed(sentence) => Some(sentence.clone()),
+            Self::Failed(sentence) | Self::Final(sentence) => Some(sentence.clone()),
         }
     }
 }
@@ -125,13 +165,19 @@ pub struct GitHub {
     credential: String,
     gh: Box<dyn GhRunner>,
     rest: Option<Box<dyn Rest>>,
+    budget: Duration,
 }
 
 impl GitHub {
     /// An adapter for `repository` (`<owner>/<name>`). `rest` is None when no
     /// token is stored under `credential`; then only `gh` can read.
     pub fn new(repository: &str, credential: &str, gh: Box<dyn GhRunner>, rest: Option<Box<dyn Rest>>) -> Self {
-        Self { repository: repository.to_string(), credential: credential.to_string(), gh, rest }
+        Self { repository: repository.to_string(), credential: credential.to_string(), gh, rest, budget: PULL_BUDGET }
+    }
+
+    /// The same adapter with another total reading time for one pull.
+    pub fn with_budget(self, budget: Duration) -> Self {
+        Self { budget, ..self }
     }
 
     /// Doctor check: one cheap read of the repository. Tries `gh`, then the
@@ -146,7 +192,7 @@ impl GitHub {
         };
         let Some(rest) = self.rest.as_ref() else {
             return Err(match failure {
-                GhFailure::Failed(sentence) => (FailureCode::Provider, Some(sentence)),
+                GhFailure::Failed(sentence) | GhFailure::Final(sentence) => (FailureCode::Provider, Some(sentence)),
                 GhFailure::Absent(_) => (FailureCode::Credential, Some(self.no_reader(&failure))),
             });
         };
@@ -166,15 +212,16 @@ impl GitHub {
         }
     }
 
-    /// Merged pull requests and the reader that gave them: `gh` first, the
-    /// token when `gh` cannot read or fails.
-    fn read(&self, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Result<(Vec<Value>, Source), String> {
-        let failure = match self.read_gh(since, limit) {
-            Ok(nodes) => return Ok((nodes, Source::Gh)),
+    /// Hand `emit` the merged pull requests, window by window or page by
+    /// page: `gh` first, the token when `gh` cannot read or fails.
+    fn read(&self, since: Option<DateTime<Utc>>, limit: Option<usize>, budget: &Budget, emit: &mut Emit<'_>) -> Result<(), String> {
+        let failure = match self.read_gh(since, limit, budget, emit) {
+            Ok(()) => return Ok(()),
             Err(failure) => failure,
         };
         match (&self.rest, &failure) {
-            (Some(rest), _) => self.read_rest(rest.as_ref(), since, limit).map(|nodes| (nodes, Source::Rest)).map_err(|error| match failure.sentence() {
+            (_, GhFailure::Final(sentence)) => Err(sentence.clone()),
+            (Some(rest), _) => self.read_rest(rest.as_ref(), since, limit, budget, emit).map_err(|error| match failure.sentence() {
                 Some(sentence) => format!("{sentence}; the API token read failed: {error}"),
                 None => error,
             }),
@@ -188,31 +235,34 @@ impl GitHub {
         unreachable_line(&self.credential)
     }
 
-    /// Merged pull requests through `gh`, or why `gh` gave none. A first
-    /// pull is one bounded read. An incremental pull reads the window from
-    /// `since`; a full pull reads every update time since GitHub began. A
-    /// window is split until no reply holds `WINDOW_LIMIT` rows.
-    fn read_gh(&self, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Result<Vec<Value>, GhFailure> {
-        let mut nodes = Vec::new();
+    /// Merged pull requests through `gh`, handed to `emit`, or why `gh`
+    /// gave none. A first pull is one bounded read. An incremental pull reads
+    /// the window from `since`; a full pull reads every update time since
+    /// GitHub began. A window is split until no reply holds `WINDOW_LIMIT`
+    /// rows, and each window under it goes to `emit` as it completes.
+    fn read_gh(&self, since: Option<DateTime<Utc>>, limit: Option<usize>, budget: &Budget, emit: &mut Emit<'_>) -> Result<(), GhFailure> {
         match (limit, since) {
-            (Some(_), _) => return self.run_list(&GhRead::First),
-            (None, Some(since)) => self.read_window(since, None, &mut nodes)?,
+            (Some(_), _) => {
+                budget.check().map_err(GhFailure::Final)?;
+                let rows = self.run_list(&GhRead::First)?;
+                emit(&rows, Source::Gh).map_err(GhFailure::Final)
+            }
+            (None, Some(since)) => self.read_window(since, None, budget, emit),
             (None, None) => {
                 let start = DateTime::from_timestamp(GITHUB_EPOCH_SECONDS, 0).unwrap_or_default();
-                self.read_window(start, Some(latest_update()), &mut nodes)?;
+                self.read_window(start, Some(latest_update()), budget, emit)
             }
         }
-        Ok(nodes)
     }
 
-    /// The rows of one window, or of its two halves, newer half first, when
-    /// the reply holds `WINDOW_LIMIT` rows. A one-second window at the limit
-    /// cannot be split and fails.
-    fn read_window(&self, from: DateTime<Utc>, to: Option<DateTime<Utc>>, nodes: &mut Vec<Value>) -> Result<(), GhFailure> {
+    /// One window, or its two halves, newer half first, when the reply
+    /// holds `WINDOW_LIMIT` rows. A one-second window at the limit cannot be
+    /// split and fails.
+    fn read_window(&self, from: DateTime<Utc>, to: Option<DateTime<Utc>>, budget: &Budget, emit: &mut Emit<'_>) -> Result<(), GhFailure> {
+        budget.check().map_err(GhFailure::Final)?;
         let rows = self.run_list(&GhRead::Window { from, to })?;
         if rows.len() < WINDOW_LIMIT {
-            nodes.extend(rows);
-            return Ok(());
+            return emit(&rows, Source::Gh).map_err(GhFailure::Final);
         }
         let (start, end) = (from.timestamp(), to.unwrap_or_else(latest_update).timestamp());
         if end <= start {
@@ -223,8 +273,8 @@ impl GitHub {
         }
         let middle = start + (end - start) / 2;
         let at = |seconds| DateTime::from_timestamp(seconds, 0).unwrap_or_default();
-        self.read_window(at(middle + 1), Some(at(end)), nodes)?;
-        self.read_window(at(start), Some(at(middle)), nodes)
+        self.read_window(at(middle + 1), Some(at(end)), budget, emit)?;
+        self.read_window(at(start), Some(at(middle)), budget, emit)
     }
 
     fn run_list(&self, read: &GhRead) -> Result<Vec<Value>, GhFailure> {
@@ -235,22 +285,21 @@ impl GitHub {
     }
 
     /// Merged pull requests through the REST API, most recently updated
-    /// first, stopping at `limit` or at the first one updated before `since`.
-    fn read_rest(&self, rest: &dyn Rest, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Result<Vec<Value>, String> {
-        let mut merged = Vec::new();
+    /// first, handed to `emit` page by page, stopping at `limit` or at the
+    /// first one updated before `since`.
+    fn read_rest(&self, rest: &dyn Rest, since: Option<DateTime<Utc>>, limit: Option<usize>, budget: &Budget, emit: &mut Emit<'_>) -> Result<(), String> {
+        let mut read = 0;
         for page in 1..=MAX_PAGES {
+            budget.check()?;
             let reply = rest.get(&rest_list_path(&self.repository, page))?;
             let nodes = reply.as_array().ok_or_else(|| "GitHub returned a reply that is not a list of pull requests".to_string())?;
-            let mut older = false;
-            for node in nodes {
-                older |= since.is_some_and(|since| time(node, "updated_at").is_some_and(|updated| updated < since));
-                if !node["merged_at"].is_string() || limit.is_some_and(|limit| merged.len() >= limit) {
-                    continue;
-                }
-                merged.push(node.clone());
-            }
-            if older || nodes.len() < PER_PAGE || limit.is_some_and(|limit| merged.len() >= limit) {
-                return Ok(merged);
+            let older = nodes.iter().any(|node| since.is_some_and(|since| time(node, "updated_at").is_some_and(|updated| updated < since)));
+            let room = limit.map_or(usize::MAX, |limit| limit.saturating_sub(read));
+            let merged: Vec<Value> = nodes.iter().filter(|node| node["merged_at"].is_string()).take(room).cloned().collect();
+            read += merged.len();
+            emit(&merged, Source::Rest)?;
+            if older || nodes.len() < PER_PAGE || limit.is_some_and(|limit| read >= limit) {
+                return Ok(());
             }
         }
         Err(format!("GitHub returned more than {MAX_PAGES} pages"))
@@ -261,18 +310,22 @@ impl Adapter for GitHub {
     fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
         let since = since.filter(|_| !full);
         let limit = (!full && since.is_none()).then_some(FIRST_PULL_LIMIT);
-        let (nodes, source) = self.read(since, limit)?;
-        let mut events = Vec::new();
-        for node in &nodes {
-            let event = translate(&self.repository, node, source)?;
-            if since.is_none_or(|since| event.common().occurred_at >= since) {
-                events.push(event);
+        let budget = Budget::starting_now(self.budget);
+        let repository = &self.repository;
+        let mut emit = |nodes: &[Value], source: Source| -> Result<(), String> {
+            let mut events = Vec::new();
+            for node in nodes {
+                let event = translate(repository, node, source)?;
+                if since.is_none_or(|since| event.common().occurred_at >= since) {
+                    events.push(event);
+                }
             }
-        }
-        for page in events.chunks(PER_PAGE) {
-            sink(page.to_vec())?;
-        }
-        Ok(())
+            for page in events.chunks(PER_PAGE) {
+                sink(page.to_vec())?;
+            }
+            Ok(())
+        };
+        self.read(since, limit, &budget, &mut emit)
     }
 }
 
@@ -683,15 +736,20 @@ pub(crate) mod tests {
     /// way GitHub does: the `updated:` qualifiers of `--search` filter, rows
     /// come most recently updated first, `--limit` caps them, and a reply
     /// over `RESPONSE_LIMIT` bytes is oversize.
+    #[derive(Default)]
     pub(crate) struct DatasetGh {
         pub nodes: Rc<RefCell<Vec<Value>>>,
         pub replies: Rc<RefCell<Vec<(Vec<String>, usize, usize)>>>,
+        /// Exit 1 instead of giving the Nth window that holds rows under the limit.
+        pub fail_window: Option<usize>,
+        /// Sleep this long before each reply.
+        pub delay: Duration,
     }
 
     impl DatasetGh {
         pub(crate) fn new(nodes: Vec<Value>) -> (Self, Rc<RefCell<Vec<Value>>>, Rc<RefCell<Vec<(Vec<String>, usize, usize)>>>) {
             let (nodes, replies) = (Rc::new(RefCell::new(nodes)), Rc::new(RefCell::new(vec![])));
-            (Self { nodes: nodes.clone(), replies: replies.clone() }, nodes, replies)
+            (Self { nodes: nodes.clone(), replies: replies.clone(), ..Default::default() }, nodes, replies)
         }
     }
 
@@ -726,6 +784,11 @@ pub(crate) mod tests {
             kept.sort_by_key(|r| std::cmp::Reverse(time(r, "updatedAt").unwrap()));
             kept.truncate(limit);
             let rows: Vec<Value> = kept.into_iter().cloned().collect();
+            std::thread::sleep(self.delay);
+            let windows = self.replies.borrow().iter().filter(|(_, n, _)| (1..WINDOW_LIMIT).contains(n)).count();
+            if (1..WINDOW_LIMIT).contains(&rows.len()) && self.fail_window == Some(windows + 1) {
+                return GhOutcome::Exited(Some(1));
+            }
             let bytes = serde_json::to_vec(&rows).unwrap();
             self.replies.borrow_mut().push((args.to_vec(), rows.len(), bytes.len()));
             match bytes.len() > RESPONSE_LIMIT {
@@ -832,6 +895,12 @@ pub(crate) mod tests {
         assert_eq!(numbers.len(), 1_000);
         let kept = replies.borrow().iter().filter(|(_, rows, _)| *rows < WINDOW_LIMIT).count();
         assert!(kept >= 10, "{kept} windows under the limit");
+    }
+
+    #[test]
+    fn the_budget_reads_as_minutes_or_seconds() {
+        assert_eq!(budget_sentence(PULL_BUDGET), "the read did not finish in 10 minutes; rows read so far are kept; run the pull again");
+        assert_eq!(budget_sentence(Duration::from_secs(2)), "the read did not finish in 2 seconds; rows read so far are kept; run the pull again");
     }
 
     #[test]
