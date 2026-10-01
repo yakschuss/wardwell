@@ -120,6 +120,9 @@ enum TrackerCommand {
         /// With --full, accept an empty result and remove every open issue
         #[arg(long, requires = "full")]
         allow_empty: bool,
+        /// Only bindings of this provider; repeat for several. A background refresh passes the providers that are due
+        #[arg(long)]
+        provider: Vec<String>,
     },
     /// Show last pull, last full resync, event count and readonly flag per project
     Status,
@@ -272,7 +275,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
             let token = String::from_utf8(bytes).map_err(|_| "Tracker token must be UTF-8")?;
             vec![cli::connect(&config_dir, &name, &token)?]
         }
-        TrackerCommand::Pull { project, full, allow_empty } => {
+        TrackerCommand::Pull { project, full, allow_empty, provider } => {
             use wardwell::tracker::pull::Mode;
             let only = project.clone();
             let _watchdog = wardwell::tracker::deadline::arm(wardwell::tracker::deadline::PULL_DEADLINE, move || expire_pull(only));
@@ -283,7 +286,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
                 (true, false) => Mode::Full,
                 (true, true) => Mode::FullAllowEmpty,
             };
-            cli::pull(&config, &config_dir, project.as_deref(), mode, now, &connect_provider)?
+            cli::pull_providers(&config, &config_dir, project.as_deref(), &provider, mode, now, &connect_provider)?
         }
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;

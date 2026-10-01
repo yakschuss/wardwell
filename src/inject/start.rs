@@ -134,7 +134,7 @@ mod tests {
     fn the_refresh_line_prints_once_for_repeated_session_starts() {
         struct WritesStart(std::path::PathBuf, DateTime<Utc>);
         impl crate::tracker::trigger::Spawner for WritesStart {
-            fn spawn(&self, _: &str) -> Result<(), String> {
+            fn spawn(&self, _: &str, _: &[&str]) -> Result<(), String> {
                 crate::tracker::state::record(&self.0, "linear", crate::tracker::state::Record::Started(std::process::id()), self.1)
             }
         }

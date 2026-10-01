@@ -28,7 +28,23 @@ pub fn pull(
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<Vec<String>, String> {
-    let bindings = selected(config, only)?;
+    pull_providers(config, config_dir, only, &[], mode, now, connect)
+}
+
+/// `pull`, limited to the bindings whose provider is in `providers` when it
+/// is not empty. A background refresh passes the providers that are due, so
+/// a provider held after a failure is not pulled with its healthy sibling.
+pub fn pull_providers(
+    config: &WardwellConfig,
+    config_dir: &Path,
+    only: Option<&str>,
+    providers: &[String],
+    mode: Mode,
+    now: DateTime<Utc>,
+    connect: &Connect<'_>,
+) -> Result<Vec<String>, String> {
+    let mut bindings = selected(config, only)?;
+    bindings.retain(|(_, b)| providers.is_empty() || providers.contains(&b.provider));
     let mut lines = Vec::new();
     let mut failures = Vec::new();
     for (key, binding) in &bindings {
@@ -308,6 +324,19 @@ mod tests {
         assert!(crate::tracker::state::claim(&claim, Utc::now()));
         pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         assert!(!claim.exists(), "released after a completed pull");
+    }
+
+    #[test]
+    fn a_provider_filter_pulls_only_those_providers_and_a_manual_pull_ignores_the_hold() {
+        let (dir, config) = linear_and_github();
+        let state_path = crate::tracker::state::path(dir.path(), "work", "claims");
+        crate::tracker::state::record(&state_path, "linear", crate::tracker::state::Record::Failed(FailureCode::Provider), Utc::now()).unwrap();
+        let lines = pull_providers(&config, dir.path(), Some("work/claims"), &["github".to_string()], Mode::Incremental, now(), &fake_connect).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        assert_eq!(log::read_for(&path, "linear").unwrap().last_pull_at, None, "linear was not pulled");
+        let manual = pull(&config, dir.path(), Some("work/claims"), Mode::Incremental, now(), &fake_connect).unwrap();
+        assert_eq!(manual.len(), 2, "a manual pull ignores the hold: {manual:?}");
     }
 
     #[test]

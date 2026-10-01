@@ -23,10 +23,14 @@ pub const REFRESH_AFTER: TimeDelta = TimeDelta::hours(1);
 /// The line the session that started a refresh prints.
 pub const STARTED_LINE: &str = "Refresh started in the background.";
 
-/// Starts `wardwell tracker pull --project <key>` without waiting for it.
-/// Injected so no test starts a real process.
+/// A failed provider is not due again from the trigger for this long.
+pub const HOLD_AFTER_FAILURE: TimeDelta = TimeDelta::hours(1);
+
+/// Starts `wardwell tracker pull --project <key> --provider <p>...` for the
+/// due providers without waiting for it. Injected so no test starts a real
+/// process.
 pub trait Spawner {
-    fn spawn(&self, project: &str) -> Result<(), String>;
+    fn spawn(&self, project: &str, providers: &[&str]) -> Result<(), String>;
 }
 
 /// What `refresh` did.
@@ -38,6 +42,8 @@ pub enum Outcome {
     NoBinding,
     /// Every binding pulled within the last hour.
     NotDue,
+    /// Every binding that is due failed within the last hour.
+    Held,
     /// A pull of the project is running in a live process.
     Running,
     /// A start, completion or failure is younger than the cooldown.
@@ -86,18 +92,21 @@ pub fn refresh(places: &Places<'_>, domain: &str, project: &str, now: DateTime<U
     if bindings.iter().any(|b| cooling(&of(b), now)) {
         return Outcome::Cooldown;
     }
-    let due: Vec<&TrackerBinding> = bindings.iter().copied().filter(|b| is_due(&of(b), now)).collect();
+    let stale: Vec<&TrackerBinding> = bindings.iter().copied().filter(|b| is_due(&of(b), now)).collect();
+    let due: Vec<&TrackerBinding> = stale.iter().copied().filter(|b| !held(&of(b), now)).collect();
     let pullable: Vec<&TrackerBinding> = due.iter().copied().filter(|b| (probes.can_pull)(b)).collect();
-    match (due.is_empty(), pullable.is_empty()) {
-        (true, _) => return Outcome::NotDue,
-        (false, true) => return Outcome::Blocked,
-        (false, false) => {}
+    match (stale.is_empty(), due.is_empty(), pullable.is_empty()) {
+        (true, _, _) => return Outcome::NotDue,
+        (false, true, _) => return Outcome::Held,
+        (false, false, true) => return Outcome::Blocked,
+        (false, false, false) => {}
     }
     let claim = state::claim_path(places.config_dir, domain, project);
     if !state::claim(&claim, now) {
         return Outcome::Claimed;
     }
-    match spawner.spawn(&format!("{domain}/{project}")) {
+    let providers: Vec<&str> = pullable.iter().map(|b| b.provider.as_str()).collect();
+    match spawner.spawn(&format!("{domain}/{project}"), &providers) {
         Ok(()) => Outcome::Started,
         Err(_) => {
             state::release(&claim);
@@ -177,6 +186,12 @@ fn is_due(state: &ProviderState, now: DateTime<Utc>) -> bool {
     state.completed_at.and_then(|at| age(at, now)).is_none_or(|age| age > REFRESH_AFTER)
 }
 
+/// The provider failed after its last completion, less than
+/// `HOLD_AFTER_FAILURE` ago. A failure stamped in the future counts as old.
+fn held(state: &ProviderState, now: DateTime<Utc>) -> bool {
+    state.open_failure().and_then(|(at, _)| age(at, now)).is_some_and(|age| age < HOLD_AFTER_FAILURE)
+}
+
 /// Best effort: a `spawn` failure in the state and a marker in the log for each binding.
 fn record_spawn_failure(places: &Places<'_>, state_path: &Path, bindings: &[&TrackerBinding], now: DateTime<Utc>) {
     for binding in bindings {
@@ -214,14 +229,16 @@ impl DetachedPull {
 }
 
 impl Spawner for DetachedPull {
-    fn spawn(&self, project: &str) -> Result<(), String> {
+    fn spawn(&self, project: &str, providers: &[&str]) -> Result<(), String> {
         use std::io::Write;
+        let mut args = vec!["tracker", "pull", "--project", project];
+        providers.iter().for_each(|provider| args.extend(["--provider", provider]));
         let mut log = self.open_log()?;
-        let _ = writeln!(log, "{} refresh: tracker pull --project {project}", freshness::stamp(Utc::now()));
+        let _ = writeln!(log, "{} refresh: {}", freshness::stamp(Utc::now()), args.join(" "));
         let errors = log.try_clone().map_err(|_| format!("could not open {}", self.log.display()))?;
         let mut command = std::process::Command::new(&self.program);
         command
-            .args(["tracker", "pull", "--project", project])
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(log)
             .stderr(errors);
@@ -273,8 +290,8 @@ mod tests {
     }
 
     impl Spawner for Fake {
-        fn spawn(&self, project: &str) -> Result<(), String> {
-            self.started.borrow_mut().push(project.to_string());
+        fn spawn(&self, project: &str, providers: &[&str]) -> Result<(), String> {
+            self.started.borrow_mut().push(format!("{project} {}", providers.join(",")));
             if let Some((path, pid)) = &self.records_start {
                 state::record(path, "linear", Record::Started(*pid), now()).unwrap();
             }
@@ -331,7 +348,7 @@ mod tests {
         record(&s, "linear", Record::Completed, ago(61));
         let fake = Fake::new();
         assert_eq!(run(&s, &fake, false, true), Outcome::Started);
-        assert_eq!(*fake.started.borrow(), vec!["work/claims"]);
+        assert_eq!(*fake.started.borrow(), vec!["work/claims linear"]);
     }
 
     #[test]
@@ -400,6 +417,31 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_under_an_hour_old_holds_the_provider() {
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(180));
+        record(&s, "linear", Record::Failed(FailureCode::Provider), ago(2));
+        let fake = Fake::new();
+        assert_eq!(run(&s, &fake, false, true), Outcome::Held);
+        assert!(fake.started.borrow().is_empty());
+        record(&s, "linear", Record::Failed(FailureCode::Provider), ago(61));
+        assert_eq!(run(&s, &fake, false, true), Outcome::Started, "the hold ends after an hour");
+    }
+
+    #[test]
+    fn a_held_provider_does_not_make_its_healthy_sibling_pull_again() {
+        let s = setup(true);
+        record(&s, "linear", Record::Completed, ago(180));
+        record(&s, "linear", Record::Failed(FailureCode::Auth), ago(5));
+        record(&s, "github", Record::Completed, ago(30));
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Held, "github is fresh and linear is held");
+        record(&s, "github", Record::Completed, ago(90));
+        let fake = Fake::new();
+        assert_eq!(run(&s, &fake, false, true), Outcome::Started);
+        assert_eq!(*fake.started.borrow(), vec!["work/claims github"], "only the due provider is pulled");
+    }
+
+    #[test]
     fn a_binding_that_cannot_pull_is_not_started() {
         let s = setup(false);
         let fake = Fake::new();
@@ -445,7 +487,7 @@ mod tests {
     struct Counting(std::sync::Mutex<usize>);
 
     impl Spawner for Counting {
-        fn spawn(&self, _: &str) -> Result<(), String> {
+        fn spawn(&self, _: &str, _: &[&str]) -> Result<(), String> {
             *self.0.lock().unwrap() += 1;
             Ok(())
         }
@@ -526,11 +568,11 @@ mod tests {
     fn the_detached_spawner_reports_a_missing_program_as_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let spawner = DetachedPull { program: dir.path().join("gone/wardwell"), log: dir.path().join("tracker-pull.log") };
-        let error = spawner.spawn("work/claims").unwrap_err();
+        let error = spawner.spawn("work/claims", &["github"]).unwrap_err();
         assert!(error.contains("could not start"), "{error}");
         let log = std::fs::read_to_string(dir.path().join("tracker-pull.log")).unwrap();
-        assert!(log.ends_with("refresh: tracker pull --project work/claims\n"), "{log}");
+        assert!(log.ends_with("refresh: tracker pull --project work/claims --provider github\n"), "{log}");
         let unopenable = DetachedPull { program: dir.path().join("wardwell"), log: dir.path().join("no/such/dir/log") };
-        assert!(unopenable.spawn("work/claims").unwrap_err().contains("could not open"));
+        assert!(unopenable.spawn("work/claims", &["github"]).unwrap_err().contains("could not open"));
     }
 }
