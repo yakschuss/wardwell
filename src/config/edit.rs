@@ -14,13 +14,22 @@ use std::path::{Path, PathBuf};
 /// file's shape is one this edit does not handle, with what to do instead.
 pub fn add_project_path(text: &str, key: &str, dir: &Path) -> Result<String, String> {
     let before = parse(text).map_err(|e| format!("config.yml does not parse: {e}"))?;
+    // A file written entirely with CRLF is edited as LF and written back as CRLF.
+    let crlf = text.contains("\r\n") && !text.replace("\r\n", "").contains('\n');
+    let lf = if crlf { text.replace("\r\n", "\n") } else { text.to_string() };
+    let edited = edit(&lf, key, dir)?;
+    let edited = if crlf { edited.replace('\n', "\r\n") } else { edited };
+    verify(text, &edited, &before.projects, key, dir)?;
+    Ok(edited)
+}
+
+fn edit(text: &str, key: &str, dir: &Path) -> Result<String, String> {
     let item = quoted(&dir.to_string_lossy());
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let edited = match top_level(&lines, "projects") {
         None => append_section(text, key, &item),
         Some(at) => insert_in_section(&lines, at, key, &item)?,
     };
-    verify(text, &edited, &before.projects, key, dir)?;
     Ok(edited)
 }
 
@@ -75,7 +84,11 @@ fn add_to_entry(lines: &[&str], k: usize, item: &str) -> Result<(usize, String),
     if !rest_is_empty(lines[paths], "paths:") {
         return Err(format!("`paths:` is not an indented list; {HAND_EDIT}"));
     }
-    let items_end = section_end(lines, paths + 1, indent(lines[paths]));
+    // Items sit deeper than `paths:`, or at its own indent when they start
+    // with `-`; both block-list forms are accepted.
+    let level = indent(lines[paths]);
+    let in_list = |i: usize| content(lines[i]).is_none_or(|c| indent(lines[i]) > level || (indent(lines[i]) == level && c.starts_with('-')));
+    let items_end = (paths + 1..lines.len()).find(|&i| !in_list(i)).unwrap_or(lines.len());
     let items: Vec<usize> = (paths + 1..items_end).filter(|&i| content(lines[i]).is_some_and(|c| c.starts_with('-'))).collect();
     let last = items.last().ok_or_else(|| format!("`paths:` has no items; {HAND_EDIT}"))?;
     Ok((last + 1, format!("{}- {item}\n", " ".repeat(indent(lines[*last])))))
@@ -213,5 +226,27 @@ mod tests {
     fn a_config_that_does_not_parse_is_refused() {
         let error = add_project_path("vault_path: [\n", "work/a", Path::new("/a")).unwrap_err();
         assert!(error.contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn crlf_files_keep_crlf_endings() {
+        let text = "vault_path: /tmp/v\r\nsession_sources: []\r\nprojects:\r\n  work/old:\r\n    paths:\r\n      - /code/old\r\n";
+        let out = add_project_path(text, "work/old", Path::new("/code/two")).unwrap();
+        assert_eq!(out, "vault_path: /tmp/v\r\nsession_sources: []\r\nprojects:\r\n  work/old:\r\n    paths:\r\n      - /code/old\r\n      - \"/code/two\"\r\n");
+        let out = add_project_path(&out, "work/new", Path::new("/code/new")).unwrap();
+        assert!(out.ends_with("  work/new:\r\n    paths:\r\n      - \"/code/new\"\r\n"), "{out:?}");
+        let bare = "vault_path: /tmp/v\r\nsession_sources: []\r\n";
+        let out = add_project_path(bare, "work/new", Path::new("/code/new")).unwrap();
+        assert_eq!(out, format!("{bare}\r\nprojects:\r\n  work/new:\r\n    paths:\r\n      - \"/code/new\"\r\n"));
+        assert!(!out.replace("\r\n", "").contains('\n'), "no bare LF: {out:?}");
+    }
+
+    #[test]
+    fn a_list_at_the_same_indent_as_paths_gains_an_item_in_that_form() {
+        let text = "vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/old:\n    paths:\n    - /code/old\n    # spare\n  work/b:\n    paths:\n    - /code/b\n";
+        let out = add_project_path(text, "work/old", Path::new("/code/two")).unwrap();
+        assert_eq!(out, "vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/old:\n    paths:\n    - /code/old\n    - \"/code/two\"\n    # spare\n  work/b:\n    paths:\n    - /code/b\n");
+        let out = add_project_path(text, "work/new", Path::new("/code/new")).unwrap();
+        assert!(out.ends_with("    - /code/b\n  work/new:\n    paths:\n      - \"/code/new\"\n"), "{out}");
     }
 }
