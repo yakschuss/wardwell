@@ -34,8 +34,11 @@ pub trait Spawner {
 }
 
 /// What `refresh` did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
+    /// The refresh state cannot be written at this path, so a pull could
+    /// not record itself; nothing starts.
+    StateUnwritable(PathBuf),
     /// A detached pull was started.
     Started,
     /// The project has no tracker binding.
@@ -103,6 +106,9 @@ pub fn refresh(places: &Places<'_>, domain: &str, project: &str, now: DateTime<U
         (false, false, true) => return Outcome::Blocked,
         (false, false, false) => {}
     }
+    if let Err(path) = state::check_writable(places.config_dir, domain, project) {
+        return Outcome::StateUnwritable(path);
+    }
     let claim = state::claim_path(places.config_dir, domain, project);
     if !state::claim(&claim, now) {
         return Outcome::Claimed;
@@ -146,6 +152,7 @@ pub fn refresh_bound(config: &WardwellConfig, refresh: &dyn Fn(&str, &str) -> Ou
         .filter_map(|(domain, project)| match refresh(domain, project) {
             Outcome::Started => Some(format!("tracker refresh started for {domain}/{project}")),
             Outcome::SpawnFailed => Some(format!("tracker refresh for {domain}/{project} could not start (spawn)")),
+            Outcome::StateUnwritable(path) => Some(format!("tracker refresh for {domain}/{project} cannot write its state at {}", path.display())),
             _ => None,
         })
         .collect()
@@ -536,6 +543,29 @@ mod tests {
         assert_eq!(outcome, Outcome::SpawnFailed);
         assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
         assert_eq!(state::provider(&s.state, "linear").unwrap().open_failure(), Some((now(), FailureCode::Spawn)), "the local state holds it first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_refresh_location_starts_nothing_and_names_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = setup(false);
+        let folder = s.state.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&s.state).unwrap();
+        let fake = Fake::new();
+        assert_eq!(run(&s, &fake, false, true), Outcome::StateUnwritable(s.state.clone()), "a directory at the state path");
+        assert_eq!(run(&s, &fake, false, true), Outcome::StateUnwritable(s.state.clone()), "and again, without a start");
+        std::fs::remove_dir(&s.state).unwrap();
+        std::fs::remove_dir(&folder).unwrap();
+        std::fs::write(&folder, "a file").unwrap();
+        assert_eq!(run(&s, &fake, false, true), Outcome::StateUnwritable(folder.clone()), "a file at the folder path");
+        std::fs::remove_file(&folder).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = run(&s, &fake, false, true);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(outcome, Outcome::StateUnwritable(folder.clone()), "a folder that cannot be written");
+        assert!(fake.started.borrow().is_empty(), "nothing started");
     }
 
     #[test]

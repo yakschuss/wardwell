@@ -112,6 +112,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for row in mirror_rows(&config, &config_dir(), chrono::Utc::now()) {
                     println!("{row}");
                 }
+                let (rows, refresh_ok) = refresh_state_rows(&config, &config_dir());
+                for row in rows {
+                    println!("{row}");
+                }
+                all_ok &= refresh_ok;
 
                 // MCP configs
                 let mcp_paths = McpConfigPaths::detect();
@@ -368,6 +373,25 @@ fn mirror_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path
             format!("  {label:<38} {}", freshness_words(config, config_dir, binding, now))
         })
         .collect()
+}
+
+/// One failing row per bound project whose refresh state cannot be
+/// written; none when every one can. The bool is false when a row failed.
+fn refresh_state_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
+    let mut projects: Vec<(&str, &str)> = Vec::new();
+    for binding in &config.trackers {
+        if !projects.contains(&(binding.domain.as_str(), binding.project.as_str())) {
+            projects.push((binding.domain.as_str(), binding.project.as_str()));
+        }
+    }
+    let rows: Vec<String> = projects
+        .into_iter()
+        .filter_map(|(domain, project)| crate::tracker::state::check_writable(config_dir, domain, project).err().map(|path| {
+            format!("  {:<38} \u{2717} Refresh state cannot be written at {}.", format!("Refresh {domain}/{project}"), path.display())
+        }))
+        .collect();
+    let ok = rows.is_empty();
+    (rows, ok)
 }
 
 /// The freshness words for one binding, read from its log.
@@ -739,6 +763,20 @@ mod tests {
         let rows = mirror_rows(&config, dir.path(), chrono::Utc::now());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn doctor_fails_a_refresh_state_that_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let cfg = dir.path().join("cfg");
+        assert_eq!(refresh_state_rows(&config, &cfg), (vec![], true));
+        let state = crate::tracker::state::path(&cfg, "work", "claims");
+        std::fs::remove_file(crate::tracker::state::path(&cfg, "work", "claims")).ok();
+        std::fs::create_dir_all(&state).unwrap();
+        let (rows, ok) = refresh_state_rows(&config, &cfg);
+        assert!(!ok);
+        assert_eq!(rows, vec![format!("  {:<38} \u{2717} Refresh state cannot be written at {}.", "Refresh work/claims", state.display())]);
     }
 
     #[test]

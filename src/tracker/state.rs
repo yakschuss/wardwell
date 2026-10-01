@@ -132,6 +132,28 @@ pub fn release(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Whether the project's state file can be written: the refresh folder
+/// and the domain folder are folders or can be made, the state path is not
+/// a folder, and a file can be created in the domain folder. The error is
+/// the path at fault.
+pub fn check_writable(config_dir: &Path, domain: &str, project: &str) -> Result<(), PathBuf> {
+    let state = path(config_dir, domain, project);
+    let folder = state.parent().map(Path::to_path_buf).unwrap_or_else(|| config_dir.join(DIR));
+    for dir in [config_dir.join(DIR), folder.clone()] {
+        if dir.exists() && !dir.is_dir() {
+            return Err(dir);
+        }
+    }
+    if state.exists() && !state.is_file() {
+        return Err(state);
+    }
+    std::fs::create_dir_all(&folder).map_err(|_| folder.clone())?;
+    let probe = folder.join(format!(".probe.{}", uuid::Uuid::new_v4()));
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).map_err(|_| folder.clone())?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
+}
+
 /// The state at `path`.
 pub fn read(path: &Path) -> Read {
     match std::fs::read(path) {
