@@ -40,6 +40,13 @@ and its arguments are exactly Wardwell's. Each changed file is saved beside
 itself first, with owner-only permissions, and written through a temp file
 and a rename.
 
+A rewrite of `~/.claude/settings.json` uses two-space indentation, LF line
+ends, and a final newline. Key order, number text and string escapes stay as
+you wrote them. A file already in that layout stays byte-identical outside
+Wardwell's entries. When a rewrite will change the file's layout, the plan
+line says "UPDATE + BACKUP, reformats the file", and the backup keeps the
+original.
+
 `setup` installs in two tiers:
 
 - **Memory, always.** The session-start hook and the Stop hook in

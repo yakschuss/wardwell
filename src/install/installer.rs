@@ -28,9 +28,13 @@ pub const PULL_INTERVAL: u32 = 3600;
 pub enum Action {
     Create,
     UpdateBackup,
+    /// UPDATE + BACKUP of a file whose layout the rewrite changes.
+    UpdateReformat,
     /// A Wardwell-generated file replaced whole; nothing of the user's is in it.
     Update,
     Remove,
+    /// REMOVE + BACKUP of a file whose layout the rewrite changes.
+    RemoveReformat,
     /// A Wardwell-generated file deleted; nothing of the user's is in it.
     Delete,
     /// A step not taken because its input could not be read.
@@ -45,8 +49,10 @@ impl Action {
         match self {
             Action::Create => "CREATE",
             Action::UpdateBackup => "UPDATE + BACKUP",
+            Action::UpdateReformat => "UPDATE + BACKUP, reformats the file",
             Action::Update => "UPDATE",
             Action::Remove => "REMOVE + BACKUP",
+            Action::RemoveReformat => "REMOVE + BACKUP, reformats the file",
             Action::Delete => "REMOVE",
             Action::Skipped => "SKIPPED",
             Action::Unchanged => "UNCHANGED",
@@ -148,7 +154,7 @@ impl Plan {
 
     /// Labels of the lines that remove something, for a summary after apply.
     pub fn removals(&self) -> Vec<String> {
-        self.lines.iter().filter(|line| matches!(line.action, Action::Remove | Action::Delete)).map(|line| line.label.clone()).collect()
+        self.lines.iter().filter(|line| matches!(line.action, Action::Remove | Action::RemoveReformat | Action::Delete)).map(|line| line.label.clone()).collect()
     }
 
     /// What the user must do before the change is active, said honestly.
@@ -188,6 +194,9 @@ struct Draft {
     before: Option<Vec<u8>>,
     /// The original text as a document, so a rewrite keeps what the user wrote.
     doc: Option<json_doc::Node>,
+    /// True when any rewrite changes the file's layout: it is not already
+    /// two-space indented, LF, with a final newline.
+    reformats: bool,
     original: Value,
     value: Value,
     removing: bool,
@@ -222,18 +231,24 @@ impl Draft {
             Some(Err(_)) => return Err(format!("{} is not UTF-8; no files changed", path.display())),
             _ => None,
         };
-        Ok(Draft { path, before, doc, original: value.clone(), value, removing })
+        let reformats = match (&doc, before.as_deref()) {
+            (Some(doc), Some(bytes)) => json_doc::render(&json_doc::reconcile(doc, &value)).as_bytes() != bytes,
+            _ => false,
+        };
+        Ok(Draft { path, before, doc, reformats, original: value.clone(), value, removing })
     }
 
     /// Apply one edit and record its plan line.
     fn step(&mut self, lines: &mut Vec<Line>, label: String, edit: impl FnOnce(&mut Value) -> Result<(), String>) -> Result<(), String> {
         let previous = self.value.clone();
         edit(&mut self.value)?;
-        let action = match (self.value == previous, self.removing, self.before.is_some()) {
-            (true, _, _) => Action::Unchanged,
-            (false, true, _) => Action::Remove,
-            (false, false, true) => Action::UpdateBackup,
-            (false, false, false) => Action::Create,
+        let action = match (self.value == previous, self.removing, self.before.is_some(), self.reformats) {
+            (true, _, _, _) => Action::Unchanged,
+            (false, true, _, false) => Action::Remove,
+            (false, true, _, true) => Action::RemoveReformat,
+            (false, false, true, false) => Action::UpdateBackup,
+            (false, false, true, true) => Action::UpdateReformat,
+            (false, false, false, _) => Action::Create,
         };
         lines.push(Line { action, label, path: Some(self.path.clone()) });
         Ok(())
@@ -738,7 +753,9 @@ mod tests {
     fn put_settings(h: &Home, value: Value) {
         let path = settings_path(&h.home);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        let mut text = serde_json::to_vec_pretty(&value).unwrap();
+        text.push(b'\n');
+        fs::write(path, text).unwrap();
     }
 
     fn rendered(plan: &Plan) -> String {
@@ -953,6 +970,29 @@ mod tests {
         assert!(after.contains("\"timeout\": 2e0"), "{after}");
         assert!(!after.contains("linear-gate.py"), "{after}");
         assert!(after.contains("\"matcher\": \"mcp__linear__.*\""), "{after}");
+    }
+
+    #[test]
+    fn the_plan_says_when_a_rewrite_reformats_the_file() {
+        let h = home();
+        let path = settings_path(&h.home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (text, reformats) in [
+            ("{\n  \"model\": \"keep\"\n}\n", false),
+            ("{\n    \"model\": \"keep\"\n}\n", true),
+            ("{\r\n  \"model\": \"keep\"\r\n}\r\n", true),
+            ("{\n  \"model\": \"keep\"\n}", true),
+        ] {
+            fs::write(&path, text).unwrap();
+            let plan = plan_for(&h, &BTreeMap::new(), false);
+            let line = plan.lines.iter().find(|l| l.label.starts_with("Session start hook")).unwrap().render();
+            assert!(line.contains("UPDATE + BACKUP"), "{line}");
+            assert_eq!(line.contains("UPDATE + BACKUP, reformats the file"), reformats, "{text:?}: {line}");
+        }
+        fs::write(&path, "{\n  \"model\": \"keep\"\n}\n").unwrap();
+        run(&h, &BTreeMap::new());
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with("{\n  \"model\": \"keep\",\n  \"hooks\": {"), "{after}");
     }
 
     #[test]

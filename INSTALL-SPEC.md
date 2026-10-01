@@ -109,7 +109,7 @@ Sets up or repairs this computer. Never reads or changes the vault.
 - Each file is checked again just before it is written. A file changed since the preview stops the run.
 - Backs up each changed file beside it, mode 0600. Writes through a temp file and a rename.
 - Ownership is exact. A hook handler is Wardwell's only when its program's file name is `wardwell` or `wardwell-<digits>.<digits>...` and its arguments are exactly Wardwell's. A substring never matches. A Wardwell handler under a matcher the user chose counts as installed: setup updates its command in place and leaves the matcher; uninstall removes that handler and leaves the rest of the group. Doctor fails the gate row when that matcher does not match Linear writes.
-- Rewrites keep what the user wrote: key order, number text, and the file's permission mode.
+- Rewrites keep what the user wrote: key order, number text, string escapes, and the file's permission mode. The layout is two-space indentation, LF, and a final newline; a file already in that layout stays byte-identical outside Wardwell's entries. When a rewrite changes the layout, the plan line says "UPDATE + BACKUP, reformats the file".
 
 ### Tier one: memory, always planned
 
