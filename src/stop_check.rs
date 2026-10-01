@@ -78,7 +78,7 @@ impl Check<'_> {
         claim(&marker)?;
         let key = format!("{domain}/{project}");
         log(self.state_dir, &json!({"at": Utc::now().to_rfc3339(), "session_id": session, "project": key, "commits": commits, "since": start.to_rfc3339()}));
-        Some(reason(commits, start, &key))
+        Some(reason(commits, start, &key, Local::now().date_naive()))
     }
 }
 
@@ -111,23 +111,19 @@ pub fn last_block(state_dir: &Path, key: &str) -> Option<(DateTime<Utc>, u64)> {
 }
 
 /// `2 commits since 14:02, no history entry. Run ...`
-fn reason(commits: usize, start: DateTime<Utc>, key: &str) -> String {
+fn reason(commits: usize, start: DateTime<Utc>, key: &str, today: NaiveDate) -> String {
     let local = start.with_timezone(&Local);
-    let when = if local.date_naive() == Local::now().date_naive() { local.format("%H:%M") } else { local.format("%b %-d %H:%M") };
+    let when = if local.date_naive() == today { local.format("%H:%M") } else { local.format("%b %-d %H:%M") };
     let noun = if commits == 1 { "commit" } else { "commits" };
     format!("{commits} {noun} since {when}, no history entry. Run wardwell_write append_history for {key}, or set WARDWELL_STOP_CHECK=off.")
 }
 
-/// True when the newest history entry was written at or after `start`. An
-/// entry with a date and no time counts from that date on.
+/// True when the newest history entry was written at or after `start`.
+/// Every writer stamps a full RFC 3339 time; anything else is not proof.
 fn history_since(project_dir: &Path, start: DateTime<Utc>) -> bool {
-    let Some(stamp) = crate::inject::session::last_history_stamp(project_dir) else {
-        return false;
-    };
-    match DateTime::parse_from_rfc3339(&stamp) {
-        Ok(at) => at >= start,
-        Err(_) => stamp.get(..10).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()).is_some_and(|d| d >= start.date_naive()),
-    }
+    crate::inject::session::last_history_stamp(project_dir)
+        .and_then(|stamp| DateTime::parse_from_rfc3339(&stamp).ok())
+        .is_some_and(|at| at >= start)
 }
 
 /// Create the once marker. None when it exists or cannot be written, so a
@@ -378,5 +374,34 @@ mod tests {
             .evaluate(&payload(&f, "s-1", false), |s| crate::companion::lifecycle::session_started_at_in(&base, crate::companion::lifecycle::Client::Claude, s));
         assert!(began.elapsed() < BUDGET, "{:?}", began.elapsed());
         assert!(blocked.is_some_and(|r| r.starts_with("1 commit since")));
+    }
+
+    #[test]
+    fn the_reason_names_the_day_when_the_session_began_on_another_day() {
+        use chrono::TimeZone;
+        let start = Local.with_ymd_and_hms(2026, 9, 29, 13, 5, 0).unwrap().with_timezone(&Utc);
+        let same = reason(1, start, "work/a", NaiveDate::from_ymd_opt(2026, 9, 29).unwrap());
+        assert!(same.starts_with("1 commit since 13:05, no history entry."), "{same}");
+        let other = reason(2, start, "work/a", NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
+        assert!(other.starts_with("2 commits since Sep 29 13:05, no history entry."), "{other}");
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_written_allows_and_logs_nothing() {
+        let f = fixture();
+        after_start(&f, 1);
+        std::fs::create_dir_all(f.state.parent().unwrap()).unwrap();
+        std::fs::write(&f.state, "a file where the state folder should be").unwrap();
+        assert_eq!(eval(&f, "s-1"), None);
+        assert!(f.state.is_file(), "nothing was created under it");
+    }
+
+    #[test]
+    fn a_date_only_history_entry_is_not_proof() {
+        let f = fixture();
+        after_start(&f, 1);
+        let today = Utc::now().date_naive();
+        std::fs::write(f.project.join("history.jsonl"), format!("{{\"date\":\"{today}\",\"title\":\"x\"}}\n")).unwrap();
+        assert!(eval(&f, "s-1").is_some());
     }
 }

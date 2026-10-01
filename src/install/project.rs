@@ -373,4 +373,39 @@ mod tests {
             assert!(error.contains("is not <domain>/<project>"), "{key}: {error}");
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_keeps_the_permissions_of_config_yml() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o644, 0o640] {
+            let f = fixture();
+            let path = f.cfg.join("config.yml");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, mode);
+        }
+    }
+
+    #[test]
+    fn a_config_changed_after_the_plan_is_not_overwritten() {
+        let f = fixture();
+        let path = f.cfg.join("config.yml");
+        let planned = config_text(&f);
+        std::fs::write(&path, format!("{planned}# edited by hand\n")).unwrap();
+        let error = write(&path, &planned, "vault_path: /x\n").unwrap_err();
+        assert!(error.contains("config.yml changed while the plan was made"), "{error}");
+        assert!(config_text(&f).ends_with("# edited by hand\n"));
+        assert!(backups(&f).is_empty());
+    }
+
+    #[test]
+    fn several_vault_projects_with_the_directory_name_need_a_key() {
+        let f = fixture();
+        let vault = parse(&config_text(&f)).unwrap().vault_path;
+        std::fs::create_dir_all(vault.join("work/corrtex")).unwrap();
+        let error = run(&f, None, &f.code, false, true).unwrap_err();
+        assert!(error.contains("Several vault projects are named corrtex: personal/corrtex, work/corrtex"), "{error}");
+        assert!(backups(&f).is_empty());
+    }
 }
