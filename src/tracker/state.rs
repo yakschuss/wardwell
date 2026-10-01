@@ -89,9 +89,13 @@ pub const CLAIM_FOR: chrono::TimeDelta = chrono::TimeDelta::minutes(20);
 
 /// Take the claim at `path`: create it new, holding this process's id and
 /// `now`. An existing claim younger than `CLAIM_FOR` by its modified time,
-/// against the wall clock, wins and this returns false. An older one, or one stamped in the future,
-/// is moved aside by a rename, which only one taker can do, and the claim
-/// is created again.
+/// against the wall clock, wins and this returns false. An older one, or one
+/// stamped in the future, is renamed aside to a unique name; the moved file's
+/// own age is then checked, since another taker may have just replaced the
+/// stale claim. A young moved file goes back when no claim exists, and this
+/// returns false. Only after that is the claim created, with create-new. The
+/// replacement runs under a short advisory lock on `<claim>.lock`, so takers
+/// that saw the same stale claim decide one at a time.
 pub fn claim(path: &Path, now: DateTime<Utc>) -> bool {
     if let Some(parent) = path.parent()
         && std::fs::create_dir_all(parent).is_err()
@@ -101,19 +105,55 @@ pub fn claim(path: &Path, now: DateTime<Utc>) -> bool {
     if create_claim(path, now) {
         return true;
     }
-    let fresh = std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|modified| Utc::now() - DateTime::<Utc>::from(modified))
-        .is_ok_and(|age| age >= chrono::TimeDelta::zero() && age < CLAIM_FOR);
-    if fresh {
+    if young(path) {
+        return false;
+    }
+    let Some(_guard) = guard(&path.with_extension("claim.lock")) else {
+        return false;
+    };
+    replace_stale(path, now)
+}
+
+/// An advisory lock on `path`, waiting up to two seconds; released on drop.
+fn guard(path: &Path) -> Option<std::fs::File> {
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Under the guard: move the stale claim aside, put it back when it turns
+/// out young, else create the claim.
+fn replace_stale(path: &Path, now: DateTime<Utc>) -> bool {
+    // Another holder may have replaced it while this one waited.
+    if young(path) {
         return false;
     }
     let aside = path.with_extension(format!("claim.stale.{}", uuid::Uuid::new_v4()));
     if std::fs::rename(path, &aside).is_err() {
+        return create_claim(path, now);
+    }
+    if young(&aside) {
+        // A hard link fails when a claim exists, so this never replaces one.
+        let _ = std::fs::hard_link(&aside, path);
+        let _ = std::fs::remove_file(&aside);
         return false;
     }
     let _ = std::fs::remove_file(&aside);
     create_claim(path, now)
+}
+
+/// The file's modified time is under `CLAIM_FOR` old and not in the future.
+fn young(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|modified| Utc::now() - DateTime::<Utc>::from(modified))
+        .is_ok_and(|age| age >= chrono::TimeDelta::zero() && age < CLAIM_FOR)
 }
 
 fn create_claim(path: &Path, now: DateTime<Utc>) -> bool {
@@ -285,6 +325,30 @@ mod tests {
         release(&file);
         assert!(!file.exists());
         assert!(claim(&file, now));
+    }
+
+    #[test]
+    fn thirty_takers_against_one_stale_claim_leave_exactly_one_winner_each_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = claim_path(dir.path(), "work", "claims");
+        for round in 0..50 {
+            assert!(claim(&file, Utc::now()) || file.exists());
+            age_claim(&file, chrono::TimeDelta::minutes(30));
+            let barrier = std::sync::Barrier::new(30);
+            let winners: usize = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..30)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            usize::from(claim(&file, Utc::now()))
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).sum()
+            });
+            assert_eq!(winners, 1, "round {round}");
+            assert!(file.exists(), "round {round}: a claim is held");
+        }
     }
 
     #[test]
