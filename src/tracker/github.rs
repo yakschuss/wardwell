@@ -24,7 +24,7 @@ const SEARCH_LIMIT: usize = 1_000;
 /// A full `gh` read lists every merged pull request up to this many.
 const FULL_LIMIT: usize = 100_000;
 /// The `gh pr list` fields the adapter reads.
-pub const GH_FIELDS: &str = "number,title,body,author,mergedAt,url,baseRefName,id";
+pub const GH_FIELDS: &str = "number,title,body,author,mergedAt,url,baseRefName,id,updatedAt";
 const PER_PAGE: usize = 100;
 /// Upper bound on REST pages per pull so a misbehaving reply cannot loop forever.
 const MAX_PAGES: usize = 1_000;
@@ -284,10 +284,10 @@ pub fn unreachable_line(credential: &str) -> String {
 
 /// The arguments of the `gh pr list` read. A first pull asks for the
 /// `FIRST_PULL_LIMIT` most recently updated; an incremental pull searches
-/// for those merged at or after `since`; a full pull lists every one.
+/// for merged ones updated at or after `since`; a full pull lists every one.
 pub fn gh_list_args(repository: &str, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Vec<String> {
     let (limit, search) = match (since, limit) {
-        (Some(since), _) => (SEARCH_LIMIT, Some(format!("merged:>={} sort:updated-desc", since.to_rfc3339_opts(SecondsFormat::Secs, true)))),
+        (Some(since), _) => (SEARCH_LIMIT, Some(format!("is:merged updated:>={} sort:updated-desc", since.to_rfc3339_opts(SecondsFormat::Secs, true)))),
         (None, Some(limit)) => (limit, Some("sort:updated-desc".to_string())),
         (None, None) => (FULL_LIMIT, None),
     };
@@ -316,15 +316,17 @@ enum Source {
     Rest,
 }
 
-/// One merged pull request node as a `change_merged` event. The id is
-/// stable, so a re-pull of the same pull request appends nothing.
+/// One merged pull request node as a `change_merged` event at the pull
+/// request's update time, the time the GitHub cursor follows. The id is
+/// stable; the log appends a revision only when the content changed.
 fn translate(repository: &str, node: &Value, source: Source) -> Result<Event, String> {
-    let (merged_key, author, url, base, id) = match source {
-        Source::Gh => ("mergedAt", &node["author"]["login"], "url", &node["baseRefName"], "id"),
-        Source::Rest => ("merged_at", &node["user"]["login"], "html_url", &node["base"]["ref"], "node_id"),
+    let (merged_key, updated_key, author, url, base, id) = match source {
+        Source::Gh => ("mergedAt", "updatedAt", &node["author"]["login"], "url", &node["baseRefName"], "id"),
+        Source::Rest => ("merged_at", "updated_at", &node["user"]["login"], "html_url", &node["base"]["ref"], "node_id"),
     };
     let number = node["number"].as_u64().ok_or_else(|| "GitHub pull request without a number".to_string())?;
     let merged_at = time(node, merged_key).ok_or_else(|| format!("GitHub pull request #{number} without a merge time"))?;
+    let updated_at = time(node, updated_key).unwrap_or(merged_at).max(merged_at);
     let title = node["title"].as_str().unwrap_or_default().to_string();
     let base_branch = base.as_str().map(str::to_string);
     let reference = format!("{repository}#{number}");
@@ -346,7 +348,7 @@ fn translate(repository: &str, node: &Value, source: Source) -> Result<Event, St
             external_key: reference.clone(),
             external_id: node[id].as_str().map_or_else(|| number.to_string(), str::to_string),
             actor: change.author.clone(),
-            occurred_at: merged_at,
+            occurred_at: updated_at,
             title: format!("{reference} merged{into}: {title}"),
             raw: node.clone(),
         },
@@ -600,6 +602,66 @@ pub(crate) mod tests {
         })
     }
 
+    /// A `gh pr list` node for pull request `number`, merged at `merged` and
+    /// last updated at `updated`.
+    pub(crate) fn pr(number: u64, title: &str, body: &str, merged: DateTime<Utc>, updated: DateTime<Utc>) -> Value {
+        json!({
+            "number": number, "title": title, "body": body, "author": {"login": "jdoe"},
+            "mergedAt": merged.to_rfc3339(), "updatedAt": updated.to_rfc3339(),
+            "url": format!("https://github.com/acme/app/pull/{number}"), "baseRefName": "main", "id": format!("PR_{number}")
+        })
+    }
+
+    /// A `gh` over a set of merged pull requests that answers `pr list` the
+    /// way GitHub does: the `updated:` qualifiers of `--search` filter, rows
+    /// come most recently updated first, `--limit` caps them, and a reply
+    /// over `RESPONSE_LIMIT` bytes is oversize.
+    pub(crate) struct DatasetGh {
+        pub nodes: Rc<RefCell<Vec<Value>>>,
+        pub replies: Rc<RefCell<Vec<(Vec<String>, usize, usize)>>>,
+    }
+
+    impl DatasetGh {
+        pub(crate) fn new(nodes: Vec<Value>) -> (Self, Rc<RefCell<Vec<Value>>>, Rc<RefCell<Vec<(Vec<String>, usize, usize)>>>) {
+            let (nodes, replies) = (Rc::new(RefCell::new(nodes)), Rc::new(RefCell::new(vec![])));
+            (Self { nodes: nodes.clone(), replies: replies.clone() }, nodes, replies)
+        }
+    }
+
+    fn after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    }
+
+    fn stamp(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text).unwrap().with_timezone(&Utc)
+    }
+
+    impl GhRunner for DatasetGh {
+        fn run(&self, args: &[String]) -> GhOutcome {
+            if args.first().is_some_and(|a| a == "repo") {
+                return GhOutcome::Output(b"{}".to_vec());
+            }
+            let limit: usize = after(args, "--limit").unwrap().parse().unwrap();
+            let search = after(args, "--search").unwrap_or_default();
+            let mut rows: Vec<Value> = self.nodes.borrow().clone();
+            for term in search.split_whitespace() {
+                if let Some(from) = term.strip_prefix("updated:>=") {
+                    rows.retain(|r| time(r, "updatedAt").unwrap() >= stamp(from));
+                } else if let Some((from, to)) = term.strip_prefix("updated:").and_then(|t| t.split_once("..")) {
+                    rows.retain(|r| (stamp(from)..=stamp(to)).contains(&time(r, "updatedAt").unwrap()));
+                }
+            }
+            rows.sort_by_key(|r| std::cmp::Reverse(time(r, "updatedAt").unwrap()));
+            rows.truncate(limit);
+            let bytes = serde_json::to_vec(&rows).unwrap();
+            self.replies.borrow_mut().push((args.to_vec(), rows.len(), bytes.len()));
+            match bytes.len() > RESPONSE_LIMIT {
+                true => GhOutcome::Oversize(RESPONSE_LIMIT),
+                false => GhOutcome::Output(bytes),
+            }
+        }
+    }
+
     /// A REST pull request node updated at `hour`, merged then when `merged`.
     fn rest_node(number: u64, hour: u32, merged: bool) -> Value {
         json!({
@@ -661,10 +723,11 @@ pub(crate) mod tests {
     #[test]
     fn gh_arguments_bound_the_first_pull_search_from_the_cursor_and_list_all_on_full() {
         let fields = GH_FIELDS;
+        assert!(fields.ends_with(",updatedAt"), "{fields}");
         let first = gh_list_args("acme/app", None, Some(FIRST_PULL_LIMIT)).join(" ");
         assert_eq!(first, format!("pr list --repo acme/app --state merged --limit 200 --json {fields} --search sort:updated-desc"));
         let since = gh_list_args("acme/app", Some(at(9)), None).join(" ");
-        assert_eq!(since, format!("pr list --repo acme/app --state merged --limit 1000 --json {fields} --search merged:>=2026-09-01T09:00:00Z sort:updated-desc"));
+        assert_eq!(since, format!("pr list --repo acme/app --state merged --limit 1000 --json {fields} --search is:merged updated:>=2026-09-01T09:00:00Z sort:updated-desc"));
         let full = gh_list_args("acme/app", None, None).join(" ");
         assert_eq!(full, format!("pr list --repo acme/app --state merged --limit 100000 --json {fields}"));
 

@@ -209,6 +209,17 @@ pub struct MergedChange {
     pub keys: Vec<String>,
 }
 
+impl MergedChange {
+    /// Short stable fingerprint of what a reader of the change sees: the
+    /// title, the body and the keys. An update that leaves them alone, such
+    /// as a new comment, keeps it.
+    pub fn content_digest(&self) -> String {
+        let canonical = serde_json::json!([self.title, self.body, self.keys]);
+        let digest = sha2::Sha256::digest(canonical.to_string().as_bytes());
+        digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    }
+}
+
 /// Full field snapshot of an issue at `occurred_at`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IssueSnapshot {

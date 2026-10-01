@@ -788,6 +788,106 @@ mod tests {
         assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(10)));
     }
 
+    /// Minute `m` after 2026-09-01T00:00:00Z.
+    fn minute(m: i64) -> DateTime<Utc> {
+        at(0) + TimeDelta::minutes(m)
+    }
+
+    fn dataset_adapter(gh: crate::tracker::github::tests::DatasetGh) -> GitHub {
+        github_for(&github(), None, Box::new(gh))
+    }
+
+    /// Chunk headings the real index returns for `query` over the vault.
+    fn search(vault: &Path, query: &str) -> Vec<String> {
+        let store = crate::index::store::IndexStore::in_memory().unwrap();
+        crate::index::builder::IndexBuilder::full_build(&store, vault, None).unwrap();
+        store.chunk_fts_search(query, 20, None).unwrap().into_iter().filter_map(|(id, _)| store.get_chunk(&id).ok().and_then(|c| c.2)).collect()
+    }
+
+    #[test]
+    fn a_pull_request_retitled_after_merge_gains_its_new_key_and_search_finds_it() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let (gh, nodes, replies) = DatasetGh::new(vec![pr(42, "Fix the claims inbox", "Body", minute(10), minute(10))]);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(minute(10)));
+
+        nodes.borrow_mut()[0] = pr(42, "COR-77 Fix the claims inbox", "Body", minute(10), minute(90));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: replies.clone() };
+        let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(100)).unwrap();
+        assert_eq!(outcome.appended, 1, "the retitle is a new revision");
+        assert!(replies.borrow().last().unwrap().0.join(" ").contains("--search is:merged updated:>=2026-08-31T23:10:00Z sort:updated-desc"), "{:?}", replies.borrow());
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.cursor, Some(minute(90)), "the cursor is the newest update time");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"id\":\"github:acme/app#42:rev:"), "{content}");
+        assert!(content.contains("\"keys\":[\"COR-77\"]"), "{content}");
+        let found = search(vault.path(), "COR-77");
+        assert_eq!(found, vec!["acme/app#42 merged into main: COR-77 Fix the claims inbox"]);
+    }
+
+    #[test]
+    fn a_comment_only_update_appends_nothing_and_full_repairs_keys() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let (gh, nodes, _) = DatasetGh::new(vec![pr(42, "COR-12 Fix", "Body", minute(10), minute(10))]);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
+        nodes.borrow_mut()[0] = pr(42, "COR-12 Fix", "Body", minute(10), minute(50));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(60)).unwrap();
+        assert_eq!(outcome.appended, 0, "a comment moves the update time, not the content");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(minute(50)));
+
+        // Keys behind the cursor, as an earlier build parsed them, are out
+        // of reach of an incremental pull; --full repairs them.
+        nodes.borrow_mut().push(pr(43, "Later", "Body", minute(300), minute(300)));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(310)).unwrap();
+        nodes.borrow_mut()[0] = pr(42, "COR-12 COR-13 Fix", "Body", minute(10), minute(50));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let missed = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(320)).unwrap();
+        assert_eq!(missed.appended, 0);
+        assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12"]);
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let full = pull_project(vault.path(), &github(), &dataset_adapter(gh), true, minute(330)).unwrap();
+        assert_eq!(full.appended, 1);
+        assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12", "COR-13"]);
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        assert_eq!(pull_project(vault.path(), &github(), &dataset_adapter(gh), true, minute(340)).unwrap().appended, 0);
+    }
+
+    #[test]
+    fn the_first_pull_of_200_then_an_incremental_pull_leaves_nothing_after_its_oldest_row_unmirrored() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let rows: Vec<serde_json::Value> = (1..=300).map(|n| pr(n, &format!("Change {n}"), "Body", minute(n as i64), minute(n as i64))).collect();
+        let (gh, nodes, _) = DatasetGh::new(rows);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(400)).unwrap();
+        let oldest = minute(101);
+        assert_eq!(log::read_for(&path, "github").unwrap().changes.len(), 200);
+
+        // After the first pull: an old one is edited, a mirrored one is edited, a new one merges.
+        nodes.borrow_mut()[49] = pr(50, "COR-50 Change 50", "Body", minute(50), minute(500));
+        nodes.borrow_mut()[199] = pr(200, "Change 200", "New body", minute(200), minute(501));
+        nodes.borrow_mut().push(pr(301, "Change 301", "Body", minute(502), minute(502)));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(600)).unwrap();
+
+        let mirrored = log::read_for(&path, "github").unwrap().changes;
+        for node in nodes.borrow().iter() {
+            let updated = DateTime::parse_from_rfc3339(node["updatedAt"].as_str().unwrap()).unwrap().with_timezone(&Utc);
+            let key = format!("acme/app#{}", node["number"]);
+            if updated >= oldest {
+                let latest = &mirrored.get(&key).unwrap_or_else(|| panic!("{key} is not mirrored"));
+                assert_eq!(latest.title, node["title"].as_str().unwrap(), "{key}");
+                assert_eq!(latest.body.as_deref(), node["body"].as_str(), "{key}");
+            }
+        }
+    }
+
     #[test]
     fn a_full_github_pull_never_removes_linear_issues_in_the_same_log() {
         let vault = tempfile::tempdir().unwrap();
