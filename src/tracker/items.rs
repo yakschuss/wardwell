@@ -15,6 +15,31 @@ pub const MIRROR_QUERIES: &[&str] = &["recent", "stale"];
 /// Note returned with a named query the mirror cannot answer.
 pub const QUERY_NOT_MIRRORED: &str = "Tracker mirror items answer only the recent and stale queries.";
 
+/// At most this many mirrored items in a `list` or `query` result.
+pub const LIST_CAP: usize = 50;
+
+/// At most this many mirrored items in a `search` result.
+pub const SEARCH_CAP: usize = 20;
+
+/// A mirrored issue as a `list`, `query` or `search` result: `mirrored`
+/// without the description, which only `get` returns.
+pub fn summary(binding: &TrackerBinding, view: &MirrorView, issue: &MirroredIssue, now: DateTime<Utc>) -> Value {
+    let mut value = mirrored(binding, view, issue, now);
+    if let Value::Object(fields) = &mut value {
+        fields.remove("description");
+    }
+    value
+}
+
+/// Orders keys by team, then by number as a number: COR-2 before COR-10.
+pub fn key_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let split = |key: &str| {
+        let (team, number) = key.rsplit_once('-').unwrap_or((key, ""));
+        (team.to_ascii_uppercase(), number.parse::<u64>().ok(), key.to_string())
+    };
+    split(a).cmp(&split(b))
+}
+
 /// A native kanban item as a read result: its own fields plus `origin: "kanban"`.
 pub fn native(item: &impl serde::Serialize) -> Value {
     let mut value = serde_json::to_value(item).unwrap_or(Value::Null);
@@ -193,6 +218,24 @@ mod tests {
         let never = mirrored(&binding(), &MirrorView::default(), &issue("COR-12", "Todo", StateCategory::Unstarted), at(10));
         assert_eq!(never["last_pulled_age"], "never");
         assert!(never["last_pulled_at"].is_null());
+    }
+
+    #[test]
+    fn keys_sort_by_team_then_number() {
+        let mut keys = vec!["COR-10", "COR-2", "ABC-3", "cor-1", "COR-x"];
+        keys.sort_by(|a, b| key_order(a, b));
+        assert_eq!(keys, vec!["ABC-3", "COR-x", "cor-1", "COR-2", "COR-10"]);
+    }
+
+    #[test]
+    fn summary_drops_only_the_description() {
+        let view = MirrorView::default();
+        let open = issue("COR-12", "Todo", StateCategory::Unstarted);
+        let full = mirrored(&binding(), &view, &open, at(10));
+        let short = summary(&binding(), &view, &open, at(10));
+        assert_eq!(full["description"], "Payer column");
+        assert!(short.get("description").is_none());
+        assert_eq!(short["url"], full["url"]);
     }
 
     #[test]

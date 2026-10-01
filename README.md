@@ -464,7 +464,11 @@ its fields, including its own `source`, and gains `origin: "kanban"`. `list`
 and `search` leave out removed and archived issues; `list` also leaves out
 completed and canceled ones unless `include_done` is set. The mirror has no
 epics or deadlines, so of the named queries it answers only `recent` and
-`stale`. Any other query returns a `tracker_note` that says so.
+`stale`. Any other query returns a `tracker_note` that says so. Outside
+`get`, mirrored items carry no description. They sort by key with the number
+compared as a number, so COR-2 comes before COR-10. `list` and `query` return
+at most 50 mirrored items and `search` at most 20. When more match, the
+result adds `tracker_truncated` with the count left out.
 
 `get` for a key the mirror does not hold runs one incremental pull for the
 binding that owns the key, then looks again. It never runs a full pull, and

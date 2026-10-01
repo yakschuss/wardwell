@@ -2221,10 +2221,14 @@ impl WardwellServer {
         match kanban.search(query, p.project.as_deref(), domains) {
             Ok(items) => {
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let mirrored = self.mirror_items(p.project.as_deref(), &|issue| crate::tracker::items::search_keeps(issue, query));
-                items.extend(mirrored.into_iter().take(20));
+                let (mirrored, truncated) = self.mirror_items(p.project.as_deref(), crate::tracker::items::SEARCH_CAP, &|issue| crate::tracker::items::search_keeps(issue, query));
+                items.extend(mirrored);
                 let total = items.len();
-                serde_json::to_string(&serde_json::json!({"items": items, "total": total})).unwrap_or_default()
+                let mut response = serde_json::json!({"items": items, "total": total});
+                if truncated > 0 {
+                    response["tracker_truncated"] = serde_json::json!(truncated);
+                }
+                serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
@@ -2256,11 +2260,14 @@ impl WardwellServer {
                     include_done: p.include_done.unwrap_or(false),
                 };
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                items.extend(self.mirror_items(p.project.as_deref(), &|issue| filter.keeps(issue)));
+                let (mirrored, truncated) = self.mirror_items(p.project.as_deref(), crate::tracker::items::LIST_CAP, &|issue| filter.keeps(issue));
+                items.extend(mirrored);
                 let total = items.len();
-                serde_json::to_string(&serde_json::json!({
-                    "items": items, "total": total, "returned": total,
-                })).unwrap_or_default()
+                let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
+                if truncated > 0 {
+                    response["tracker_truncated"] = serde_json::json!(truncated);
+                }
+                serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
@@ -2412,11 +2419,15 @@ impl WardwellServer {
             Ok(items) => {
                 let now = chrono::Utc::now();
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                items.extend(self.mirror_items(p.project.as_deref(), &|issue| {
+                let (mirrored, truncated) = self.mirror_items(p.project.as_deref(), crate::tracker::items::LIST_CAP, &|issue| {
                     crate::tracker::items::query_keeps(issue, question, now).unwrap_or(false)
-                }));
+                });
+                items.extend(mirrored);
                 let total = items.len();
                 let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
+                if truncated > 0 {
+                    response["tracker_truncated"] = serde_json::json!(truncated);
+                }
                 if !crate::tracker::items::MIRROR_QUERIES.contains(&question.as_str()) && !self.read_bindings(p.project.as_deref()).is_empty() {
                     response["tracker_note"] = serde_json::json!(crate::tracker::items::QUERY_NOT_MIRRORED);
                 }
@@ -3652,17 +3663,26 @@ impl WardwellServer {
             .collect()
     }
 
-    /// Mirrored issues of the covered bindings that `keep` accepts, as read
-    /// results. A log that cannot be read contributes nothing.
-    fn mirror_items(&self, project: Option<&str>, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> Vec<serde_json::Value> {
+    /// Mirrored issues of the covered bindings that `keep` accepts, as
+    /// summaries in key order, at most `cap`, with how many were left out.
+    /// A log that cannot be read contributes nothing.
+    fn mirror_items(&self, project: Option<&str>, cap: usize, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> (Vec<serde_json::Value>, usize) {
         let now = chrono::Utc::now();
-        self.read_bindings(project)
+        let mut items: Vec<(String, serde_json::Value)> = self
+            .read_bindings(project)
             .into_iter()
             .filter_map(|binding| self.mirror_view(binding).map(|view| (binding, view)))
             .flat_map(|(binding, view)| {
-                view.issues.values().filter(|issue| keep(issue)).map(|issue| crate::tracker::items::mirrored(binding, &view, issue, now)).collect::<Vec<_>>()
+                view.issues
+                    .values()
+                    .filter(|issue| keep(issue))
+                    .map(|issue| (issue.key.clone(), crate::tracker::items::summary(binding, &view, issue, now)))
+                    .collect::<Vec<_>>()
             })
-            .collect()
+            .collect();
+        items.sort_by(|a, b| crate::tracker::items::key_order(&a.0, &b.0));
+        let truncated = items.len().saturating_sub(cap);
+        (items.into_iter().take(cap).map(|(_, item)| item).collect(), truncated)
     }
 
     /// The mirrored issue under `key` in any covered binding, removed and

@@ -294,3 +294,72 @@ fn list_query_and_search_never_pull() {
     kanban(&f.server, json!({"action": "query", "question": "recent"}));
     assert!(calls.lock().unwrap().is_empty());
 }
+
+/// 200 open backlog issues with long descriptions, last updated 30 days ago.
+fn backlog_of_200() -> Vec<Event> {
+    let now = chrono::Utc::now();
+    let mut events: Vec<Event> = (0..200)
+        .map(|n| {
+            let mut e = snapshot(&format!("COR-{n}"), "A typical backlog issue title here", "Backlog", StateCategory::Backlog, now - chrono::TimeDelta::days(30));
+            if let Event::IssueUpserted { issue, .. } = &mut e {
+                issue.description = Some("d".repeat(1500));
+            }
+            e
+        })
+        .collect();
+    events.push(pulled(now));
+    events
+}
+
+fn raw_kanban(server: &WardwellServer, args: Value) -> String {
+    let params: KanbanParams = serde_json::from_value(args).unwrap();
+    let store = server.kanban.as_ref().unwrap();
+    match params.action.as_str() {
+        "list" => server.kanban_list(store, &params),
+        "query" => server.kanban_query(store, &params),
+        "search" => server.kanban_search(store, &params),
+        other => panic!("unexpected action {other}"),
+    }
+}
+
+#[test]
+fn list_and_query_cap_mirrored_items_sort_by_key_number_and_drop_descriptions() {
+    let f = fixture(&backlog_of_200(), true);
+    for args in [
+        json!({"action": "list", "project": "claims"}),
+        json!({"action": "list"}),
+        json!({"action": "query", "question": "stale"}),
+    ] {
+        let raw = raw_kanban(&f.server, args.clone());
+        assert!(raw.len() < 40 * 1024, "{args}: {} bytes", raw.len());
+        let response: Value = serde_json::from_str(&raw).unwrap();
+        let mirrored: Vec<&Value> = response["items"].as_array().unwrap().iter().filter(|i| i["origin"] == "tracker").collect();
+        assert_eq!(mirrored.len(), 50, "{args}");
+        assert_eq!(response["tracker_truncated"], 150, "{args}");
+        let keys: Vec<&str> = mirrored.iter().map(|i| i["ticket_id"].as_str().unwrap()).collect();
+        assert_eq!(&keys[..4], ["COR-0", "COR-1", "COR-2", "COR-3"], "{args}");
+        assert_eq!(keys[10], "COR-10");
+        assert!(mirrored.iter().all(|i| i.get("description").is_none()), "{args}");
+    }
+    let get = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-7"}));
+    assert_eq!(get["item"]["description"].as_str().unwrap().len(), 1500, "get keeps the description");
+}
+
+#[test]
+fn a_small_mirror_reports_no_truncation() {
+    let f = fixture(&standard_mirror(), true);
+    let response = kanban(&f.server, json!({"action": "list", "project": "claims"}));
+    assert!(response.get("tracker_truncated").is_none(), "{response}");
+}
+
+#[test]
+fn search_caps_mirrored_items_at_twenty() {
+    let f = fixture(&backlog_of_200(), true);
+    let raw = raw_kanban(&f.server, json!({"action": "search", "query": "backlog"}));
+    let response: Value = serde_json::from_str(&raw).unwrap();
+    let keys = keys(&response);
+    assert_eq!(keys.len(), 20);
+    assert_eq!(&keys[..3], ["COR-0", "COR-1", "COR-2"]);
+    assert_eq!(response["tracker_truncated"], 180);
+    assert!(response["items"][0].get("description").is_none());
+}
