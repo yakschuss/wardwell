@@ -411,7 +411,13 @@ failed. `pull` exits non-zero when any binding failed.
 `doctor` prints three lines per binding: whether the credential file exists
 with owner-only permissions, whether the provider accepts the token on one
 cheap request, and whether the team key resolves. A failure names one code:
-`credential`, `auth`, `provider` or `team_not_found`. It never prints a token.
+`credential`, `auth`, `provider` or `team_not_found`. `auth` means the
+provider refused the token; any other provider error, including a GraphQL
+error that is not about authentication, is `provider`. It never prints a
+token. `config.yml` is rejected at load when a binding names a provider
+Wardwell has no adapter for; the error lists the supported ones. Should one
+reach `doctor` anyway, its second line reads `provider failed
+(unsupported_provider)`.
 
 `compact` is the only command that rewrites a tracker log, and only
 `tracker.jsonl`; it may because the log is a re-pullable mirror, not a system

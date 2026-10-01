@@ -50,14 +50,16 @@ const TEAM_QUERY: &str = r#"query WardwellDoctorTeam($key: String!) {
   teams(first: 1, filter: { key: { eq: $key } }) { nodes { key } }
 }"#;
 
-/// Doctor check: one cheap authenticated request. Any GraphQL error on the
-/// viewer query, or HTTP 401/403, means the token was refused.
+/// Doctor check: one cheap authenticated request. HTTP 401/403 or a GraphQL
+/// authentication error means the token was refused; any other error is a
+/// provider failure.
 pub fn check_auth(transport: &dyn Transport) -> Result<(), FailureCode> {
     let response = transport.post(&json!({"query": VIEWER_QUERY})).map_err(transport_code)?;
-    match (response.get("errors").is_some(), response["data"]["viewer"]["id"].is_string()) {
-        (false, true) => Ok(()),
-        (true, _) => Err(FailureCode::Auth),
-        (false, false) => Err(FailureCode::Provider),
+    match response.get("errors").and_then(Value::as_array) {
+        Some(errors) if errors.iter().any(is_auth_error) => Err(FailureCode::Auth),
+        Some(_) => Err(FailureCode::Provider),
+        None if response["data"]["viewer"]["id"].is_string() => Ok(()),
+        None => Err(FailureCode::Provider),
     }
 }
 

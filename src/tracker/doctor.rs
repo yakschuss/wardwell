@@ -22,8 +22,9 @@ pub fn connect_transport(binding: &TrackerBinding, credential: &Credential) -> R
     }
 }
 
-/// Three lines per bound project: credential, auth, team. The bool is true
-/// when every check passed.
+/// Three lines per bound project: credential, auth, team; `provider` takes
+/// the place of auth when the provider has no adapter. The bool is true when
+/// every check passed.
 pub fn run(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>) -> (Vec<String>, bool) {
     if config.trackers.is_empty() {
         return (vec!["No trackers bound. Add a trackers section to config.yml.".to_string()], true);
@@ -60,25 +61,31 @@ impl Outcome {
 }
 
 fn check_binding(config_dir: &Path, binding: &TrackerBinding, probe: &Probe<'_>) -> Vec<(String, Outcome)> {
-    let names = ["credential".to_string(), "auth".to_string(), format!("team {}", binding.team)];
+    let team = format!("team {}", binding.team);
     // Credential errors name the path and the fix, never the file contents.
-    let credential = credential::path_in(config_dir, &binding.credential).and_then(|path| credential::load(&path));
-    let transport = credential
-        .as_ref()
-        .map_err(|message| Outcome::Failed(FailureCode::Credential, Some(message.clone())))
-        .and_then(|c| probe(binding, c).map_err(|_| Outcome::Failed(FailureCode::UnsupportedProvider, None)));
-    let outcomes = match transport {
-        Err(failure) => [failure, Outcome::Skipped, Outcome::Skipped],
-        Ok(transport) => {
-            let auth = Outcome::from(linear::check_auth(transport.as_ref()));
-            let team = match auth {
-                Outcome::Ok => Outcome::from(linear::check_team(transport.as_ref(), &binding.team)),
-                _ => Outcome::Skipped,
-            };
-            [Outcome::Ok, auth, team]
+    let credential = match credential::path_in(config_dir, &binding.credential).and_then(|path| credential::load(&path)) {
+        Ok(credential) => credential,
+        Err(message) => {
+            return vec![
+                ("credential".to_string(), Outcome::Failed(FailureCode::Credential, Some(message))),
+                ("auth".to_string(), Outcome::Skipped),
+                (team, Outcome::Skipped),
+            ];
         }
     };
-    names.into_iter().zip(outcomes).collect()
+    let Ok(transport) = probe(binding, &credential) else {
+        return vec![
+            ("credential".to_string(), Outcome::Ok),
+            ("provider".to_string(), Outcome::Failed(FailureCode::UnsupportedProvider, None)),
+            (team, Outcome::Skipped),
+        ];
+    };
+    let auth = Outcome::from(linear::check_auth(transport.as_ref()));
+    let team_outcome = match auth {
+        Outcome::Ok => Outcome::from(linear::check_team(transport.as_ref(), &binding.team)),
+        _ => Outcome::Skipped,
+    };
+    vec![("credential".to_string(), Outcome::Ok), ("auth".to_string(), auth), (team, team_outcome)]
 }
 
 #[cfg(test)]
@@ -166,7 +173,8 @@ mod tests {
         let (dir, config) = setup(true);
         for viewer in [
             Err(format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED)),
-            Ok(json!({"errors": [{"message": "Authentication required for lin_api_secret"}]})),
+            Ok(json!({"errors": [{"message": "Authentication required for lin_api_secret", "extensions": {"code": "AUTHENTICATION_ERROR"}}]})),
+            Ok(json!({"errors": [{"message": "Authentication required", "extensions": {"type": "authentication error"}}]})),
         ] {
             let (lines, healthy) = doctor_with(dir.path(), &config, viewer, json!([{"key": "COR"}]));
             assert_eq!(&lines[1..], ["work/claims: auth failed (auth)", "work/claims: team COR skipped"]);
@@ -180,6 +188,27 @@ mod tests {
         let (dir, config) = setup(true);
         let (lines, _) = doctor_with(dir.path(), &config, Err("Linear request failed".into()), json!([]));
         assert_eq!(lines[1], "work/claims: auth failed (provider)");
+    }
+
+    #[test]
+    fn a_graphql_error_that_is_not_authentication_is_a_provider_failure() {
+        let (dir, config) = setup(true);
+        let viewer = Ok(json!({"errors": [{"message": "Rate limit exceeded", "extensions": {"code": "RATELIMITED"}}]}));
+        let (lines, healthy) = doctor_with(dir.path(), &config, viewer, json!([{"key": "COR"}]));
+        assert_eq!(&lines[1..], ["work/claims: auth failed (provider)", "work/claims: team COR skipped"]);
+        assert!(!healthy);
+    }
+
+    #[test]
+    fn an_unknown_provider_is_a_provider_failure_not_a_credential_one() {
+        let (dir, mut config) = setup(true);
+        config.trackers.get_mut("work/claims").unwrap().provider = "jira".into();
+        let (lines, healthy) = run(&config, dir.path(), &connect_transport);
+        assert_eq!(
+            lines,
+            vec!["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped"]
+        );
+        assert!(!healthy);
     }
 
     #[test]
