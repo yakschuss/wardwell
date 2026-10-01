@@ -37,7 +37,8 @@ pub fn link(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) -> Opt
 /// that config.yml did not change in between.
 fn link_waiting(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) -> Option<GitDirs>, confirm: impl FnOnce() -> bool, out: &mut dyn Write, wait: Duration) -> Result<(), String> {
     let path = config_dir.join("config.yml");
-    let mut lock = Lock::take(&path, wait)?;
+    // A dry run writes nothing, so it takes no lock and needs no writable folder.
+    let mut lock = if request.dry_run { None } else { Some(Lock::take(&path, wait)?) };
     let (before, config) = read_config(&path)?;
     let dir = recorded_dir(request.dir, git)?;
     let key = match request.key {
@@ -61,7 +62,7 @@ fn link_waiting(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) ->
         if !confirm() {
             return say(out, "\n  Cancelled. Nothing changed.".into());
         }
-        lock = Lock::take(&path, wait)?;
+        lock = Some(Lock::take(&path, wait)?);
     }
     let backup = write(&path, &before, &after)?;
     drop(lock);
@@ -407,5 +408,17 @@ mod tests {
         let error = run(&f, None, &f.code, false, true).unwrap_err();
         assert!(error.contains("Several vault projects are named corrtex: personal/corrtex, work/corrtex"), "{error}");
         assert!(backups(&f).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_needs_no_lock_and_no_writable_config_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        std::fs::set_permissions(&f.cfg, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = run(&f, Some("personal/corrtex"), &f.code, true, true);
+        std::fs::set_permissions(&f.cfg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = result.unwrap();
+        assert!(out.contains("UPDATE + BACKUP") && out.contains("Dry run complete. Nothing changed."), "{out}");
     }
 }
