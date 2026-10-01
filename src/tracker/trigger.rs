@@ -97,6 +97,40 @@ pub fn refresh_detached(config: &WardwellConfig, config_dir: &Path, domain: &str
     refresh(config, domain, project, now, &spawner, &Probes { alive: &freshness::process_alive, can_pull: &can_pull })
 }
 
+/// How often the running server asks each bound project for a refresh.
+pub const SERVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Ask `refresh` once for each bound project, in config order, and return
+/// a log line for each project where a pull started or could not start.
+pub fn refresh_bound(config: &WardwellConfig, refresh: &dyn Fn(&str, &str) -> Outcome) -> Vec<String> {
+    let mut projects: Vec<(&str, &str)> = Vec::new();
+    for binding in &config.trackers {
+        let project = (binding.domain.as_str(), binding.project.as_str());
+        if !projects.contains(&project) {
+            projects.push(project);
+        }
+    }
+    projects
+        .into_iter()
+        .filter_map(|(domain, project)| match refresh(domain, project) {
+            Outcome::Started => Some(format!("tracker refresh started for {domain}/{project}")),
+            Outcome::SpawnFailed => Some(format!("tracker refresh for {domain}/{project} could not start (spawn)")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run `task` every `period`, the first time one `period` after the call.
+/// Runs until the process ends.
+pub async fn every(period: std::time::Duration, mut task: impl FnMut()) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        task();
+    }
+}
+
 /// The last completed pull is older than `REFRESH_AFTER`, or none exists.
 fn is_due(view: &MirrorView, now: DateTime<Utc>) -> bool {
     view.last_pull_at.is_none_or(|at| now - at > REFRESH_AFTER)
@@ -357,6 +391,46 @@ mod tests {
         assert_eq!(run(&config, &Fake::new(), false, true), Outcome::Started);
         assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
         drop(held);
+    }
+
+    #[test]
+    fn the_server_asks_each_bound_project_once_and_logs_starts_and_spawn_failures() {
+        let yaml = "vault_path: /v\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: linear\n      team: COR\n      credential: c\n    - provider: github\n      repository: acme/app\n  work/ops:\n    provider: linear\n    team: OPS\n    credential: c\n  home/notes:\n    provider: linear\n    team: NOTE\n    credential: c\n";
+        let config = crate::config::loader::parse(yaml).unwrap();
+        let asked = RefCell::new(Vec::new());
+        let refresh = |domain: &str, project: &str| {
+            asked.borrow_mut().push(format!("{domain}/{project}"));
+            match project {
+                "claims" => Outcome::Started,
+                "ops" => Outcome::SpawnFailed,
+                _ => Outcome::NotDue,
+            }
+        };
+        let lines = refresh_bound(&config, &refresh);
+        let mut seen = asked.borrow().clone();
+        seen.sort();
+        assert_eq!(seen, vec!["home/notes", "work/claims", "work/ops"]);
+        let mut lines = lines;
+        lines.sort();
+        assert_eq!(lines, vec!["tracker refresh for work/ops could not start (spawn)", "tracker refresh started for work/claims"]);
+    }
+
+    #[test]
+    fn the_timer_first_fires_one_period_after_it_starts() {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = std::rc::Rc::clone(&count);
+        runtime.block_on(async {
+            let timer = every(std::time::Duration::from_millis(100), move || seen.set(seen.get() + 1));
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), timer).await;
+        });
+        assert_eq!(count.get(), 0, "nothing at start");
+        let seen = std::rc::Rc::clone(&count);
+        runtime.block_on(async {
+            let timer = every(std::time::Duration::from_millis(40), move || seen.set(seen.get() + 1));
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(150), timer).await;
+        });
+        assert!((2..=4).contains(&count.get()), "{}", count.get());
     }
 
     #[test]

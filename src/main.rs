@@ -681,10 +681,35 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
         )
         .await;
     });
+    // Refresh each bound project's mirror on the hour while the server runs,
+    // the first time one hour after it starts. A failure is logged only.
+    let refresh_config_dir = config_dir.clone();
+    tokio::spawn(wardwell::tracker::trigger::every(wardwell::tracker::trigger::SERVE_INTERVAL, move || {
+        let config_dir = refresh_config_dir.clone();
+        tokio::task::spawn_blocking(move || refresh_bound_projects(&config_dir));
+    }));
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
 
     Ok(())
+}
+
+/// One server refresh round: the refresh trigger for every bound project,
+/// with the config read fresh. Every outcome is a log line; none is fatal.
+fn refresh_bound_projects(config_dir: &std::path::Path) {
+    use wardwell::tracker::trigger;
+    let config = match wardwell::config::loader::load(None) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("wardwell: tracker refresh skipped; config could not be read ({error})");
+            return;
+        }
+    };
+    let now = chrono::Utc::now();
+    let refresh = |domain: &str, project: &str| trigger::refresh_detached(&config, config_dir, domain, project, now);
+    for line in trigger::refresh_bound(&config, &refresh) {
+        eprintln!("wardwell: {line}");
+    }
 }
 
 async fn run_daemon_loop(
