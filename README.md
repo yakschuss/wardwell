@@ -455,6 +455,36 @@ proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
 status, and export_roadmap, which saves a PDF into the project folder) refuses
 and says to edit in the tracker. Reads are unaffected.
 
+The kanban read actions `get`, `list`, `query` and `search` include the
+mirrored issues of a bound project. A mirrored item has `origin: "tracker"`
+and carries the provider, the external key, the tracker's state name and
+category, the parent, the relations, the url, `last_pulled_at`, and that
+pull's age in plain words, such as `3 hours ago`. A native kanban item keeps
+its fields, including its own `source`, and gains `origin: "kanban"`. `list`
+and `search` leave out removed and archived issues; `list` also leaves out
+completed and canceled ones unless `include_done` is set. The mirror has no
+epics or deadlines, so of the named queries it answers only `recent` and
+`stale`. Any other query returns a `tracker_note` that says so.
+
+`get` for a key the mirror does not hold runs one incremental pull for the
+binding that owns the key, then looks again. It never runs a full pull, and
+each binding refreshes at most once a minute. The result carries `refreshed`,
+true when a pull completed, and `refresh_reason`: `found_after_pull`,
+`still_missing`, `cooldown`, `pull_failed:<code>` or `no_binding`. `list`,
+`query` and `search` never pull.
+
+At session start, `wardwell inject` prints a rot line for each project
+folder in the matched domain. It reads like this: Last history entry 12 days
+ago. Last decision 3 days ago. A bound project also gets a tracker section.
+Its first line is "Tracker mirror. Last pulled 2 hours ago. Not
+authoritative." Up to ten issues in a started state follow, each with key,
+title and state. When the last pull failed or is more than 24 hours old, the
+section shows only the age and that notice.
+
+`wardwell doctor` prints one row per binding. It checks only the credential
+file and the provider, with no network call, and names `wardwell tracker
+doctor` for the live check.
+
 ```sh
 wardwell tracker schedule [--interval-seconds 3600]
 wardwell tracker unschedule
