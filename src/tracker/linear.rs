@@ -221,6 +221,11 @@ fn snapshot_event(issue: &IssueRef, node: &Value, issue_title: String) -> Result
         }
     }
     let mut common = issue.common("issue", node, required_time(node, "updatedAt")?, None, title)?;
+    // Linear does not bump updatedAt on archive, so the archive time joins the
+    // id; unarchived ids stay as they were so earlier logs still dedup.
+    if let Some(raw_archived) = text(node, "archivedAt") {
+        common.id = format!("{}:{raw_archived}", common.id);
+    }
     common.raw = raw;
     Ok(Event::IssueUpserted {
         common,
@@ -516,6 +521,78 @@ mod tests {
         let Event::IssueUpserted { common, issue } = &events[0] else { panic!("snapshot") };
         assert_eq!(issue.archived_at, Some(Utc.with_ymd_and_hms(2026, 9, 2, 9, 0, 0).unwrap()));
         assert_eq!(common.title, "COR-13 Old export: archived (In Progress)");
+    }
+
+    #[test]
+    fn archive_without_an_updated_at_bump_appends_one_new_upsert() {
+        use crate::config::TrackerBinding;
+        use crate::tracker::{log, pull::pull_project};
+        let (updated, archived) = ("2026-09-02T09:00:00.000Z", "2026-09-02T09:02:00.000Z");
+        let transport = FakeTransport::new(vec![
+            page(vec![issue("i2", "COR-13", "Old export", updated, None)], None),
+            page(vec![issue("i2", "COR-13", "Old export", updated, Some(archived))], None),
+            page(vec![issue("i2", "COR-13", "Old export", updated, Some(archived))], None),
+        ]);
+        let adapter = Linear::new(&transport, "COR");
+        let binding = TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "linear".into(),
+            team: "COR".into(),
+            credential: "corr-linear".into(),
+            readonly: true,
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();
+        let first = pull_project(vault.path(), &binding, &adapter, false, now).unwrap();
+        assert_eq!(first.appended, 4, "snapshot, comment, state change, link");
+        let second = pull_project(vault.path(), &binding, &adapter, false, now).unwrap();
+        assert_eq!(second.appended, 1, "only the archived snapshot is new");
+        let third = pull_project(vault.path(), &binding, &adapter, false, now).unwrap();
+        assert_eq!(third.appended, 0);
+
+        let content = std::fs::read_to_string(log::path_for(vault.path(), "work", "claims")).unwrap();
+        let upserts: Vec<Event> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .filter(|event| matches!(event, Event::IssueUpserted { .. }))
+            .collect();
+        assert_eq!(upserts.len(), 2);
+        let archived_at: Vec<_> = upserts
+            .iter()
+            .map(|event| match event {
+                Event::IssueUpserted { issue, .. } => issue.archived_at,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(archived_at, vec![None, Some(Utc.with_ymd_and_hms(2026, 9, 2, 9, 2, 0).unwrap())]);
+        assert_eq!(upserts[0].common().id, format!("linear:issue:i2:{updated}"), "unarchived ids are unchanged");
+    }
+
+    #[test]
+    fn full_pull_keeps_an_archived_issue_present() {
+        use crate::config::TrackerBinding;
+        use crate::tracker::pull::pull_project;
+        let transport = FakeTransport::new(vec![
+            page(vec![issue("i2", "COR-13", "Old export", "2026-09-02T09:00:00.000Z", None)], None),
+            page(vec![issue("i2", "COR-13", "Old export", "2026-09-02T09:00:00.000Z", Some("2026-09-02T09:02:00.000Z"))], None),
+        ]);
+        let adapter = Linear::new(&transport, "COR");
+        let binding = TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "linear".into(),
+            team: "COR".into(),
+            credential: "corr-linear".into(),
+            readonly: true,
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();
+        pull_project(vault.path(), &binding, &adapter, true, now).unwrap();
+        let again = pull_project(vault.path(), &binding, &adapter, true, now).unwrap();
+        assert_eq!(again.removed, 0);
+        let content = std::fs::read_to_string(crate::tracker::log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert!(!content.contains("issue_removed"), "{content}");
     }
 
     #[test]
