@@ -262,7 +262,7 @@ entries Wardwell added.
 
 The gate reads the PreToolUse payload on standard input. It prints a deny
 decision with the reason, or nothing to allow. It always exits 0. A payload it
-cannot read is allowed. The rules are the ruleset `linear-updates`, version 2,
+cannot read is allowed. The rules are the ruleset `linear-updates`, version 3,
 held as data in the binary:
 
 - A comment's first line starts with `Shipped:`, `Needs info:`, `Blocked:` or
@@ -270,7 +270,7 @@ held as data in the binary:
 - The comment has a "For the team" section, and each field of its shape is
   present and not empty.
 - A created issue has the fields Asked by, What changes for whom, and Done
-  when, and a parent issue or a template.
+  when, and a parent issue, a project, or a template.
 - The team section has fewer than 80 words. Each sentence has 20 words or
   fewer. No parentheses, semicolons, dashes, "e.g." or "i.e.".
 - A comment's team section has no backticks, paths, links, a number sign
@@ -407,7 +407,7 @@ Checks that everything is wired correctly:
 - Local context and hosted-app connection entries configured in Claude Code and Codex
 - Local context configured in Claude Desktop; hosted access remains an account connector
 - SessionStart hook registered
-- Gate ruleset: its name and version, `linear-updates v2`
+- Gate ruleset: its name and version, `linear-updates v3`
 - Linear gate: installed when a linear binding has `gate: true`, and running this binary
 - Linear deny list: every destructive Linear tool denied
 - Tracker pull service: a row only when a launchd agent exists. It fails when the vault is under a folder macOS protects, and when the program it runs is gone. Whether launchd loaded it is not checked.
