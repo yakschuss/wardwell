@@ -3,7 +3,8 @@
 //! The log is its own cursor: the reader derives the cursor from the latest
 //! completed-pull or full-resync marker, the known event ids, and the issues
 //! still open in the mirror. Appends go
-//! only through `kanban::jsonl::append_line`. Does NOT talk to any provider.
+//! only through `kanban::jsonl::append_line`, after ending a torn last line
+//! with a newline. Does NOT talk to any provider.
 
 use crate::kanban::jsonl::append_line;
 use crate::tracker::events::{Event, RAW_FILE_NAME, RAW_SCHEMA_HEADER, SCHEMA_HEADER};
@@ -116,8 +117,7 @@ pub fn append_new(path: &Path, events: &[Event], summary: &mut LogSummary) -> Re
             append_raw(&raw_path, &light.common().id, raw)?;
         }
         let line = serde_json::to_string(&light).map_err(|_| "could not encode tracker event".to_string())?;
-        append_line(path, Some(SCHEMA_HEADER), &line)
-            .map_err(|error| format!("could not append to {}: {error}", path.display()))?;
+        append_after_newline(path, SCHEMA_HEADER, &line)?;
         summary.observe(&light);
         written += 1;
     }
@@ -159,8 +159,38 @@ pub fn raw_path_for(log_path: &Path) -> PathBuf {
 pub fn append_raw(raw_path: &Path, id: &str, raw: Value) -> Result<(), String> {
     let record = RawRecord { id: id.to_string(), raw };
     let line = serde_json::to_string(&record).map_err(|_| "could not encode a raw tracker payload".to_string())?;
-    append_line(raw_path, Some(RAW_SCHEMA_HEADER), &line)
-        .map_err(|error| format!("could not append to {}: {error}", raw_path.display()))
+    append_after_newline(raw_path, RAW_SCHEMA_HEADER, &line)
+}
+
+/// Append `line` through `append_line`, first ending a torn last line (a
+/// crash mid-append) with a newline so it cannot swallow `line`.
+fn append_after_newline(path: &Path, header: &str, line: &str) -> Result<(), String> {
+    let failed = |error: std::io::Error| format!("could not append to {}: {error}", path.display());
+    if ends_without_newline(path).map_err(failed)? {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"\n"))
+            .map_err(failed)?;
+    }
+    append_line(path, Some(header), line).map_err(failed)
+}
+
+/// True when `path` exists, is not empty, and its last byte is not `\n`.
+fn ends_without_newline(path: &Path) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// Every raw payload in the sidecar by event id; the first line for an id
@@ -265,6 +295,26 @@ mod tests {
         assert!(error.contains("tracker.raw.jsonl"), "{error}");
         assert!(!path.exists(), "no log line without its raw payload");
         assert!(summary.event_ids.is_empty());
+    }
+
+    #[test]
+    fn a_torn_tail_does_not_swallow_the_next_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        let raw_path = raw_path_for(&path);
+        let torn = format!("{}\n{{\"id\":\"e0\",\"ra", crate::tracker::events::RAW_SCHEMA_HEADER);
+        std::fs::write(&raw_path, &torn).unwrap();
+        std::fs::write(&path, format!("{}\n{{\"kind\":\"issue_ups", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+
+        let mut summary = read(&path).unwrap();
+        let event = with_raw(upsert("e1", "COR-1", 9), serde_json::json!({"body": "next"}));
+        append_new(&path, &[event], &mut summary).unwrap();
+
+        assert_eq!(read_raw(&raw_path).unwrap()["e1"], serde_json::json!({"body": "next"}));
+        assert!(std::fs::read_to_string(&raw_path).unwrap().starts_with(&format!("{torn}\n")), "the torn line is kept on its own line");
+        let summary = read(&path).unwrap();
+        assert!(summary.event_ids.contains("e1"));
+        assert_eq!(summary.unreadable_lines, 1);
     }
 
     #[test]
