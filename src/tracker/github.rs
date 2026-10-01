@@ -60,7 +60,9 @@ pub trait Rest {
 /// Which reader answered a doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
+    /// The `gh` command answered.
     Gh,
+    /// The REST API answered with the stored token.
     Token,
 }
 

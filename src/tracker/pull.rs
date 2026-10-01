@@ -120,7 +120,7 @@ pub fn connect_provider(binding: &TrackerBinding, credential: Option<&Credential
     }
 }
 
-/// The GitHub adapter for a binding: `gh` through `gh`, and the REST API
+/// The GitHub adapter for a binding: it reads through `gh`, and through the REST API
 /// when a token is stored.
 pub fn github_for(binding: &TrackerBinding, credential: Option<&Credential>, gh: Box<dyn GhRunner>) -> GitHub {
     let rest = credential.map(|c| Box::new(HttpRest::new(c.token().to_string())) as Box<dyn Rest>);
