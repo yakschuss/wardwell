@@ -1,6 +1,10 @@
 //! Installs and removes the launchd agent that runs `wardwell tracker pull`
-//! on an interval. Does NOT pull, read config, or touch the tracker; launchctl
-//! is reached only through `LaunchctlRunner` so tests never invoke it.
+//! on an interval, an explicit choice for a vault outside the folders macOS
+//! protects; `setup` installs none. Also says whether a plist on disk is
+//! exactly the one Wardwell writes, and whether a vault is under a
+//! protected folder. Does NOT pull, read config, or touch the tracker;
+//! launchctl is reached only through `LaunchctlRunner` so tests never
+//! invoke it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +16,75 @@ pub const LABEL: &str = "com.wardwell.tracker-pull";
 pub const MIN_INTERVAL_SECONDS: u32 = 60;
 /// Longest interval accepted; launchd's StartInterval is a signed 32-bit integer.
 pub const MAX_INTERVAL_SECONDS: u32 = 2_147_483_647;
+
+/// Folders under the home folder whose files macOS guards with a privacy
+/// prompt. A launchd job that reads a vault under one waits on that prompt,
+/// and macOS asks again for each new build.
+pub const PROTECTED_FOLDERS: [&str; 4] = ["Library/Mobile Documents", "Documents", "Desktop", "Downloads"];
+
+/// The sentence `tracker schedule` and `doctor` print for a vault under a protected folder.
+pub const PROTECTED_SENTENCE: &str = "macOS asks for consent after every upgrade, and the session refresh needs none.";
+
+/// Whether `vault` is under a folder of `home` that macOS protects. Compares
+/// the paths as written and, where they exist, with links resolved.
+pub fn is_protected(vault: &Path, home: &Path) -> bool {
+    PROTECTED_FOLDERS.iter().map(|folder| home.join(folder)).any(|folder| vault.starts_with(&folder) || resolved(vault).starts_with(resolved(&folder)))
+}
+
+/// `path` with links resolved in its longest existing ancestor, and the
+/// rest appended, so a folder that does not exist yet still resolves.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = current.canonicalize() {
+            return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// The launchd agent at Wardwell's label path, as `setup`, `uninstall` and
+/// `doctor` judge it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Agent {
+    /// No plist at the label path.
+    Absent,
+    /// Exactly the plist Wardwell writes, for this program and interval,
+    /// and the program is a Wardwell binary.
+    Owned { program: PathBuf, interval: u32 },
+    /// A plist at the label path that is not exactly Wardwell's.
+    Foreign,
+}
+
+/// The agent at the label path under `home`. Owned only on an exact match
+/// with what `launch_agent_plist` writes for its own program and interval,
+/// with the log in `config_dir`, and a program named `wardwell` or
+/// `wardwell-<version>`.
+pub fn agent(home: &Path, config_dir: &Path) -> Agent {
+    let Ok(body) = std::fs::read_to_string(plist_path(home)) else {
+        return match plist_path(home).exists() {
+            true => Agent::Foreign,
+            false => Agent::Absent,
+        };
+    };
+    match (scheduled_program(home), schedule_status(home)) {
+        (Some(program), Some(interval)) if is_wardwell_program(&program) && body == launch_agent_plist(&program, interval, &log_path(config_dir)) => {
+            Agent::Owned { program, interval }
+        }
+        _ => Agent::Foreign,
+    }
+}
+
+fn is_wardwell_program(program: &Path) -> bool {
+    program.is_absolute() && program.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "wardwell" || n.starts_with("wardwell-"))
+}
 
 /// Runs one launchctl argv (program first).
 pub trait LaunchctlRunner {
@@ -254,6 +327,63 @@ mod tests {
         assert!(xml.contains("<key>RunAtLoad</key>\n  <true/>"));
         assert!(xml.contains("<key>StandardOutPath</key>\n  <string>/cfg/tracker-pull.log</string>"));
         assert!(xml.contains("<key>StandardErrorPath</key>\n  <string>/cfg/tracker-pull.log</string>"));
+    }
+
+    #[test]
+    fn a_vault_under_a_protected_folder_of_the_given_home_is_protected() {
+        let home = Path::new("/nonexistent-home/jane");
+        for vault in ["Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes", "Documents/vault", "Desktop/v", "Downloads/v"] {
+            assert!(is_protected(&home.join(vault), home), "{vault}");
+        }
+        for vault in ["notes", "Library/Application Support/vault", "Documentsx/v"] {
+            assert!(!is_protected(&home.join(vault), home), "{vault}");
+        }
+        assert!(!is_protected(Path::new("/nonexistent-other/Documents/v"), home), "only the given home");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_into_a_protected_folder_is_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join("Documents/vault")).unwrap();
+        std::os::unix::fs::symlink(home.join("Documents/vault"), root.path().join("vault")).unwrap();
+        assert!(is_protected(&root.path().join("vault"), &home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_folder_not_yet_made_under_a_symlinked_home_is_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let real_home = root.path().join("real-home");
+        std::fs::create_dir_all(&real_home).unwrap();
+        let linked_home = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let later = "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes";
+        assert!(is_protected(&linked_home.join(later), &real_home), "vault through the link, home real");
+        assert!(is_protected(&real_home.join("Documents/vault"), &linked_home), "vault real, home through the link");
+        assert!(!is_protected(&linked_home.join("notes/vault"), &real_home));
+    }
+
+    #[test]
+    fn only_the_exact_plist_for_a_wardwell_program_is_owned() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg = home.path().join(".wardwell");
+        assert_eq!(agent(home.path(), &cfg), Agent::Absent);
+        let path = plist_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let write = |program: &str, log: &Path| std::fs::write(&path, launch_agent_plist(Path::new(program), 900, log)).unwrap();
+        write("/Users/jane/.wardwell/bin/wardwell-0.12.0", &log_path(&cfg));
+        assert_eq!(agent(home.path(), &cfg), Agent::Owned { program: PathBuf::from("/Users/jane/.wardwell/bin/wardwell-0.12.0"), interval: 900 });
+        write("/opt/homebrew/bin/wardwell", &log_path(&cfg));
+        assert!(matches!(agent(home.path(), &cfg), Agent::Owned { .. }));
+        write("/usr/local/bin/other-tool", &log_path(&cfg));
+        assert_eq!(agent(home.path(), &cfg), Agent::Foreign, "not a Wardwell program");
+        write("/opt/homebrew/bin/wardwell", Path::new("/elsewhere.log"));
+        assert_eq!(agent(home.path(), &cfg), Agent::Foreign, "not the log Wardwell writes");
+        let edited = launch_agent_plist(Path::new("/opt/homebrew/bin/wardwell"), 900, &log_path(&cfg)).replace("<key>RunAtLoad</key>", "<key>Nice</key><integer>5</integer><key>RunAtLoad</key>");
+        std::fs::write(&path, edited).unwrap();
+        assert_eq!(agent(home.path(), &cfg), Agent::Foreign, "edited by hand");
     }
 
     #[test]

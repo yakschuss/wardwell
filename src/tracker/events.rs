@@ -109,6 +109,15 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<DateTime<Utc>>,
     },
+    /// Marks a pull that holds the project lock and is about to call the
+    /// provider, with the id of the process that runs it. A later
+    /// pull_completed, full_resync or pull_failed of the same provider ends
+    /// it. Readers before 0.13.1 skip the row as unreadable.
+    PullStarted {
+        #[serde(flatten)]
+        common: Common,
+        pid: u32,
+    },
     /// Marks a pull that stopped early, with a closed reason and no provider
     /// text. Never moves the cursor.
     PullFailed {
@@ -149,6 +158,10 @@ pub enum FailureCode {
     EmptyFullResult,
     /// Doctor only: the team key equals the project's native kanban prefix.
     PrefixCollision,
+    /// The pull ran past its hard deadline and was stopped.
+    Timeout,
+    /// A refresh could not start the detached pull process.
+    Spawn,
 }
 
 impl FailureCode {
@@ -165,6 +178,8 @@ impl FailureCode {
             Self::TeamNotFound => "team_not_found",
             Self::EmptyFullResult => "empty_full_result",
             Self::PrefixCollision => "prefix_collision",
+            Self::Timeout => "timeout",
+            Self::Spawn => "spawn",
         }
     }
 }
@@ -181,6 +196,7 @@ impl Event {
             | Event::IssueRemoved { common }
             | Event::FullResync { common, .. }
             | Event::PullCompleted { common, .. }
+            | Event::PullStarted { common, .. }
             | Event::PullFailed { common, .. } => common,
         }
     }
@@ -428,7 +444,9 @@ mod tests {
             Event::IssueRemoved { common: common("e") },
             Event::FullResync { common: common("f"), issues: 3, removed: 1, through: None },
             Event::PullCompleted { common: common("g"), through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },
+            Event::PullStarted { common: common("s"), pid: 4242 },
             Event::PullFailed { common: common("h"), code: FailureCode::Provider, automatic_full: false },
+            Event::PullFailed { common: common("t"), code: FailureCode::Timeout, automatic_full: false },
         ];
         for event in events {
             let line = serde_json::to_string(&event).unwrap();
@@ -517,10 +535,20 @@ mod tests {
         for code in [
             FailureCode::Credential, FailureCode::UnsupportedProvider, FailureCode::LockBusy, FailureCode::LogRead,
             FailureCode::LogWrite, FailureCode::Provider, FailureCode::Auth, FailureCode::TeamNotFound,
+            FailureCode::Timeout, FailureCode::Spawn,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(code.as_str()));
         }
         assert_eq!(crate::tracker::lock::LOCK_BUSY, FailureCode::LockBusy.as_str());
+    }
+
+    #[test]
+    fn pull_started_carries_the_process_id_and_provider() {
+        let value = serde_json::to_value(Event::PullStarted { common: common("s"), pid: 4242 }).unwrap();
+        assert_eq!(value["kind"], "pull_started");
+        assert_eq!(value["pid"], 4242);
+        assert_eq!(value["provider"], "linear");
+        assert_eq!(FailureCode::Timeout.as_str(), "timeout");
     }
 
     #[test]

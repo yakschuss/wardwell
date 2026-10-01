@@ -109,6 +109,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{row}");
                 }
                 all_ok &= trackers_ok;
+                for row in mirror_rows(&config, &config_dir(), chrono::Utc::now()) {
+                    println!("{row}");
+                }
+                let (rows, refresh_ok) = refresh_state_rows(&config, &config_dir());
+                for row in rows {
+                    println!("{row}");
+                }
+                all_ok &= refresh_ok;
 
                 // MCP configs
                 let mcp_paths = McpConfigPaths::detect();
@@ -116,7 +124,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Tracker policy and pull service: offline reads only
                 let home = dirs::home_dir().unwrap_or_default();
-                let (rows, policy_ok) = policy_rows(&config, &home, &binary_path, cfg!(target_os = "macos"));
+                let (rows, policy_ok) = policy_rows(&config, &home, &config_dir(), &binary_path, cfg!(target_os = "macos"));
                 for row in rows {
                     println!("{row}");
                 }
@@ -227,11 +235,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Rows for the Linear gate, its ruleset, the deny list, and the tracker
-/// pull service, read offline from Claude settings and the plist. Whether
-/// launchd has the agent loaded is not checked. The bool is false when a row
-/// failed.
-pub(crate) fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, binary: &Path, launchd: bool) -> (Vec<String>, bool) {
+/// Rows for the Linear gate, its ruleset, the deny list, and a launchd pull
+/// agent when one exists, read offline from Claude settings and the plist.
+/// An agent fails its row when the vault is under a folder macOS protects.
+/// Whether launchd has the agent loaded is not checked. The bool is false
+/// when a row failed.
+pub(crate) fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, config_dir: &Path, binary: &Path, launchd: bool) -> (Vec<String>, bool) {
     use crate::gate::ruleset::LINEAR_UPDATES;
     use crate::install::client_hooks::{self, GATE};
     const FIX: &str = "run `wardwell setup`";
@@ -279,17 +288,21 @@ pub(crate) fn policy_rows(config: &crate::config::loader::WardwellConfig, home: 
             false => row("Linear deny list", Some(false), format!("missing {}; {FIX}", missing.join(", "))),
         }
     }
-    if !config.trackers.is_empty() {
-        let program = crate::tracker::schedule::scheduled_program(home);
-        let interval = crate::tracker::schedule::schedule_status(home);
-        match (launchd, program, interval) {
-            (false, _, _) => row("Tracker pull service", None, "not checked; launchd is macOS only, use cron".to_string()),
-            (true, None, _) => row("Tracker pull service", Some(false), format!("plist not installed; {FIX}")),
-            (true, Some(program), _) if !program.exists() => row("Tracker pull service", Some(false), format!("plist runs {}, which does not exist; {FIX}", program.display())),
-            (true, Some(_), interval) => row("Tracker pull service", Some(true), format!(
-                "plist present, every {}s; whether launchd loaded it is not checked offline",
-                interval.map_or("?".to_string(), |i| i.to_string())
+    if launchd {
+        use crate::tracker::schedule::{self, Agent};
+        const LABEL: &str = "Tracker pull service";
+        let protected = schedule::is_protected(&config.vault_path, home);
+        match (schedule::agent(home, config_dir), protected) {
+            (Agent::Absent, _) => {}
+            (_, true) => row(LABEL, Some(false), format!(
+                "a launchd agent runs the pull, and the vault is under a folder macOS protects. {} Run `wardwell tracker unschedule` to remove it.",
+                schedule::PROTECTED_SENTENCE
             )),
+            (Agent::Owned { program, .. }, false) if !program.exists() => row(LABEL, Some(false), format!("plist runs {}, which does not exist; run `wardwell tracker schedule` again or `wardwell tracker unschedule`", program.display())),
+            (Agent::Owned { interval, .. }, false) => row(LABEL, Some(true), format!(
+                "plist present, every {interval}s, as `wardwell tracker schedule` wrote it; whether launchd loaded it is not checked offline"
+            )),
+            (Agent::Foreign, false) => row(LABEL, None, "a plist at com.wardwell.tracker-pull that Wardwell did not write; left alone".to_string()),
         }
     }
     (rows, ok)
@@ -349,6 +362,46 @@ fn tracker_rows_with(
     (rows, ok)
 }
 
+/// One fact row per binding with the mirror's freshness words: fresh,
+/// stale and why, or the pull running since a time. Never fails doctor.
+fn mirror_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    config
+        .trackers
+        .iter()
+        .map(|binding| {
+            let label = format!("Mirror {} {}", binding.key(), binding.provider);
+            format!("  {label:<38} {}", freshness_words(config, config_dir, binding, now))
+        })
+        .collect()
+}
+
+/// One failing row per bound project whose refresh state cannot be
+/// written; none when every one can. The bool is false when a row failed.
+fn refresh_state_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
+    let mut projects: Vec<(&str, &str)> = Vec::new();
+    for binding in &config.trackers {
+        if !projects.contains(&(binding.domain.as_str(), binding.project.as_str())) {
+            projects.push((binding.domain.as_str(), binding.project.as_str()));
+        }
+    }
+    let rows: Vec<String> = projects
+        .into_iter()
+        .filter_map(|(domain, project)| crate::tracker::state::check_writable(config_dir, domain, project).err().map(|path| {
+            format!("  {:<38} \u{2717} Refresh state cannot be written at {}.", format!("Refresh {domain}/{project}"), path.display())
+        }))
+        .collect();
+    let ok = rows.is_empty();
+    (rows, ok)
+}
+
+/// The freshness words for one binding, read from its log.
+fn freshness_words(config: &crate::config::loader::WardwellConfig, config_dir: &Path, binding: &crate::config::loader::TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
+    let path = crate::tracker::log::path_for(&config.vault_path, &binding.domain, &binding.project);
+    let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
+    let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, &binding.domain, &binding.project), &binding.provider);
+    crate::tracker::freshness::assess_read(&read, local.as_ref(), now, &crate::tracker::freshness::process_alive).sentence()
+}
+
 /// One row per mapped project: whether each path exists, the age of the
 /// last history entry and decision, the last pull when bound, and the last
 /// Stop-check block. A missing path, a path inside a linked worktree, or a
@@ -371,7 +424,7 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
             }
             let today = now.with_timezone(&chrono::Local).date_naive();
             let rot = crate::inject::session::project_rot_line(&folder, today);
-            format!("  {label:<38} {mark} {}. {rot}{} {}", paths.join(", "), last_pull(config, mapping, &folder, now), last_block(config_dir, key, now))
+            format!("  {label:<38} {mark} {}. {rot}{} {}", paths.join(", "), last_pull(config, config_dir, mapping, now), last_block(config_dir, key, now))
         })
         .collect();
     (rows, ok)
@@ -391,13 +444,10 @@ fn path_status(path: &Path, git: &impl Fn(&Path) -> Option<crate::inject::git::G
     }
 }
 
-/// ` Last pull 2 hours ago.` for a bound project, empty otherwise.
-fn last_pull(config: &crate::config::loader::WardwellConfig, mapping: &crate::config::loader::ProjectMapping, folder: &Path, now: chrono::DateTime<chrono::Utc>) -> String {
-    let Some(binding) = config.tracker_for(&mapping.domain, &mapping.project) else {
-        return String::new();
-    };
-    let view = crate::tracker::view::MirrorView::read_for(&folder.join(crate::tracker::events::FILE_NAME), &binding.provider).unwrap_or_default();
-    view.last_pull_at.map_or(" Never pulled.".to_string(), |at| format!(" Last pull {} ago.", crate::tracker::view::age_words(now - at)))
+/// The freshness words for a bound project, such as ` Last pulled 45m ago.`,
+/// with a leading space; empty when it is not bound.
+fn last_pull(config: &crate::config::loader::WardwellConfig, config_dir: &Path, mapping: &crate::config::loader::ProjectMapping, now: chrono::DateTime<chrono::Utc>) -> String {
+    config.tracker_for(&mapping.domain, &mapping.project).map_or(String::new(), |binding| format!(" {}", freshness_words(config, config_dir, binding, now)))
 }
 
 fn last_block(config_dir: &Path, key: &str, now: chrono::DateTime<chrono::Utc>) -> String {
@@ -684,6 +734,52 @@ mod tests {
     }
 
     #[test]
+    fn mirror_rows_carry_the_freshness_words_for_each_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let now = chrono::Utc::now();
+        assert_eq!(mirror_rows(&config, dir.path(), now), vec![format!("  {:<38} Never pulled. Stale. Reason: No pull was tried.", "Mirror work/claims linear")]);
+        let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let at = |minutes: i64| (now - chrono::TimeDelta::minutes(minutes)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let completed = format!(r#"{{"kind":"pull_completed","id":"p","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"p"}}"#, at(300));
+        let started = format!(r#"{{"kind":"pull_started","id":"s","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"s","pid":{}}}"#, at(1), std::process::id());
+        std::fs::write(&path, format!("{}\n{completed}\n{started}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+        assert!(mirror_rows(&config, dir.path(), now)[0].ends_with(&format!("Last pulled 5h ago; pull running since {}.", at(1))), "{:?}", mirror_rows(&config, dir.path(), now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_mirror_log_is_named_and_never_called_untried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let expected = vec![format!("  {:<38} Could not read the mirror log: log_read.", "Mirror work/claims linear")];
+        std::fs::write(&path, b"\xff").unwrap();
+        assert_eq!(mirror_rows(&config, dir.path(), chrono::Utc::now()), expected);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let rows = mirror_rows(&config, dir.path(), chrono::Utc::now());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn doctor_fails_a_refresh_state_that_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let cfg = dir.path().join("cfg");
+        assert_eq!(refresh_state_rows(&config, &cfg), (vec![], true));
+        let state = crate::tracker::state::path(&cfg, "work", "claims");
+        std::fs::remove_file(crate::tracker::state::path(&cfg, "work", "claims")).ok();
+        std::fs::create_dir_all(&state).unwrap();
+        let (rows, ok) = refresh_state_rows(&config, &cfg);
+        assert!(!ok);
+        assert_eq!(rows, vec![format!("  {:<38} \u{2717} Refresh state cannot be written at {}.", "Refresh work/claims", state.display())]);
+    }
+
+    #[test]
     fn no_bindings_no_tracker_rows() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = tracker_config(dir.path(), "linear");
@@ -759,7 +855,7 @@ mod tests {
         std::fs::create_dir_all(&code).unwrap();
         let config = project_config(dir.path(), &[&code], true);
         let (rows, _) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
-        assert!(rows[0].contains("No decisions. Never pulled. No stop-check blocks."), "{}", rows[0]);
+        assert!(rows[0].contains("No decisions. Never pulled. Stale. Reason: No pull was tried. No stop-check blocks."), "{}", rows[0]);
         let mut config = config;
         config.projects.clear();
         assert_eq!(project_rows(&config, dir.path(), noon(), |_: &Path| None), (vec![], true));
@@ -795,6 +891,13 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
+    /// The agent plist exactly as Wardwell writes it for `program`, with the
+    /// log in `home/cfg`, the config dir these tests pass.
+    fn put_agent(home: &Path, program: &Path) {
+        let log = crate::tracker::schedule::log_path(&home.join("cfg"));
+        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist", &crate::tracker::schedule::launch_agent_plist(program, 3600, &log));
+    }
+
     #[test]
     fn policy_rows_pass_when_the_gate_runs_this_binary_and_every_tool_is_denied() {
         let dir = tempfile::tempdir().unwrap();
@@ -805,38 +908,64 @@ mod tests {
         let settings = serde_json::json!({"permissions": {"deny": deny}, "hooks": {"PreToolUse": [{"matcher": crate::gate::linear::MATCHER,
             "hooks": [{"type": "command", "command": format!("'{}' gate linear", binary.display())}]}]}});
         put(home, ".claude/settings.json", &settings.to_string());
-        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist",
-            &crate::tracker::schedule::launch_agent_plist(&binary, 3600, Path::new("/l")));
-        let (rows, ok) = policy_rows(&policy_config(home, true), home, &binary, true);
+        put_agent(home, &binary);
+        let (rows, ok) = policy_rows(&policy_config(home, true), home, &home.join("cfg"), &binary, true);
         assert!(ok, "{rows:?}");
         assert_eq!(rows[0], format!("  {:<38} \u{2713} linear-updates v1", "Gate ruleset"));
         assert!(rows[1].contains("\u{2713} installed; runs"), "{}", rows[1]);
         assert!(rows[2].contains("7 of 7 destructive tools denied"), "{}", rows[2]);
-        assert!(rows[3].contains("plist present, every 3600s; whether launchd loaded it is not checked offline"), "{}", rows[3]);
+        assert!(rows[3].contains("\u{2713} plist present, every 3600s, as `wardwell tracker schedule` wrote it; whether launchd loaded it is not checked offline"), "{}", rows[3]);
     }
 
     #[test]
-    fn policy_rows_fail_on_a_stale_gate_path_missing_denies_and_no_plist() {
+    fn policy_rows_fail_on_a_stale_gate_path_and_missing_denies_and_no_agent_is_no_row() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "mcp__linear__save_comment|mcp__linear__save_issue", "hooks": [{"type": "command", "command": "/old/wardwell gate linear"}]}]}}"#);
-        let (rows, ok) = policy_rows(&policy_config(home, true), home, Path::new("/new/wardwell"), true);
+        let (rows, ok) = policy_rows(&policy_config(home, true), home, &home.join("cfg"), Path::new("/new/wardwell"), true);
         assert!(!ok);
         assert!(rows[1].contains("\u{2717} runs /old/wardwell, not this binary /new/wardwell; run `wardwell setup`"), "{}", rows[1]);
         assert!(rows[2].contains("\u{2717} missing mcp__linear__delete_comment"), "{}", rows[2]);
-        assert!(rows[3].contains("\u{2717} plist not installed"), "{}", rows[3]);
+        assert_eq!(rows.len(), 3, "no launchd agent, no pull row: {rows:?}");
     }
 
     #[test]
     fn the_pull_row_fails_when_the_plist_program_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist",
-            &crate::tracker::schedule::launch_agent_plist(Path::new("/gone/wardwell"), 3600, Path::new("/l")));
-        let (rows, ok) = policy_rows(&policy_config(home, false), home, Path::new("/w"), true);
+        put_agent(home, Path::new("/gone/wardwell"));
+        let (rows, ok) = policy_rows(&policy_config(home, false), home, &home.join("cfg"), Path::new("/w"), true);
         assert!(!ok);
         let row = rows.iter().find(|r| r.contains("Tracker pull service")).unwrap();
-        assert!(row.contains("\u{2717} plist runs /gone/wardwell, which does not exist; run `wardwell setup`"), "{row}");
+        assert!(row.contains("\u{2717} plist runs /gone/wardwell, which does not exist"), "{row}");
+    }
+
+    #[test]
+    fn an_agent_fails_its_row_when_the_vault_is_under_a_protected_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let binary = home.join("bin/wardwell");
+        put(home, "bin/wardwell", "");
+        put_agent(home, &binary);
+        let mut config = policy_config(home, false);
+        config.vault_path = home.join("Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes");
+        let (rows, ok) = policy_rows(&config, home, &home.join("cfg"), &binary, true);
+        assert!(!ok);
+        let row = rows.iter().find(|r| r.contains("Tracker pull service")).unwrap();
+        assert!(row.contains("\u{2717} a launchd agent runs the pull, and the vault is under a folder macOS protects. macOS asks for consent after every upgrade, and the session refresh needs none. Run `wardwell tracker unschedule` to remove it."), "{row}");
+        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist", "hand written");
+        let (rows, ok) = policy_rows(&config, home, &home.join("cfg"), &binary, true);
+        assert!(!ok, "a plist Wardwell did not write fails too: {rows:?}");
+    }
+
+    #[test]
+    fn a_plist_wardwell_did_not_write_is_a_fact_row_outside_a_protected_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist", "hand written");
+        let (rows, ok) = policy_rows(&policy_config(home, false), home, &home.join("cfg"), Path::new("/w"), true);
+        assert!(ok, "{rows:?}");
+        assert_eq!(rows.last().unwrap(), &format!("  {:<38} a plist at com.wardwell.tracker-pull that Wardwell did not write; left alone", "Tracker pull service"));
     }
 
     #[test]
@@ -844,24 +973,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/w/wardwell gate linear"}]}]}}"#);
-        let (rows, ok) = policy_rows(&policy_config(home, true), home, Path::new("/w/wardwell"), false);
+        let (rows, ok) = policy_rows(&policy_config(home, true), home, &home.join("cfg"), Path::new("/w/wardwell"), false);
         assert!(!ok);
         assert!(rows[1].contains("\u{2717} installed under matcher Bash, which does not match Linear writes"), "{}", rows[1]);
         put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "mcp__linear__.*", "hooks": [{"type": "command", "command": "/w/wardwell gate linear"}]}]}}"#);
-        let (rows, _) = policy_rows(&policy_config(home, true), home, Path::new("/w/wardwell"), false);
+        let (rows, _) = policy_rows(&policy_config(home, true), home, &home.join("cfg"), Path::new("/w/wardwell"), false);
         assert!(rows[1].contains("\u{2713} installed; runs /w/wardwell"), "{}", rows[1]);
     }
 
     #[test]
-    fn policy_rows_say_off_without_gate_true_and_skip_the_pull_without_bindings() {
+    fn policy_rows_say_off_without_gate_true_and_have_no_pull_row_without_launchd() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let (rows, ok) = policy_rows(&policy_config(home, false), home, Path::new("/w"), false);
+        put_agent(home, Path::new("/w/wardwell"));
+        let (rows, ok) = policy_rows(&policy_config(home, false), home, &home.join("cfg"), Path::new("/w"), false);
         assert!(ok);
         assert!(rows[1].ends_with("off; no linear binding has gate: true"), "{}", rows[1]);
-        assert!(rows[2].contains("not checked; launchd is macOS only"), "{}", rows[2]);
+        assert_eq!(rows.len(), 2, "{rows:?}");
         let mut config = policy_config(home, false);
         config.trackers.clear();
-        assert_eq!(policy_rows(&config, home, Path::new("/w"), true).0.len(), 2);
+        std::fs::remove_file(home.join("Library/LaunchAgents/com.wardwell.tracker-pull.plist")).unwrap();
+        assert_eq!(policy_rows(&config, home, &home.join("cfg"), Path::new("/w"), true).0.len(), 2);
     }
 }

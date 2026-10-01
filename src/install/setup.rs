@@ -1,4 +1,4 @@
-use crate::config::loader::{self, TrackerBinding};
+use crate::config::loader;
 use crate::install::detect;
 use crate::install::installer;
 use crate::tracker::schedule::{SystemRunner, current_uid};
@@ -25,7 +25,8 @@ impl Client {
 
 /// Set up or repair this computer's agent configuration without reading or
 /// changing the vault: MCP entries, then the installer's two tiers of hooks
-/// and permissions, and the tracker pull service when a binding exists.
+/// and permissions. It installs no launchd agent; it removes one an earlier
+/// version installed when the vault is under a folder macOS protects.
 pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("wardwell setup\n");
     println!("  Scope: agent configuration on this computer only.");
@@ -36,7 +37,8 @@ pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     let paths = McpConfigPaths::detect();
     let binary_path = detect::find_binary_path();
     let clients = detected_clients(&paths);
-    let trackers = tracker_bindings(&config_dir)?;
+    let config = installed_config(&config_dir)?;
+    let trackers = config.as_ref().map(|c| c.trackers.clone()).unwrap_or_default();
 
     // Preflight every client and every settings file before asking for
     // consent or making any change. A malformed or conflicting file must not
@@ -53,6 +55,7 @@ pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
         claude_code: clients.iter().any(|c| matches!(c, Client::ClaudeCode))
             || installer::settings_path(&home).exists(),
         launchd: cfg!(target_os = "macos"),
+        vault: config.as_ref().map(|c| c.vault_path.as_path()),
     };
     let plan = installer::plan(&inputs)?;
 
@@ -119,15 +122,15 @@ pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// The tracker bindings in config.yml. No config means none; a config that
-/// does not parse stops setup before anything changes.
-pub(crate) fn tracker_bindings(config_dir: &Path) -> Result<Vec<TrackerBinding>, String> {
+/// The config in `config_dir`, or None when there is no config.yml. A
+/// config that does not parse stops setup before anything changes.
+pub(crate) fn installed_config(config_dir: &Path) -> Result<Option<loader::WardwellConfig>, String> {
     let path = config_dir.join("config.yml");
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     loader::load(Some(&path))
-        .map(|config| config.trackers)
+        .map(Some)
         .map_err(|error| format!("{} could not be read ({error}); no files changed", path.display()))
 }
 

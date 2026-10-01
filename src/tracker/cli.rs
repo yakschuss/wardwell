@@ -6,7 +6,7 @@ use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::pull::{Connect, Mode, pull_binding};
 use crate::tracker::schedule::{self, LaunchctlRunner};
 use crate::tracker::events::FailureCode;
-use crate::tracker::{compact, credential, lock, log};
+use crate::tracker::{compact, credential, freshness, lock, log};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
 
@@ -28,10 +28,34 @@ pub fn pull(
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<Vec<String>, String> {
-    let bindings = selected(config, only)?;
+    pull_providers(config, config_dir, only, &[], mode, now, connect)
+}
+
+/// `pull`, limited to the bindings whose provider is in `providers` when it
+/// is not empty. A background refresh passes the providers that are due, so
+/// a provider held after a failure is not pulled with its healthy sibling.
+pub fn pull_providers(
+    config: &WardwellConfig,
+    config_dir: &Path,
+    only: Option<&str>,
+    providers: &[String],
+    mode: Mode,
+    now: DateTime<Utc>,
+    connect: &Connect<'_>,
+) -> Result<Vec<String>, String> {
+    let mut bindings = selected(config, only)?;
+    if let Some(missing) = providers.iter().find(|p| !bindings.iter().any(|(_, b)| &b.provider == *p)) {
+        release_claims(config_dir, &bindings);
+        let mut known: Vec<&str> = bindings.iter().map(|(_, b)| b.provider.as_str()).collect();
+        known.dedup();
+        let whose = only.map_or("No bound project".to_string(), str::to_string);
+        return Err(format!("{whose} has no {missing} binding; its providers are {}.", known.join(", ")));
+    }
+    bindings.retain(|(_, b)| providers.is_empty() || providers.contains(&b.provider));
     let mut lines = Vec::new();
     let mut failures = Vec::new();
-    for (key, binding) in bindings {
+    for (key, binding) in &bindings {
+        let binding = *binding;
         match pull_binding(&config.vault_path, config_dir, binding, mode, now, connect) {
             Ok(outcome) => match (&outcome.failed_full, outcome.resync_due) {
                 (Some(failed), Some(due)) => failures.push(format!(
@@ -44,13 +68,25 @@ pub fn pull(
             Err(error) => failures.push(format!("{key}: {error}")),
         }
     }
+    release_claims(config_dir, &bindings);
     match failures.is_empty() {
         true => Ok(lines),
         false => Err(lines.into_iter().chain(failures).collect::<Vec<_>>().join("\n")),
     }
 }
 
+/// Remove the refresh claim of each project pulled, so the next due
+/// refresh can start.
+pub fn release_claims(config_dir: &Path, bindings: &[(String, &TrackerBinding)]) {
+    for (_, binding) in bindings {
+        crate::tracker::state::release(&crate::tracker::state::claim_path(config_dir, &binding.domain, &binding.project));
+    }
+}
+
 fn pull_summary(outcome: &crate::tracker::pull::PullOutcome) -> String {
+    if outcome.skipped {
+        return "skipped, a pull that completed while this one waited already refreshed it".to_string();
+    }
     let mode = match (outcome.full, outcome.resync_due) {
         (true, Some(due)) => format!("full pull ({}, so this pull ran full)", due.describe()),
         (true, None) => "full pull".to_string(),
@@ -144,20 +180,25 @@ fn status_with(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, s
 fn schedule_line(scheduled: Option<u32>) -> String {
     match scheduled {
         Some(seconds) => format!("pull schedule: every {seconds} s (plist on disk)"),
-        None => "pull schedule: not scheduled".to_string(),
+        None => "pull schedule: no launchd agent; session start and the running server refresh a mirror over an hour old".to_string(),
     }
 }
 
 /// Install the launchd agent that runs `tracker pull` every `interval_seconds`.
+/// For a vault under a folder macOS protects, the first line is the
+/// sentence that says why the session refresh is the better choice.
 pub fn schedule(
     home: &Path,
     config_dir: &Path,
+    vault: Option<&Path>,
     interval_seconds: u32,
     runner: &dyn LaunchctlRunner,
     current_exe: &Path,
     uid: u32,
-) -> Result<String, String> {
-    schedule::schedule(home, config_dir, interval_seconds, runner, current_exe, uid)
+) -> Result<Vec<String>, String> {
+    let installed = schedule::schedule(home, config_dir, interval_seconds, runner, current_exe, uid)?;
+    let warning = vault.filter(|vault| schedule::is_protected(vault, home)).map(|_| schedule::PROTECTED_SENTENCE.to_string());
+    Ok(warning.into_iter().chain([installed]).collect())
 }
 
 /// Remove the launchd agent.
@@ -187,11 +228,15 @@ fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &Tracke
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
+    let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
+    let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, &binding.domain, &binding.project), &binding.provider);
+    let fresh = freshness::assess_read(&read, local.as_ref(), now, &freshness::process_alive);
     let blocked = cannot_pull(config_dir, binding, gh_on_path).map(|code| format!(", cannot pull ({})", code.as_str()));
     let last = summary.last_failure.map(|(at, code)| format!(", last error {} at {}", code.as_str(), stamp(at)));
-    let failure = match (blocked, last) {
-        (None, None) => ", no errors".to_string(),
-        (blocked, last) => format!("{}{}", blocked.unwrap_or_default(), last.unwrap_or_default()),
+    let problems = format!("{}{}{}", blocked.unwrap_or_default(), last.unwrap_or_default(), freshness_tail(&fresh));
+    let failure = match problems.is_empty() {
+        true => ", no errors".to_string(),
+        false => problems,
     };
     let Some(pulled) = summary.last_pull_at else {
         return format!("{head}, never pulled{failure}");
@@ -203,6 +248,19 @@ fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &Tracke
         age(now - pulled),
         summary.event_count
     )
+}
+
+/// What the status line adds for a mirror that is not fresh and clean:
+/// the stale words and reason, the running pull, or a pull that did not
+/// finish. Empty when the mirror is fresh and clean.
+fn freshness_tail(fresh: &freshness::Freshness) -> String {
+    match (fresh.state, fresh.unfinished) {
+        (freshness::State::Stale(reason), _) => format!(". Stale. Reason: {}.", reason.sentence()),
+        (freshness::State::Running(since), _) => format!(", pull running since {}", stamp(since)),
+        (freshness::State::Unreadable(code), _) => format!(". Could not read the mirror log: {}.", code.as_str()),
+        (freshness::State::Fresh, Some(at)) => format!(", a pull started at {} and did not finish", stamp(at)),
+        (freshness::State::Fresh, None) => String::new(),
+    }
 }
 
 fn stamp(time: DateTime<Utc>) -> String {
@@ -262,6 +320,88 @@ mod tests {
         assert!(!message.contains("lin_api_secret"));
         let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
         assert_eq!(crate::tracker::credential::load(&path).unwrap().token(), "lin_api_secret");
+    }
+
+    #[test]
+    fn a_pull_releases_the_project_claim_on_success_and_on_failure() {
+        let (dir, config) = setup(false);
+        let claim = crate::tracker::state::claim_path(dir.path(), "work", "claims");
+        assert!(crate::tracker::state::claim(&claim, Utc::now()));
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap_err();
+        assert!(!claim.exists(), "released after a failed pull");
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        assert!(crate::tracker::state::claim(&claim, Utc::now()));
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
+        assert!(!claim.exists(), "released after a completed pull");
+    }
+
+    #[test]
+    fn a_provider_filter_pulls_only_those_providers_and_a_manual_pull_ignores_the_hold() {
+        let (dir, config) = linear_and_github();
+        let state_path = crate::tracker::state::path(dir.path(), "work", "claims");
+        crate::tracker::state::record(&state_path, "linear", crate::tracker::state::Record::Failed(FailureCode::Provider), Utc::now()).unwrap();
+        let lines = pull_providers(&config, dir.path(), Some("work/claims"), &["github".to_string()], Mode::Incremental, now(), &fake_connect).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        assert_eq!(log::read_for(&path, "linear").unwrap().last_pull_at, None, "linear was not pulled");
+        let manual = pull(&config, dir.path(), Some("work/claims"), Mode::Incremental, now(), &fake_connect).unwrap();
+        assert_eq!(manual.len(), 2, "a manual pull ignores the hold: {manual:?}");
+    }
+
+    /// Counts provider reads.
+    struct CountsReads(std::rc::Rc<std::cell::Cell<usize>>);
+    impl Adapter for CountsReads {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_log_completion_stamped_in_the_future_never_skips_a_pull() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let wall = Utc::now();
+        seed(&config, wall + chrono::TimeDelta::hours(3), &[]);
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = std::rc::Rc::clone(&reads);
+        let connect_counting = move |_: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>| -> Result<Box<dyn Adapter>, String> {
+            Ok(Box::new(CountsReads(std::rc::Rc::clone(&counter))))
+        };
+        let manual = pull(&config, dir.path(), None, Mode::IncrementalOnly, wall, &connect_counting).unwrap();
+        assert!(manual[0].contains("incremental pull"), "{manual:?}");
+        assert_eq!(reads.get(), 1, "the manual pull read the provider");
+        let triggered = pull_providers(&config, dir.path(), Some("work/claims"), &["linear".to_string()], Mode::IncrementalOnly, Utc::now(), &connect_counting).unwrap();
+        assert!(triggered[0].contains("incremental pull"), "{triggered:?}");
+        assert_eq!(reads.get(), 2, "the triggered pull read the provider");
+        let state_path = crate::tracker::state::path(dir.path(), "work", "claims");
+        let local = crate::tracker::state::provider(&state_path, "linear").unwrap();
+        assert!(local.completed_at.is_some_and(|at| at <= Utc::now()), "{local:?}");
+        let spawned = std::cell::Cell::new(false);
+        struct Never<'a>(&'a std::cell::Cell<bool>);
+        impl crate::tracker::trigger::Spawner for Never<'_> {
+            fn spawn(&self, _: &str, _: &[&str]) -> Result<(), String> {
+                self.0.set(true);
+                Ok(())
+            }
+        }
+        let places = crate::tracker::trigger::Places { config: &config, config_dir: dir.path(), vault_bound: crate::tracker::bounded::VAULT_BOUND };
+        let probes = crate::tracker::trigger::Probes { alive: &|_| false, can_pull: &|_| true };
+        let outcome = crate::tracker::trigger::refresh(&places, "work", "claims", Utc::now() + chrono::TimeDelta::minutes(2), &Never(&spawned), &probes);
+        assert_eq!(outcome, crate::tracker::trigger::Outcome::NotDue);
+        assert!(!spawned.get(), "the next session start spawns nothing");
+    }
+
+    #[test]
+    fn a_provider_with_no_binding_fails_with_one_sentence_and_releases_the_claim() {
+        let (dir, config) = linear_and_github();
+        let claim = crate::tracker::state::claim_path(dir.path(), "work", "claims");
+        assert!(crate::tracker::state::claim(&claim, Utc::now()));
+        let error = pull_providers(&config, dir.path(), Some("work/claims"), &["jira".to_string()], Mode::Incremental, now(), &fake_connect).unwrap_err();
+        assert_eq!(error, "work/claims has no jira binding; its providers are linear, github.");
+        assert!(!claim.exists(), "the claim is released on this path too");
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        assert!(!path.exists(), "nothing pulled");
     }
 
     #[test]
@@ -350,7 +490,7 @@ mod tests {
         assert!(line.contains("readonly"), "{line}");
         assert!(line.contains("last pull 2026-09-01T12:00:00Z (1h 30m ago)"), "{line}");
         assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "{line}");
-        assert!(line.contains("1 events"), "{line}");
+        assert!(line.contains("2 events"), "the pull_started and full_resync markers: {line}");
         assert!(!line.contains("lin_api_secret"));
     }
 
@@ -483,14 +623,16 @@ mod tests {
             }
         };
         pull(&config, dir.path(), None, Mode::Incremental, later, &github_breaks).unwrap_err();
-        let lines = status_with(&config, dir.path(), later, None, false);
+        // A second after the pulls: the local state holds each pull's clock
+        // at its end, a few milliseconds after `later`.
+        let lines = status_with(&config, dir.path(), later + chrono::TimeDelta::seconds(1), None, false);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("work/claims: linear COR (writable), last pull 2026-09-01T12:10:00Z"), "{}", lines[0]);
         assert!(lines[0].ends_with("no errors"), "{}", lines[0]);
-        assert!(lines[1].starts_with("work/claims: github acme/app, last pull 2026-09-01T12:00:00Z (10m ago), last full resync never, 2 events"), "{}", lines[1]);
+        assert!(lines[1].starts_with("work/claims: github acme/app, last pull 2026-09-01T12:00:00Z (10m ago), last full resync never, 4 events"), "two starts, a completion, a failure: {}", lines[1]);
         assert!(lines[1].ends_with(", cannot pull (credential), last error provider at 2026-09-01T12:10:00Z"), "{}", lines[1]);
-        let reachable = status_with(&config, dir.path(), later, None, true);
-        assert!(reachable[1].ends_with("10m ago), last full resync never, 2 events, last error provider at 2026-09-01T12:10:00Z"), "{}", reachable[1]);
+        let reachable = status_with(&config, dir.path(), later + chrono::TimeDelta::seconds(1), None, true);
+        assert!(reachable[1].ends_with("10m ago), last full resync never, 4 events, last error provider at 2026-09-01T12:10:00Z"), "{}", reachable[1]);
     }
 
     #[test]
@@ -499,7 +641,7 @@ mod tests {
         pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(10);
         pull(&config, dir.path(), None, Mode::Incremental, later, &claims_breaks).unwrap_err();
-        let lines = status(&config, dir.path(), later, None);
+        let lines = status(&config, dir.path(), later + chrono::TimeDelta::seconds(1), None);
         assert_eq!(lines.len(), 3, "{lines:?}");
         let claims = lines.iter().find(|l| l.starts_with("work/claims")).unwrap();
         assert!(claims.contains("last pull 2026-09-01T12:00:00Z"), "{claims}");
@@ -514,14 +656,14 @@ mod tests {
         let (dir, mut config) = two_bindings();
         std::fs::remove_file(crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap()).unwrap();
         let lines = status(&config, dir.path(), now(), None);
-        assert!(lines[0].ends_with("never pulled, cannot pull (credential)"), "{lines:?}");
+        assert!(lines[0].ends_with("never pulled, cannot pull (credential). Stale. Reason: No pull was tried."), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("no errors")), "{lines:?}");
 
         connect(dir.path(), "corr-linear", "t").unwrap();
         config.trackers.iter_mut().find(|b| b.project == "ops").unwrap().provider = "jira".into();
         let lines = status(&config, dir.path(), now(), None);
-        assert!(lines[0].ends_with("never pulled, no errors"), "{lines:?}");
-        assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider)"), "{lines:?}");
+        assert!(lines[0].ends_with("never pulled. Stale. Reason: No pull was tried."), "{lines:?}");
+        assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider). Stale. Reason: No pull was tried."), "{lines:?}");
     }
 
     #[test]
@@ -538,7 +680,7 @@ mod tests {
         let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &revoked).unwrap_err();
         assert!(error.ends_with("(auth)"), "{error}");
         let line = &status(&config, dir.path(), now(), None)[0];
-        assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z"), "{line}");
+        assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z. Stale. Reason: The last pull failed: auth."), "{line}");
     }
 
     #[test]
@@ -548,14 +690,111 @@ mod tests {
             Err("never called without a credential".into())
         };
         let error = doctor(&config, dir.path(), &unreachable, &crate::tracker::doctor::connect_github).unwrap_err();
-        assert_eq!(error.lines().count(), 4, "{error}");
+        assert_eq!(error.lines().count(), 5, "four checks and the mirror line: {error}");
         assert!(error.starts_with("work/claims: credential failed (credential)"), "{error}");
+    }
+
+    /// Writes `rows` after a completed pull at `pulled` into work/claims's log.
+    fn seed(config: &WardwellConfig, pulled: DateTime<Utc>, rows: &[String]) {
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let completed = format!(
+            r#"{{"kind":"pull_completed","id":"p","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"p"}}"#,
+            stamp(pulled)
+        );
+        let body: String = std::iter::once(completed).chain(rows.iter().cloned()).map(|row| format!("{row}\n")).collect();
+        std::fs::write(path, format!("{}\n{body}", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+    }
+
+    fn started(at: DateTime<Utc>, pid: u32) -> String {
+        format!(r#"{{"kind":"pull_started","id":"s{pid}","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"s","pid":{pid}}}"#, stamp(at))
+    }
+
+    #[test]
+    fn status_never_says_no_errors_for_a_stale_mirror() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        seed(&config, now() - chrono::TimeDelta::hours(5), &[]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with("1 events. Stale. Reason: No pull was tried."), "{line}");
+        assert!(!line.contains("no errors"), "{line}");
+        seed(&config, now() - chrono::TimeDelta::minutes(30), &[]);
+        assert!(status(&config, dir.path(), now(), None)[0].ends_with("no errors"), "a fresh clean mirror");
+    }
+
+    #[test]
+    fn status_shows_a_running_pull_and_its_start_time() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        seed(&config, now() - chrono::TimeDelta::hours(5), &[started(now() - chrono::TimeDelta::minutes(2), std::process::id())]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(", pull running since 2026-09-01T11:58:00Z"), "{line}");
+        assert!(!line.contains("no errors"), "{line}");
+    }
+
+    #[test]
+    fn status_never_says_no_errors_for_an_unfinished_pull() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let gone = u32::MAX;
+        seed(&config, now() - chrono::TimeDelta::minutes(40), &[started(now() - chrono::TimeDelta::minutes(30), gone)]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(", a pull started at 2026-09-01T11:30:00Z and did not finish"), "{line}");
+        seed(&config, now() - chrono::TimeDelta::hours(3), &[started(now() - chrono::TimeDelta::minutes(30), gone)]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(". Stale. Reason: A pull started at 2026-09-01T11:30:00Z and did not finish."), "{line}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_on_a_protected_vault_prints_the_one_sentence_and_still_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let fake = crate::tracker::schedule::fake::Fake::new(&[]);
+        let icloud = home.join("Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes");
+        let lines = schedule(&home, &home.join(".wardwell"), Some(&icloud), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        assert_eq!(lines[0], "macOS asks for consent after every upgrade, and the session refresh needs none.");
+        assert!(lines[1].starts_with("Scheduled tracker pull every 3600s"), "{lines:?}");
+        let elsewhere = schedule(&home, &home.join(".wardwell"), Some(&home.join("notes")), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        assert_eq!(elsewhere.len(), 1, "{elsewhere:?}");
+    }
+
+    #[test]
+    fn a_pull_stopped_at_the_deadline_while_the_vault_cannot_be_written_shows_in_status() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        seed(&config, now() - chrono::TimeDelta::hours(3), &[]);
+        let binding = config.trackers[0].clone();
+        let state_path = crate::tracker::state::path(dir.path(), "work", "claims");
+        let pid = 4242;
+        crate::tracker::state::record(&state_path, "linear", crate::tracker::state::Record::Started(pid), now() - chrono::TimeDelta::minutes(20)).unwrap();
+        #[cfg(unix)]
+        let project = config.vault_path.join("work/claims");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o500)).unwrap();
+            std::fs::set_permissions(log::path_for(&config.vault_path, "work", "claims"), std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        let marked = crate::tracker::deadline::record_timeouts(&config.vault_path, dir.path(), &[binding], pid, now() - chrono::TimeDelta::minutes(5));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(marked, vec!["work/claims linear"]);
+        assert!(!std::fs::read_to_string(log::path_for(&config.vault_path, "work", "claims")).unwrap().contains("timeout"), "the vault was not written");
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(". Stale. Reason: A pull started at 2026-09-01T11:40:00Z and did not finish."), "{line}");
     }
 
     #[test]
     fn status_ends_with_the_schedule_line() {
         let (dir, config) = setup(false);
-        assert_eq!(status(&config, dir.path(), now(), None).last().unwrap(), "pull schedule: not scheduled");
+        assert_eq!(
+            status(&config, dir.path(), now(), None).last().unwrap(),
+            "pull schedule: no launchd agent; session start and the running server refresh a mirror over an hour old"
+        );
         assert_eq!(status(&config, dir.path(), now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
     }
 }

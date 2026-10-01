@@ -5,11 +5,14 @@
 //! tracker; the kanban readonly lock enforces that on the vault side.
 
 pub mod adapter;
+pub mod bounded;
 pub mod cli;
 pub mod compact;
 pub mod credential;
+pub mod deadline;
 pub mod doctor;
 pub mod events;
+pub mod freshness;
 pub mod github;
 pub mod items;
 pub mod linear;
@@ -18,6 +21,8 @@ pub mod log;
 pub mod pull;
 pub mod refresh;
 pub mod schedule;
+pub mod state;
+pub mod trigger;
 pub mod view;
 
 /// Provider ids Wardwell has an adapter for.

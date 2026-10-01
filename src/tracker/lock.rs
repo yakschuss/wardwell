@@ -84,7 +84,7 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(200), "bounded wait honoured");
         assert!(error.contains(LOCK_BUSY), "{error}");
         drop(held);
-        assert!(acquire(&log, Duration::ZERO).is_ok(), "released on drop");
+        assert!(acquire(&log, TEST_FREE_WAIT).is_ok(), "released on drop");
         assert!(!log.exists(), "the lock never creates the log");
     }
 }

@@ -21,7 +21,7 @@ Then run three commands:
 
 ```bash
 wardwell init       # first run: vault, config, agent entries, hooks, index
-wardwell setup      # preview, then install or repair hooks, tracker policy and the pull
+wardwell setup      # preview, then install or repair hooks and tracker policy
 wardwell doctor     # check the wiring; it says what it cannot check
 ```
 
@@ -56,9 +56,16 @@ original.
   linear` and `gate: true`. The Linear gate, a PreToolUse hook, and a deny
   list for destructive Linear tools. See [Linear gate](#linear-gate).
 
-When any binding exists, `setup` also installs the hourly tracker pull, a
-launchd agent on macOS. On other hosts it prints a crontab line. When no
-binding is left, `setup` removes the agent.
+`setup` installs no background service. See [How the mirror stays
+fresh](#how-the-mirror-stays-fresh). An earlier version installed a launchd
+agent, `com.wardwell.tracker-pull`. When the vault is under a folder macOS
+protects, `setup` removes that agent: it boots the job out, backs up the
+plist, and deletes it. The protected folders are `~/Library/Mobile
+Documents`, which is iCloud Drive, `~/Documents`, `~/Desktop` and
+`~/Downloads`. When the vault is elsewhere, the agent stays and the plan says
+UNCHANGED, because it is then your own choice. `setup` removes only an exact
+match: the plist Wardwell writes, for a Wardwell program. Any other plist at
+that path is left alone, and the plan says so.
 
 Installed is not active. Claude Code reads hooks and permissions when a
 session starts. Sessions already running do not change. Start a new session,
@@ -75,7 +82,8 @@ wardwell uninstall
 ```
 
 It removes Wardwell's connection entries, its hooks, the deny entries it
-added and no others, the pull service, and its CLAUDE.md markers. It never
+added and no others, a launchd pull agent that is exactly Wardwell's, and its
+CLAUDE.md markers. It never
 deletes the Wardwell folder. It leaves the Companion install whole and says so.
 
 ## How It Works
@@ -333,10 +341,10 @@ The Companion Stop check runs first. When both block, one block carries both rea
 wardwell serve                Start the MCP server (full access)
 wardwell serve --domain work  Start scoped to a specific domain
 wardwell init                 First-run setup — interactive walkthrough
-wardwell setup --dry-run      Preview agent config, hooks, tracker policy and pull; never changes the vault
+wardwell setup --dry-run      Preview agent config, hooks and tracker policy; never changes the vault
 wardwell setup [--yes]        Apply that plan, with backups and one consent gate
 wardwell doctor               Check that everything is wired correctly
-wardwell uninstall            Remove Wardwell's entries, hooks, deny entries and pull (preserves vault)
+wardwell uninstall            Remove Wardwell's entries, hooks, deny entries and pull agent (preserves vault)
 wardwell gate linear          PreToolUse hook: check a Linear write (reads JSON from stdin)
 wardwell inject .             Output project context for a directory, used by hooks
 wardwell project link [<d/p>] [--path <dir>] [--dry-run] [--yes]   Link a directory to a vault project
@@ -369,7 +377,8 @@ Configures or repairs this computer after Wardwell itself is installed. Unlike
 `init`, it does not inspect, create, index, or change vault files. Before any
 write it preflights every detected client and every settings file, and aborts
 on malformed or conflicting configuration. It installs the two tiers described
-under [Install](#install) and the tracker pull. `init` uses the same installer
+under [Install](#install), and removes an earlier pull agent as described
+there. `init` uses the same installer
 for its hooks. OAuth approval and a successful publish/refresh remain required
 before the hosted app is considered connected.
 
@@ -401,8 +410,9 @@ Checks that everything is wired correctly:
 - Gate ruleset: its name and version, `linear-updates v1`
 - Linear gate: installed when a linear binding has `gate: true`, and running this binary
 - Linear deny list: every destructive Linear tool denied
-- Tracker pull service: the plist is present and its program exists. Whether launchd loaded it is not checked.
-- Each linked project: whether each directory exists, the age of the last history entry and last decision, the last pull when bound, and the last stop-check block
+- Tracker pull service: a row only when a launchd agent exists. It fails when the vault is under a folder macOS protects, and when the program it runs is gone. Whether launchd loaded it is not checked.
+- Each tracker binding's mirror: fresh, stale and why, or the pull running since a time
+- Each linked project: whether each directory exists, the age of the last history entry and last decision, the mirror's freshness when bound, and the last stop-check block
 - Claude CLI available (for summarizer)
 
 `doctor` verifies configuration, not authorization. Complete OAuth and publish
@@ -596,7 +606,7 @@ a `full_resync` marker that also sets the cursor. Linear does not timestamp
 every change; a new relation or the archive of an old issue can leave the
 update time alone, so an incremental pull would miss it. A pull therefore runs
 full, and says so in its output line, when the newest `full_resync` marker is
-more than 24 hours old or there is none. With the hourly schedule that is one
+more than 24 hours old or there is none. With an hourly refresh that is one
 full pull a day. A full pull that returns no issues while the mirror holds
 open ones removes nothing: it fails with `empty_full_result`, since a renamed
 team key or a token that lost access looks the same as an emptied tracker.
@@ -621,8 +631,10 @@ with neither `gh` nor a token is the exception: its pull appends a
 `pull_failed` marker with code `credential`. `status` lists every
 binding with its last error. It also checks, without a network call, that the
 provider is known and the credential reads, and prints `cannot pull` with the
-code when either fails; it says `no errors` only when both pass and no pull
-failed. `pull` exits non-zero when any binding failed.
+code when either fails. It adds the mirror's freshness: the stale words and
+reason, `pull running since <time>`, or a pull that did not finish. It says
+`no errors` only when both checks pass, no pull failed, and the mirror is
+fresh with no unfinished pull. `pull` exits non-zero when any binding failed.
 
 `tracker doctor` prints four lines per linear binding. They check whether the credential
 file exists with owner-only permissions, whether the provider accepts the token on one
@@ -703,10 +715,12 @@ days ago. The history age comes from the last entry at the end of
 `history.jsonl`. When the domain's own state file is
 printed, only the bound projects follow it, each under its own header.
 Folders that are hidden or start with an underscore get no added lines. The
-section's first line is "Tracker mirror. Last pulled 2 hours ago. Not
+section's first line is "Tracker mirror. Last pulled 45 minutes ago. Not
 authoritative." Up to ten issues in a started state follow, each with key,
-title and state. When the last pull failed or is more than 24 hours old, the
-section shows only the age and that notice. A mirror never pulled says only
+title and state. From 2 hours on, the first line says the mirror is stale and
+why, such as "Tracker mirror. Last pulled 5h ago. Stale. Reason: No pull was
+tried." When the last pull failed or is more than 24 hours old, the section
+lists no issues. A mirror never pulled says only
 "Tracker mirror. Never pulled. Not authoritative." Inject also runs the
 offline doctor check. When pulls cannot run, the section is one line, such as
 "Tracker mirror. Pulls cannot run: credential. Last pulled 3 days ago." It
@@ -721,20 +735,84 @@ running it. When `WARDWELL_GH_CANDIDATES` is set, its colon-separated paths
 replace those two fixed paths, and an empty value means none. With neither, the row reads: "github: unreachable,
 run `wardwell tracker connect github`".
 
+### How the mirror stays fresh
+
+No background service pulls the mirror. Two things start a pull instead.
+
+- Session start. The session-start hook prints the project context and the
+  tracker section first. Then it reads the project's local refresh state
+  file, `~/.wardwell/refresh/<domain>/<project>.json`. It never reads the
+  vault. A provider is due when its last completed pull is more than one
+  hour old, or when the file is missing or unreadable. A provider whose last
+  pull failed less than one hour ago is held. Nothing starts while a pull of
+  the project runs, or while any start, completion or failure is younger
+  than 60 seconds. A time stamped in the future counts as old.
+- When a provider is due, the hook takes the project's claim file,
+  `<project>.claim` beside the state file, which only one process
+  can create. A claim younger than 20 minutes stops any other start; an
+  older one is replaced. The hook then starts `wardwell tracker pull
+  --project <domain>/<project> --provider <provider>` for the due providers
+  in the background and returns at once. A failed provider is not pulled
+  again with its healthy sibling. That session prints one line: "Refresh
+  started in the background." The hook never waits on the pull and never
+  opens the network. The pull runs in its own session, with its output
+  appended to `~/.wardwell/tracker-pull.log`. It releases the claim when it
+  ends. After it takes the project lock, it reads nothing from the provider
+  when another pull completed while it waited.
+- The running server. While `wardwell serve` runs, it asks every bound
+  project the same question once an hour, the first time one hour after it
+  starts. It uses the same function as the hook. A failure goes to its log
+  and never stops the server.
+
+So the mirror refreshes while a session or the server runs, not on a clock
+when nothing runs.
+
+A pull records its start, completion and failure in a local state file,
+`~/.wardwell/refresh/<domain>/<project>.json`. It also writes a
+`pull_started` marker with its process id to the log before it calls the
+provider. A pull stops after 15 minutes. `WARDWELL_PULL_DEADLINE_SECONDS` exists for
+tests; a value from 1 to 3600 is honoured, and any other value uses the
+15 minutes. It always records the timeout in the
+local state, and it writes a `pull_failed` marker with the code `timeout`
+when the vault can be written. `status` then says "A pull started at <time>
+and did not finish." A refresh that cannot start the pull records the code
+`spawn` the same way.
+
+Every surface says the same words about freshness: `status`, `tracker
+doctor`, `doctor` and the session-start section. Under 2 hours the mirror is
+fresh. From 2 hours on it is stale, with one of three reasons:
+
+- "The last pull failed: <code>"
+- "A pull started at <time> and did not finish". The process that started it
+  is gone, or it is older than the deadline allows.
+- "No pull was tried"
+
+For example: "Last pulled 5h ago. Stale. Reason: No pull was tried." While a
+pull runs, `status` and `doctor` say `pull running since <time>`.
+
+Why there is no background service: macOS asks the person to allow a
+background job to read a folder it protects, such as iCloud Drive. It asks
+again for every new build, and `brew upgrade` installs a new build. Until
+someone answers, the job waits, and the mirror goes stale without a word. A
+pull that a session starts runs with the permission of the app that started
+the session, so it needs no answer.
+
 ```sh
 wardwell tracker schedule [--interval-seconds 3600]
 wardwell tracker unschedule
 ```
 
-`schedule` installs a launchd agent (macOS) that runs `wardwell tracker pull` at
-load and every interval, using the binary you ran it with, and replaces any
+`schedule` stays as an explicit choice for a vault outside the protected
+folders. It installs a launchd agent on macOS that runs `wardwell tracker pull`
+at load and every interval, using the binary you ran it with, and replaces any
 existing agent of the same label; output goes to `~/.wardwell/tracker-pull.log`.
-The interval must be 60 to 2147483647 seconds. On other hosts `schedule` prints a
-crontab line instead, marked approximate when cron cannot express the interval.
-`wardwell setup` installs the same agent at the hourly default when any binding
-exists, keeps an interval you set, and `wardwell uninstall` removes it.
-`unschedule` stops the agent and removes its plist. `status` reports the interval
-read from the plist on disk, not whether launchd has the job loaded.
+The interval must be 60 to 2147483647 seconds. On a vault under a protected
+folder it still installs, and first prints: "macOS asks for consent after
+every upgrade, and the session refresh needs none." On other hosts `schedule`
+prints a crontab line instead, marked approximate when cron cannot express the
+interval. `unschedule` stops the agent and removes its plist. `status` reports
+the interval read from the plist on disk, not whether launchd has the job
+loaded.
 
 Follow-up, not in this version: importing a tracker's CSV or JSON export from a
 file instead of pulling over the API. Also a follow-up: a debounce in the
@@ -772,8 +850,8 @@ requests are never removed.
 Wardwell reads GitHub in this order:
 
 1. `gh`, when one is found and answers. Wardwell looks on PATH, then at
-   `/opt/homebrew/bin/gh`, then at `/usr/local/bin/gh`. The hourly service
-   runs with a short PATH, so the two fixed paths matter there.
+   `/opt/homebrew/bin/gh`, then at `/usr/local/bin/gh`. A client hook or a
+   launchd agent can run with a short PATH, so the two fixed paths matter there.
 2. The REST API at `GET /repos/<owner>/<name>/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=<n>`,
    with the token stored by `wardwell tracker connect github --token-stdin`.
    Paging stops at the first pull request updated before the cursor.

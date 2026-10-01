@@ -120,6 +120,9 @@ enum TrackerCommand {
         /// With --full, accept an empty result and remove every open issue
         #[arg(long, requires = "full")]
         allow_empty: bool,
+        /// Only bindings of this provider; repeat for several. A background refresh passes the providers that are due
+        #[arg(long)]
+        provider: Vec<String>,
     },
     /// Show last pull, last full resync, event count and readonly flag per project
     Status,
@@ -134,7 +137,7 @@ enum TrackerCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Run `tracker pull` on a launchd interval (macOS), replacing any existing agent
+    /// Run `tracker pull` on a launchd interval (macOS), replacing any existing agent; not needed for a vault in a folder macOS protects
     Schedule {
         /// Seconds between pulls
         #[arg(long, default_value_t = 3600)]
@@ -272,8 +275,10 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
             let token = String::from_utf8(bytes).map_err(|_| "Tracker token must be UTF-8")?;
             vec![cli::connect(&config_dir, &name, &token)?]
         }
-        TrackerCommand::Pull { project, full, allow_empty } => {
+        TrackerCommand::Pull { project, full, allow_empty, provider } => {
             use wardwell::tracker::pull::Mode;
+            let only = project.clone();
+            let _watchdog = wardwell::tracker::deadline::arm(wardwell::tracker::deadline::pull_deadline(), move || expire_pull(only));
             let config = wardwell::config::loader::load(None)?;
             let now = chrono::Utc::now();
             let mode = match (full, allow_empty) {
@@ -281,7 +286,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
                 (true, false) => Mode::Full,
                 (true, true) => Mode::FullAllowEmpty,
             };
-            cli::pull(&config, &config_dir, project.as_deref(), mode, now, &connect_provider)?
+            cli::pull_providers(&config, &config_dir, project.as_deref(), &provider, mode, now, &connect_provider)?
         }
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;
@@ -297,7 +302,8 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         }
         TrackerCommand::Schedule { interval_seconds } => {
             let exe = std::env::current_exe()?;
-            vec![cli::schedule(&home()?, &config_dir, interval_seconds, &SystemRunner, &exe, current_uid()?)?]
+            let vault = wardwell::config::loader::load(None).ok().map(|config| config.vault_path);
+            cli::schedule(&home()?, &config_dir, vault.as_deref(), interval_seconds, &SystemRunner, &exe, current_uid()?)?
         }
         TrackerCommand::Unschedule => vec![cli::unschedule(&home()?, &SystemRunner, current_uid()?)?],
     };
@@ -305,6 +311,40 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         println!("{line}");
     }
     Ok(())
+}
+
+/// The pull ran past its deadline: record `timeout` for each binding whose
+/// pull this process started and did not end, waiting a bounded time for
+/// the write, then stop the process.
+fn expire_pull(only: Option<String>) {
+    use wardwell::tracker::deadline::{MARKER_WAIT, describe, pull_deadline, record_log_timeouts, record_state_timeouts};
+    let pid = std::process::id();
+    let (done, finished) = std::sync::mpsc::channel();
+    // The local state first, since it lives outside the vault; then the log
+    // marker, which may block. Each half reports as soon as it is done.
+    std::thread::spawn(move || {
+        let Ok(config) = wardwell::config::loader::load(None) else {
+            return;
+        };
+        let config_dir = wardwell::config::loader::config_dir();
+        let bindings: Vec<_> = config.trackers.iter().filter(|b| only.as_deref().is_none_or(|key| b.key() == key)).cloned().collect();
+        let now = chrono::Utc::now();
+        let _ = done.send(record_state_timeouts(&config_dir, &bindings, pid, now));
+        for binding in &bindings {
+            wardwell::tracker::state::release(&wardwell::tracker::state::claim_path(&config_dir, &binding.domain, &binding.project));
+        }
+        let _ = done.send(record_log_timeouts(&config.vault_path, &bindings, pid, now));
+    });
+    let until = std::time::Instant::now() + MARKER_WAIT;
+    let in_state = finished.recv_timeout(MARKER_WAIT).unwrap_or_default();
+    let in_log = finished.recv_timeout(until.saturating_duration_since(std::time::Instant::now()));
+    let marked = match (in_state.is_empty(), in_log) {
+        (true, _) => "no timeout was recorded".to_string(),
+        (false, Ok(_)) => format!("recorded timeout for {}", in_state.join(", ")),
+        (false, Err(_)) => format!("recorded timeout for {} in the local state; the log marker was not written", in_state.join(", ")),
+    };
+    eprintln!("wardwell: tracker pull stopped after {}; {marked}", describe(pull_deadline()));
+    std::process::exit(1);
 }
 
 async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -657,6 +697,12 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
         )
         .await;
     });
+    // Refresh each bound project's mirror on the hour while the server runs,
+    // the first time one hour after it starts. A failure is logged only.
+    tokio::spawn(wardwell::tracker::trigger::serve_refresh(wardwell::tracker::trigger::SERVE_INTERVAL, config_dir.clone(), |dir| {
+        let lines = wardwell::tracker::trigger::serve_round(dir, || wardwell::config::loader::load(None).map_err(|e| e.to_string()), chrono::Utc::now());
+        lines.iter().for_each(|line| eprintln!("wardwell: {line}"));
+    }));
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
 
@@ -730,11 +776,17 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     let cwd = std::path::absolute(cwd)?;
     let today = chrono::Local::now().date_naive();
-    // No match prints nothing. Don't pollute non-project sessions.
-    print!(
-        "{}",
-        wardwell::inject::start::output(&cwd, &config, &loader::config_dir(), wardwell::inject::git::dirs, chrono::Utc::now(), today)
-    );
+    let config_dir = loader::config_dir();
+    let now = chrono::Utc::now();
+    // Reads the project's markers and, when due, starts a detached pull and
+    // returns at once; it never waits on the pull or opens the network.
+    let refresh = |domain: &str, project: &str| {
+        wardwell::tracker::trigger::refresh_detached(&config, &config_dir, domain, project, now) == wardwell::tracker::trigger::Outcome::Started
+    };
+    // No match prints nothing. Don't pollute non-project sessions. The
+    // context is printed and flushed before the trigger runs.
+    let mut stdout = std::io::stdout().lock();
+    wardwell::inject::start::write(&mut stdout, &cwd, &config, &config_dir, wardwell::inject::git::dirs, now, today, &refresh, wardwell::tracker::bounded::VAULT_BOUND)?;
     Ok(())
 }
 

@@ -2,8 +2,10 @@
 //! `init` and `uninstall`. Tier one, memory plumbing, is always planned: the
 //! session-start hook and the Stop hook. Tier two, "Tracker policy, optional",
 //! is planned only when a linear binding carries `gate: true`: the Linear gate
-//! and the deny list. The hourly tracker pull is planned when any binding
-//! exists. Preflight reads and validates every file before any write; apply
+//! and the deny list. No launchd agent is installed: session start and the
+//! running server refresh the tracker mirror. A pull agent an earlier version
+//! installed is removed on an exact match when the vault is under a folder
+//! macOS protects, and kept otherwise. Preflight reads and validates every file before any write; apply
 //! re-checks each file, backs it up beside itself (0600), and writes through a
 //! temp file and a rename. Every path comes from the caller.
 //! Does NOT ask for consent, print, edit MCP server entries, or touch the vault.
@@ -20,8 +22,8 @@ use std::path::{Path, PathBuf};
 
 /// The label every tier-two plan line starts with.
 pub const POLICY: &str = "Tracker policy, optional";
-/// The pull interval when no agent is installed yet; an existing one is kept.
-pub const PULL_INTERVAL: u32 = 3600;
+/// The label of every plan line about the launchd pull agent.
+pub const PULL_AGENT: &str = "Tracker pull service from an earlier version";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -86,8 +88,10 @@ pub struct Inputs<'a> {
     pub trackers: &'a [TrackerBinding],
     /// Edit Claude Code's settings; false when Claude Code is not installed.
     pub claude_code: bool,
-    /// Install the pull as a launchd agent; false prints a cron line instead.
+    /// The host has launchd, so an earlier pull agent may exist.
     pub launchd: bool,
+    /// The vault folder from config.yml, when there is one.
+    pub vault: Option<&'a Path>,
 }
 
 #[derive(Debug)]
@@ -127,9 +131,7 @@ fn restore_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
 #[derive(Debug)]
 enum Pull {
     Keep,
-    Manual,
-    /// `backup`: the plist on disk was edited by hand; save it before replacing it.
-    Install { home: PathBuf, config_dir: PathBuf, binary: PathBuf, interval: u32, backup: bool },
+    /// Boot the agent out, back up its plist, and delete it.
     Remove { home: PathBuf },
 }
 
@@ -139,6 +141,8 @@ pub struct Plan {
     pub lines: Vec<Line>,
     changes: Vec<Change>,
     pull: Pull,
+    /// A tracker binding exists, so the activation notes say how the mirror refreshes.
+    refresh: bool,
     /// A gate entry whose matcher covers the Linear writes exists after apply.
     policy: bool,
     settings: bool,
@@ -149,7 +153,7 @@ pub struct Plan {
 impl Plan {
     /// True when applying would change nothing.
     pub fn is_noop(&self) -> bool {
-        self.changes.is_empty() && matches!(self.pull, Pull::Keep | Pull::Manual)
+        self.changes.is_empty() && matches!(self.pull, Pull::Keep)
     }
 
     /// Labels of the lines that remove something, for a summary after apply.
@@ -170,14 +174,15 @@ impl Plan {
                 LINEAR_UPDATES.name, LINEAR_UPDATES.version
             ));
         }
-        match self.pull {
-            Pull::Install { .. } => notes.push("launchd runs the tracker pull now and then on its interval. `wardwell tracker status` shows the last pull.".to_string()),
-            Pull::Manual => notes.push("The tracker pull is not scheduled. Add the cron line above.".to_string()),
-            Pull::Keep | Pull::Remove { .. } => {}
+        if self.refresh {
+            notes.push(REFRESH_NOTE.to_string());
         }
         notes
     }
 }
+
+/// How the mirror stays fresh, said after a setup with a tracker binding.
+pub const REFRESH_NOTE: &str = "Session start and the running server refresh the tracker mirror when it is over an hour old. No background service is installed. `wardwell tracker status` shows the last pull.";
 
 pub fn settings_path(home: &Path) -> PathBuf {
     home.join(".claude/settings.json")
@@ -312,7 +317,8 @@ pub fn plan(inputs: &Inputs) -> Result<Plan, String> {
         changes.extend(manifest_change(inputs.config_dir, recorded, &next, &mut lines)?);
     }
     let pull = pull_step(inputs, &mut lines);
-    Ok(Plan { lines, changes, pull, policy: policy && gate_active, settings: inputs.claude_code, failures: Vec::new() })
+    let refresh = !inputs.trackers.is_empty();
+    Ok(Plan { lines, changes, pull, refresh, policy: policy && gate_active, settings: inputs.claude_code, failures: Vec::new() })
 }
 
 /// Tier one: the session-start hook and the Stop hook.
@@ -433,54 +439,37 @@ fn manifest_change(config_dir: &Path, recorded: Option<(Vec<u8>, Manifest)>, nex
     Ok(Some(Change { path, before, after: manifest::encode(next)?, mode }))
 }
 
-/// True when `current` is exactly what Wardwell writes for its own program
-/// and interval, so replacing it loses nothing the user wrote.
-fn is_generated(current: &str, inputs: &Inputs) -> bool {
-    let program = schedule::scheduled_program(inputs.home);
-    let interval = schedule::schedule_status(inputs.home);
-    match (program, interval) {
-        (Some(program), Some(interval)) => current == schedule::launch_agent_plist(&program, interval, &schedule::log_path(inputs.config_dir)),
-        _ => false,
+/// The pull agent an earlier version installed: REMOVE on an exact match
+/// when the vault is under a folder macOS protects, UNCHANGED when it is
+/// elsewhere, and a plist that is not exactly Wardwell's is left alone.
+/// No agent, or no launchd, plans nothing.
+fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
+    if !inputs.launchd {
+        return Pull::Keep;
+    }
+    let path = Some(schedule::plist_path(inputs.home));
+    let protected = inputs.vault.is_some_and(|vault| schedule::is_protected(vault, inputs.home));
+    match (schedule::agent(inputs.home, inputs.config_dir), protected) {
+        (schedule::Agent::Absent, _) => Pull::Keep,
+        (schedule::Agent::Owned { .. }, true) => {
+            let label = format!("{PULL_AGENT}: the vault is under a folder macOS protects, so session start and the server refresh the mirror");
+            lines.push(Line { action: Action::Remove, label, path });
+            Pull::Remove { home: inputs.home.to_path_buf() }
+        }
+        (schedule::Agent::Owned { .. }, false) => {
+            let label = format!("{PULL_AGENT}: kept, the vault is outside the folders macOS protects; `wardwell tracker unschedule` removes it");
+            lines.push(Line { action: Action::Unchanged, label, path });
+            Pull::Keep
+        }
+        (schedule::Agent::Foreign, _) => {
+            lines.push(Line { action: Action::Unchanged, label: FOREIGN_AGENT.to_string(), path });
+            Pull::Keep
+        }
     }
 }
 
-fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
-    if inputs.trackers.is_empty() {
-        let plist = schedule::plist_path(inputs.home);
-        if !inputs.launchd || !plist.exists() {
-            return Pull::Keep;
-        }
-        lines.push(Line { action: Action::Delete, label: "Tracker pull service: no tracker binding".into(), path: Some(plist) });
-        return Pull::Remove { home: inputs.home.to_path_buf() };
-    }
-    // The path the hooks get, never resolved, so an upgrade keeps it valid.
-    let binary = inputs.binary.to_path_buf();
-    if !inputs.launchd {
-        let label = format!("Hourly tracker pull: launchd is macOS only. Add to your crontab: 0 * * * * {} tracker pull", binary.display());
-        lines.push(Line { action: Action::Manual, label, path: None });
-        return Pull::Manual;
-    }
-    let path = schedule::plist_path(inputs.home);
-    let interval = schedule::schedule_status(inputs.home).unwrap_or(PULL_INTERVAL);
-    let expected = schedule::launch_agent_plist(&binary, interval, &schedule::log_path(inputs.config_dir));
-    let action = match std::fs::read_to_string(&path) {
-        Ok(current) if current == expected => Action::Unchanged,
-        Ok(current) if is_generated(&current, inputs) => Action::Update,
-        Ok(_) => Action::UpdateBackup,
-        Err(_) => Action::Create,
-    };
-    lines.push(Line { action, label: format!("Tracker pull service, every {interval}s"), path: Some(path) });
-    match action {
-        Action::Unchanged => Pull::Keep,
-        _ => Pull::Install {
-            home: inputs.home.to_path_buf(),
-            config_dir: inputs.config_dir.to_path_buf(),
-            binary: inputs.binary.to_path_buf(),
-            interval,
-            backup: action == Action::UpdateBackup,
-        },
-    }
-}
+/// The plan line for a plist at Wardwell's label path that Wardwell did not write.
+const FOREIGN_AGENT: &str = "Launchd agent com.wardwell.tracker-pull: left alone, it is not exactly what Wardwell writes";
 
 /// Preview `uninstall`: Wardwell's hooks in Claude settings, the deny entries
 /// the install record lists and only those, and the pull service. The
@@ -510,15 +499,19 @@ pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Plan {
         label: "The Companion install was not removed: its hooks, skills, command and instructions stay. Remove it separately if you want.".into(),
         path: None,
     });
-    let plist = schedule::plist_path(home);
-    let pull = match plist.exists() {
-        true => {
-            lines.push(Line { action: Action::Delete, label: "Tracker pull service".into(), path: Some(plist) });
+    let plist = Some(schedule::plist_path(home));
+    let pull = match schedule::agent(home, config_dir) {
+        schedule::Agent::Owned { .. } => {
+            lines.push(Line { action: Action::Remove, label: "Tracker pull service".into(), path: plist });
             Pull::Remove { home: home.to_path_buf() }
         }
-        false => Pull::Keep,
+        schedule::Agent::Foreign => {
+            lines.push(Line { action: Action::Unchanged, label: FOREIGN_AGENT.into(), path: plist });
+            Pull::Keep
+        }
+        schedule::Agent::Absent => Pull::Keep,
     };
-    Plan { lines, changes, pull, policy: false, settings: false, failures }
+    Plan { lines, changes, pull, refresh: false, policy: false, settings: false, failures }
 }
 
 const DENY_LABEL: &str = "Deny entries Wardwell added";
@@ -580,7 +573,7 @@ fn stop(lines: &[String], message: impl Into<String>) -> Failed {
 /// temp file beside its target, and backed up before the first rename. Files
 /// are renamed in plan order: settings first, then the install record. When a
 /// later rename fails, the files already renamed are restored from their
-/// backups. The pull service runs last.
+/// backups. The pull agent's removal runs last.
 pub fn apply(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Result<u32, String>) -> Result<Vec<String>, Failed> {
     apply_with(plan, runner, uid, &|from, to| std::fs::rename(from, to))
 }
@@ -628,23 +621,16 @@ fn apply_with(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Resul
         }
     }
     let pull = match &plan.pull {
-        Pull::Install { home, config_dir, binary, interval, backup } => {
-            let saved = match backup {
-                true => read_optional(&schedule::plist_path(home))
-                    .and_then(|bytes| bytes.map(|bytes| backup_file(&schedule::plist_path(home), &bytes)).transpose()),
-                false => Ok(None),
-            };
-            match saved {
-                Ok(Some(saved)) => {
-                    lines.push(format!("    backup: {}", saved.display()));
-                }
+        Pull::Remove { home } => {
+            let plist = schedule::plist_path(home);
+            match read_optional(&plist).and_then(|bytes| bytes.map(|bytes| backup_file(&plist, &bytes)).transpose()) {
+                Ok(Some(saved)) => lines.push(format!("    backup: {}", saved.display())),
                 Ok(None) => {}
-                Err(error) => return Err(stop(&lines, format!("Tracker pull service: {error}; the plist was not replaced."))),
+                Err(error) => return Err(stop(&lines, format!("Tracker pull service: {error}; the plist was not removed."))),
             }
-            uid().and_then(|uid| schedule::schedule(home, config_dir, *interval, runner, binary, uid)).map(Some)
+            uid().and_then(|uid| schedule::unschedule(home, runner, uid)).map(Some)
         }
-        Pull::Remove { home } => uid().and_then(|uid| schedule::unschedule(home, runner, uid)).map(Some),
-        Pull::Keep | Pull::Manual => Ok(None),
+        Pull::Keep => Ok(None),
     };
     match pull {
         Ok(Some(line)) => lines.push(format!("  OK {line}")),
@@ -747,7 +733,7 @@ mod tests {
     }
 
     fn plan_for(h: &Home, trackers: &[TrackerBinding], launchd: bool) -> Plan {
-        plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers, claude_code: true, launchd }).unwrap()
+        plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers, claude_code: true, launchd, vault: None }).unwrap()
     }
 
     fn run(h: &Home, trackers: &[TrackerBinding]) -> Plan {
@@ -908,7 +894,7 @@ mod tests {
         let path = settings_path(&h.home);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "{").unwrap();
-        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &binding("linear", true), claude_code: true, launchd: false };
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &binding("linear", true), claude_code: true, launchd: false, vault: None };
         assert!(plan(&inputs).unwrap_err().contains("no files changed"));
         fs::write(&path, r#"{"hooks": {"Stop": {}}}"#).unwrap();
         assert!(plan(&inputs).is_err());
@@ -1024,7 +1010,7 @@ mod tests {
         assert_eq!(groups[1]["hooks"][0]["command"], format!("'{BIN}' gate linear"));
         fs::write(h.cfg.join("config.yml"), format!("vault_path: {}\nsession_sources: []\ntrackers:\n  personal/corr:\n    provider: linear\n    team: COR\n    credential: c\n    gate: true\n", h.home.display())).unwrap();
         let config = crate::config::loader::load(Some(&h.cfg.join("config.yml"))).unwrap();
-        let (rows, ok) = crate::install::doctor::policy_rows(&config, &h.home, Path::new(BIN), false);
+        let (rows, ok) = crate::install::doctor::policy_rows(&config, &h.home, &h.cfg, Path::new(BIN), false);
         assert!(ok, "{rows:?}");
         assert!(plan_for(&h, &trackers, false).is_noop());
         apply(&uninstall_plan(&h.home, &h.cfg), &Fake::new(&[]), &|| Ok(501)).unwrap();
@@ -1058,7 +1044,7 @@ mod tests {
         fs::write(&real, "{}").unwrap();
         fs::create_dir_all(h.home.join(".claude")).unwrap();
         std::os::unix::fs::symlink(&real, settings_path(&h.home)).unwrap();
-        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &[], claude_code: true, launchd: false };
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &[], claude_code: true, launchd: false, vault: None };
         let error = plan(&inputs).unwrap_err();
         assert!(error.contains(&real.display().to_string()), "{error}");
         assert!(error.contains(&format!("is a symbolic link to {}. Replace the link with a regular file, or edit the link's target by hand.", real.display())), "{error}");
@@ -1070,7 +1056,7 @@ mod tests {
     fn settings_that_are_json_but_not_an_object_are_refused() {
         let h = home();
         put_settings(&h, json!([1, 2]));
-        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &[], claude_code: true, launchd: false };
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &[], claude_code: true, launchd: false, vault: None };
         let error = plan(&inputs).unwrap_err();
         assert!(error.contains("must be a JSON object"), "{error}");
         assert!(error.contains("an array"), "{error}");
@@ -1125,44 +1111,93 @@ mod tests {
         assert!(!manifest::path(&h.cfg).exists());
     }
 
-    #[test]
-    fn without_claude_code_only_the_pull_is_planned() {
-        let h = home();
-        let trackers = binding("linear", true);
-        let plan = plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &trackers, claude_code: false, launchd: false }).unwrap();
-        assert_eq!(plan.lines.len(), 1);
-        assert_eq!(plan.lines[0].action, Action::Manual);
-        assert!(plan.lines[0].label.contains("0 * * * * /nonexistent-wardwell-test/bin/wardwell tracker pull"));
-    }
-
-    #[test]
-    fn removing_every_binding_removes_the_pull_service() {
-        let h = home();
+    /// The agent plist exactly as Wardwell writes it for `program`.
+    fn put_agent(h: &Home, program: &Path) -> PathBuf {
         let plist = schedule::plist_path(&h.home);
         fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        fs::write(&plist, schedule::launch_agent_plist(Path::new(BIN), 3600, &schedule::log_path(&h.cfg))).unwrap();
-        let plan = plan_for(&h, &[], true);
-        assert_eq!(action_of(&plan, "Tracker pull service"), Action::Delete);
-        assert!(rendered(&plan).contains("REMOVE          Tracker pull service: no tracker binding"), "{}", rendered(&plan));
-        assert!(!plan.is_noop());
-        let fake = Fake::new(&[]);
-        apply(&plan, &fake, &|| Ok(501)).unwrap();
-        assert_eq!(fake.verbs(), vec!["bootout"]);
-        assert!(!plist.exists());
-        assert!(plan_for(&h, &[], true).is_noop());
+        fs::write(&plist, schedule::launch_agent_plist(program, 3600, &schedule::log_path(&h.cfg))).unwrap();
+        plist
+    }
+
+    fn plan_with_vault(h: &Home, trackers: &[TrackerBinding], vault: &Path) -> Plan {
+        plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers, claude_code: false, launchd: true, vault: Some(vault) }).unwrap()
+    }
+
+    fn icloud(h: &Home) -> PathBuf {
+        h.home.join("Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes")
     }
 
     #[test]
-    fn a_binding_list_keeps_both_setup_tiers_and_the_pull_service() {
+    fn without_claude_code_or_an_agent_nothing_is_planned() {
+        let h = home();
+        let trackers = binding("linear", true);
+        let plan = plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &trackers, claude_code: false, launchd: true, vault: None }).unwrap();
+        assert!(plan.lines.is_empty(), "{}", rendered(&plan));
+        assert!(plan.is_noop());
+    }
+
+    #[test]
+    fn an_earlier_agent_is_removed_with_a_backup_when_the_vault_is_protected() {
+        let h = home();
+        let plist = put_agent(&h, Path::new("/Users/jane/.wardwell/bin/wardwell-0.12.0"));
+        let before = fs::read_to_string(&plist).unwrap();
+        let plan = plan_with_vault(&h, &binding("linear", false), &icloud(&h));
+        assert_eq!(action_of(&plan, PULL_AGENT), Action::Remove);
+        assert!(rendered(&plan).contains("REMOVE + BACKUP Tracker pull service from an earlier version: the vault is under a folder macOS protects"), "{}", rendered(&plan));
+        let fake = Fake::new(&[]);
+        let lines = apply(&plan, &fake, &|| Ok(501)).unwrap();
+        assert_eq!(fake.verbs(), vec!["bootout"]);
+        assert!(!plist.exists());
+        let backup = lines.iter().find_map(|l| l.trim().strip_prefix("backup: ")).unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), before);
+        assert!(plan_with_vault(&h, &binding("linear", false), &icloud(&h)).is_noop(), "a second run changes nothing");
+    }
+
+    #[test]
+    fn every_protected_folder_removes_the_agent_and_any_other_vault_keeps_it() {
+        let h = home();
+        for folder in ["Documents/vault", "Desktop/vault", "Downloads/vault"] {
+            put_agent(&h, Path::new("/opt/homebrew/bin/wardwell"));
+            assert_eq!(action_of(&plan_with_vault(&h, &[], &h.home.join(folder)), PULL_AGENT), Action::Remove, "{folder}");
+        }
+        let plan = plan_with_vault(&h, &binding("linear", false), &h.home.join("notes"));
+        assert_eq!(action_of(&plan, PULL_AGENT), Action::Unchanged);
+        assert!(rendered(&plan).contains("kept, the vault is outside the folders macOS protects; `wardwell tracker unschedule` removes it"), "{}", rendered(&plan));
+        assert!(plan.is_noop());
+        let fake = Fake::new(&[]);
+        apply(&plan, &fake, &|| Ok(501)).unwrap();
+        assert!(fake.calls.borrow().is_empty());
+        assert!(schedule::plist_path(&h.home).exists());
+    }
+
+    #[test]
+    fn a_plist_that_is_not_exactly_wardwells_is_left_alone_and_the_plan_says_so() {
+        let h = home();
+        let plist = put_agent(&h, Path::new("/opt/homebrew/bin/wardwell"));
+        let edited = fs::read_to_string(&plist).unwrap().replace("<key>RunAtLoad</key>", "<key>Nice</key><integer>5</integer><key>RunAtLoad</key>");
+        fs::write(&plist, &edited).unwrap();
+        for vault in [icloud(&h), h.home.join("notes")] {
+            let plan = plan_with_vault(&h, &binding("linear", false), &vault);
+            assert_eq!(action_of(&plan, "Launchd agent com.wardwell.tracker-pull"), Action::Unchanged);
+            assert!(rendered(&plan).contains("left alone, it is not exactly what Wardwell writes"), "{}", rendered(&plan));
+            let fake = Fake::new(&[]);
+            apply(&plan, &fake, &|| Ok(501)).unwrap();
+            assert!(fake.calls.borrow().is_empty());
+        }
+        assert_eq!(fs::read_to_string(&plist).unwrap(), edited);
+    }
+
+    #[test]
+    fn a_binding_list_keeps_both_setup_tiers_and_installs_no_agent() {
         let h = home();
         let write = |trackers: &str| {
             fs::write(h.cfg.join("config.yml"), format!("vault_path: {}\nsession_sources: []\ntrackers:\n  personal/corr:\n{trackers}", h.home.display())).unwrap();
-            crate::install::setup::tracker_bindings(&h.cfg).unwrap()
+            crate::install::setup::installed_config(&h.cfg).unwrap().unwrap().trackers
         };
         let github_only = write("    provider: github\n    repository: acme/app\n");
         assert!(!policy_enabled(&github_only), "a github binding never turns on the Linear policy");
         let plan = plan_for(&h, &github_only, true);
-        assert_eq!(action_of(&plan, "Tracker pull service, every 3600s"), Action::Create);
+        assert!(!rendered(&plan).contains("pull"), "{}", rendered(&plan));
         assert!(rendered(&plan).contains("Tracker policy, optional: off; no linear binding has gate: true"), "{}", rendered(&plan));
 
         let both = write("    - provider: github\n      repository: acme/app\n    - provider: linear\n      team: COR\n      credential: c\n      gate: true\n");
@@ -1170,7 +1205,7 @@ mod tests {
         assert!(policy_enabled(&both));
         let plan = plan_for(&h, &both, true);
         assert!(rendered(&plan).contains("Tracker policy, optional: Linear gate"), "{}", rendered(&plan));
-        assert_eq!(action_of(&plan, "Tracker pull service, every 3600s"), Action::Create);
+        assert!(!rendered(&plan).contains("pull"), "{}", rendered(&plan));
     }
 
     #[test]
@@ -1178,32 +1213,25 @@ mod tests {
         let h = home();
         let plan = plan_for(&h, &[], true);
         assert!(!rendered(&plan).contains("pull"));
+        assert!(!plan.activation().iter().any(|n| n.contains("refresh")));
     }
 
     #[test]
-    fn pull_service_is_planned_from_a_binding_and_installed_through_schedule() {
+    fn a_binding_installs_no_launchd_agent_and_says_how_the_mirror_refreshes() {
         let h = home();
         let trackers = binding("linear", false);
-        let first = plan_for(&h, &trackers, true);
-        assert_eq!(action_of(&first, "Tracker pull service, every 3600s"), Action::Create);
-        if !cfg!(target_os = "macos") {
-            return;
-        }
+        let plan = plan_for(&h, &trackers, true);
         let fake = Fake::new(&[]);
-        apply(&first, &fake, &|| Ok(501)).unwrap();
-        assert_eq!(fake.verbs(), vec!["bootout", "bootstrap", "print"]);
-        assert_eq!(schedule::schedule_status(&h.home), Some(3600));
-        let second = plan_for(&h, &trackers, true);
-        assert_eq!(action_of(&second, "Tracker pull service"), Action::Unchanged);
-        assert!(second.is_noop());
-        let fake = Fake::new(&[]);
-        apply(&second, &fake, &|| Ok(501)).unwrap();
-        assert!(fake.calls.borrow().is_empty());
+        apply(&plan, &fake, &|| Ok(501)).unwrap();
+        assert!(fake.calls.borrow().is_empty(), "no launchctl call");
+        assert!(!schedule::plist_path(&h.home).exists());
+        assert!(plan.activation().contains(&REFRESH_NOTE.to_string()), "{:?}", plan.activation());
+        assert!(plan_for(&h, &trackers, true).is_noop());
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_pull_plan_uses_the_symlink_path_the_hooks_get() {
+    fn an_agent_for_a_symlinked_wardwell_is_an_exact_match() {
         let h = home();
         let versioned = h.home.join("Cellar/wardwell/0.12.0/bin");
         fs::create_dir_all(&versioned).unwrap();
@@ -1211,22 +1239,8 @@ mod tests {
         fs::create_dir_all(h.home.join("bin")).unwrap();
         let link = h.home.join("bin/wardwell");
         std::os::unix::fs::symlink(versioned.join("wardwell"), &link).unwrap();
-        let plist = schedule::plist_path(&h.home);
-        fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        fs::write(&plist, schedule::launch_agent_plist(&link, 3600, &schedule::log_path(&h.cfg))).unwrap();
-        let trackers = binding("linear", false);
-        let plan = plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: &link, trackers: &trackers, claude_code: false, launchd: true }).unwrap();
-        assert_eq!(action_of(&plan, "Tracker pull service"), Action::Unchanged, "{}", rendered(&plan));
-    }
-
-    #[test]
-    fn an_existing_pull_interval_is_kept_and_a_moved_binary_updates_it() {
-        let h = home();
-        let plist = schedule::plist_path(&h.home);
-        fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        fs::write(&plist, schedule::launch_agent_plist(Path::new("/old/wardwell"), 900, &schedule::log_path(&h.cfg))).unwrap();
-        let plan = plan_for(&h, &binding("linear", false), true);
-        assert_eq!(action_of(&plan, "Tracker pull service, every 900s"), Action::Update);
+        put_agent(&h, &link);
+        assert_eq!(action_of(&plan_with_vault(&h, &[], &icloud(&h)), PULL_AGENT), Action::Remove);
     }
 
     #[test]
@@ -1236,9 +1250,7 @@ mod tests {
             "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "rtk check"}]}],
                       "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle begin --client claude"}]}]}}));
         run(&h, &binding("linear", true));
-        let plist = schedule::plist_path(&h.home);
-        fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        fs::write(&plist, "x").unwrap();
+        let plist = put_agent(&h, Path::new("/opt/homebrew/bin/wardwell"));
         let plan = uninstall_plan(&h.home, &h.cfg);
         assert_eq!(action_of(&plan, "Linear gate"), Action::Remove);
         let fake = Fake::new(&[]);
@@ -1314,23 +1326,17 @@ mod tests {
     }
 
     #[test]
-    fn a_hand_edited_plist_is_backed_up_before_it_is_replaced() {
+    fn uninstall_leaves_a_plist_that_is_not_exactly_wardwells() {
         let h = home();
         let plist = schedule::plist_path(&h.home);
         fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        let generated_elsewhere = schedule::launch_agent_plist(Path::new("/old/wardwell"), 3600, &schedule::log_path(&h.cfg));
-        fs::write(&plist, &generated_elsewhere).unwrap();
-        assert_eq!(action_of(&plan_for(&h, &binding("linear", false), true), "Tracker pull service"), Action::Update);
-        let edited = generated_elsewhere.replace("<key>RunAtLoad</key>", "<key>Nice</key><integer>5</integer><key>RunAtLoad</key>");
-        fs::write(&plist, &edited).unwrap();
-        let plan = plan_for(&h, &binding("linear", false), true);
-        assert_eq!(action_of(&plan, "Tracker pull service"), Action::UpdateBackup);
-        if !cfg!(target_os = "macos") {
-            return;
-        }
-        let lines = apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
-        let backup = lines.iter().find_map(|l| l.trim().strip_prefix("backup: ")).unwrap();
-        assert_eq!(fs::read_to_string(backup).unwrap(), edited);
+        fs::write(&plist, "hand written").unwrap();
+        let plan = uninstall_plan(&h.home, &h.cfg);
+        assert!(rendered(&plan).contains("UNCHANGED       Launchd agent com.wardwell.tracker-pull: left alone"), "{}", rendered(&plan));
+        let fake = Fake::new(&[]);
+        apply(&plan, &fake, &|| Ok(501)).unwrap();
+        assert!(fake.calls.borrow().is_empty());
+        assert_eq!(fs::read_to_string(&plist).unwrap(), "hand written");
     }
 
     #[test]

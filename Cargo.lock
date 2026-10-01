@@ -3646,13 +3646,14 @@ dependencies = [
 
 [[package]]
 name = "wardwell"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "chrono",
  "clap",
  "dirs",
  "fastembed",
  "glob",
+ "libc",
  "notify",
  "regex",
  "reqwest",

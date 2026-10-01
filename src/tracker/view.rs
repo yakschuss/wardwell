@@ -51,6 +51,32 @@ pub struct MirrorView {
     pub last_full_resync_at: Option<DateTime<Utc>>,
     /// The latest pull_failed marker, its time and code.
     pub last_failure: Option<(DateTime<Utc>, FailureCode)>,
+    /// The latest pull_started marker, its time and process id.
+    pub last_started: Option<(DateTime<Utc>, u32)>,
+    /// The newest start or failure after the latest completed pull, in file
+    /// order; None when a completed pull is the newest marker or none exists.
+    pub last_attempt: Option<Attempt>,
+}
+
+/// A pull marker that a completed pull has not yet followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// A pull started at this time in this process.
+    Started { at: DateTime<Utc>, pid: u32 },
+    /// A pull failed at this time with this code.
+    Failed { at: DateTime<Utc>, code: FailureCode },
+    /// A pull started at this time was stopped at its deadline. Only the
+    /// local refresh state says so; the log holds a `timeout` failure.
+    Unfinished { at: DateTime<Utc> },
+}
+
+impl Attempt {
+    /// When the attempt happened.
+    pub fn at(self) -> DateTime<Utc> {
+        match self {
+            Attempt::Started { at, .. } | Attempt::Failed { at, .. } | Attempt::Unfinished { at } => at,
+        }
+    }
 }
 
 impl MirrorView {
@@ -64,6 +90,27 @@ impl MirrorView {
     /// lines are skipped.
     pub fn read(path: &Path) -> Result<Self, String> {
         Self::read_filtered(path, None)
+    }
+
+    /// Fold the log at `path` once into one view per provider. A missing
+    /// file is no views.
+    pub fn read_by_provider(path: &Path) -> Result<std::collections::BTreeMap<String, Self>, String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(_) => return Err(format!("could not read {}", path.display())),
+        };
+        let mut views: std::collections::BTreeMap<String, Self> = Default::default();
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("{\"_schema\""))
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .for_each(|event| match views.get_mut(&event.common().provider) {
+                Some(view) => view.observe(event),
+                None => views.entry(event.common().provider.clone()).or_default().observe(event),
+            });
+        Ok(views)
     }
 
     fn read_filtered(path: &Path, provider: Option<&str>) -> Result<Self, String> {
@@ -126,9 +173,20 @@ impl MirrorView {
             Event::FullResync { common, .. } => {
                 self.last_full_resync_at = later(self.last_full_resync_at, common.occurred_at);
                 self.last_pull_at = Some(common.occurred_at);
+                self.last_attempt = None;
             }
-            Event::PullCompleted { common, .. } => self.last_pull_at = Some(common.occurred_at),
-            Event::PullFailed { common, code, .. } => self.last_failure = Some((common.occurred_at, code)),
+            Event::PullCompleted { common, .. } => {
+                self.last_pull_at = Some(common.occurred_at);
+                self.last_attempt = None;
+            }
+            Event::PullStarted { common, pid } => {
+                self.last_started = Some((common.occurred_at, pid));
+                self.last_attempt = Some(Attempt::Started { at: common.occurred_at, pid });
+            }
+            Event::PullFailed { common, code, .. } => {
+                self.last_failure = Some((common.occurred_at, code));
+                self.last_attempt = Some(Attempt::Failed { at: common.occurred_at, code });
+            }
             _ => {}
         }
     }
@@ -302,6 +360,27 @@ mod tests {
     }
 
     #[test]
+    fn the_last_attempt_is_the_newest_start_or_failure_after_the_last_completed_pull() {
+        let started = |id: &str, hour, pid| Event::PullStarted { common: common(id, "COR", hour), pid };
+        let (_dir, path) = write_log(&[started("s1", 9, 11), Event::PullCompleted { common: common("p1", "COR", 9), through: None }]);
+        let view = MirrorView::read(&path).unwrap();
+        assert_eq!(view.last_attempt, None);
+        assert_eq!(view.last_started, Some((at(9), 11)));
+
+        let (_dir, path) = write_log(&[
+            Event::PullCompleted { common: common("p1", "COR", 9), through: None },
+            started("s2", 10, 22),
+        ]);
+        assert_eq!(MirrorView::read(&path).unwrap().last_attempt, Some(Attempt::Started { at: at(10), pid: 22 }));
+
+        let (_dir, path) = write_log(&[
+            started("s3", 10, 33),
+            Event::PullFailed { common: common("x1", "COR", 10), code: FailureCode::Timeout, automatic_full: false },
+        ]);
+        assert_eq!(MirrorView::read(&path).unwrap().last_attempt, Some(Attempt::Failed { at: at(10), code: FailureCode::Timeout }));
+    }
+
+    #[test]
     fn a_completed_pull_after_a_failure_clears_it() {
         let (_dir, path) = write_log(&[
             Event::PullFailed { common: common("x1", "COR", 9), code: FailureCode::Provider, automatic_full: false },
@@ -322,6 +401,20 @@ mod tests {
         let github = MirrorView::read_for(&path, "github").unwrap();
         assert!(github.issues.is_empty(), "a merged change is not an issue");
         assert_eq!(github.failed_since_last_pull(), Some(FailureCode::Provider));
+    }
+
+    #[test]
+    fn one_parse_gives_the_same_view_per_provider_as_reading_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        std::fs::write(&path, two_provider_log()).unwrap();
+        let views = MirrorView::read_by_provider(&path).unwrap();
+        for provider in ["linear", "github"] {
+            let one = MirrorView::read_for(&path, provider).unwrap();
+            assert_eq!(views[provider].last_pull_at, one.last_pull_at, "{provider}");
+            assert_eq!(views[provider].last_attempt, one.last_attempt, "{provider}");
+            assert_eq!(views[provider].issues, one.issues, "{provider}");
+        }
     }
 
     #[test]

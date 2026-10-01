@@ -599,7 +599,8 @@ fn hooks_plan(binary_path: &Path) -> Result<installer::Plan, String> {
 }
 
 fn hooks_plan_at(home: &Path, config_dir: &Path, binary_path: &Path, launchd: bool) -> Result<installer::Plan, String> {
-    let trackers = crate::install::setup::tracker_bindings(config_dir)?;
+    let config = crate::install::setup::installed_config(config_dir)?;
+    let trackers = config.as_ref().map(|c| c.trackers.clone()).unwrap_or_default();
     installer::plan(&installer::Inputs {
         home,
         config_dir,
@@ -607,6 +608,7 @@ fn hooks_plan_at(home: &Path, config_dir: &Path, binary_path: &Path, launchd: bo
         trackers: &trackers,
         claude_code: true,
         launchd,
+        vault: config.as_ref().map(|c| c.vault_path.as_path()),
     })
 }
 

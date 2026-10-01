@@ -1,8 +1,11 @@
 //! What `wardwell inject` prints for a working directory: the resolved
 //! project's summary, rot line and tracker section, or the domain output as
-//! before, or nothing when the directory resolves to neither.
+//! before, or nothing when the directory resolves to neither. For a
+//! resolved project it asks `refresh` to start a background pull, and
+//! adds one line when one started.
 //!
-//! Does NOT resolve directories itself (resolve.rs does) or pull trackers.
+//! Does NOT resolve directories itself (resolve.rs does), decide whether a
+//! refresh is due (tracker::trigger does), or pull trackers.
 
 use crate::config::loader::WardwellConfig;
 use crate::inject::git::GitDirs;
@@ -10,14 +13,63 @@ use crate::inject::resolve::{Resolution, resolve};
 use chrono::{DateTime, NaiveDate, Utc};
 use std::path::Path;
 
-/// The session-start output for `cwd` at `now` and local date `today`.
-pub fn output(cwd: &Path, config: &WardwellConfig, config_dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>, now: DateTime<Utc>, today: NaiveDate) -> String {
+/// Asked once per session start for the resolved project; true when it
+/// started a background refresh.
+pub type Refresh<'a> = dyn Fn(&str, &str) -> bool + 'a;
+
+/// The sentence when the mirror log does not answer within the bound.
+pub const LOG_NOT_IN_TIME: &str = "Could not read the mirror log in time.";
+
+/// The session-start output for `cwd` at `now` and local date `today`,
+/// as `write` emits it with a generous bound.
+pub fn output(cwd: &Path, config: &WardwellConfig, config_dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>, now: DateTime<Utc>, today: NaiveDate, refresh: &Refresh<'_>) -> String {
+    let mut out = Vec::new();
+    let _ = write(&mut out, cwd, config, config_dir, git, now, today, refresh, std::time::Duration::from_secs(30));
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Write the session-start output to `out`. For a resolved project: its
+/// header and rot line first, flushed; then the tracker section, read on a
+/// helper thread within `bound`, or one sentence past it; then the refresh
+/// trigger last, and its one line when it started a pull. A helper still
+/// blocked on the log is left behind and ends with the process. `refresh`
+/// runs only for a resolved project with a vault folder.
+#[allow(clippy::too_many_arguments)]
+pub fn write(
+    out: &mut dyn std::io::Write,
+    cwd: &Path,
+    config: &WardwellConfig,
+    config_dir: &Path,
+    git: impl Fn(&Path) -> Option<GitDirs>,
+    now: DateTime<Utc>,
+    today: NaiveDate,
+    refresh: &Refresh<'_>,
+    bound: std::time::Duration,
+) -> std::io::Result<()> {
     match resolve(cwd, config, git) {
         Some(Resolution::Project { domain, project }) => {
-            crate::inject::domain::project_context(config, config_dir, &domain, &project, now, today)
+            let head = crate::inject::domain::project_head(config, &domain, &project, today);
+            if head.is_empty() {
+                return Ok(());
+            }
+            out.write_all(head.as_bytes())?;
+            out.flush()?;
+            let bindings: Vec<_> = config.bindings_for(&domain, &project).into_iter().cloned().collect();
+            if !bindings.is_empty() {
+                let (dir, cfg, d) = (config.vault_path.join(&domain).join(&project), config_dir.to_path_buf(), domain.clone());
+                match crate::tracker::bounded::run(bound, move || crate::inject::session::tracker_lines_for(&bindings, &cfg, &d, &dir, now)) {
+                    Some(lines) => lines.unwrap_or_default().iter().try_for_each(|line| writeln!(out, "  {line}"))?,
+                    None => writeln!(out, "  {LOG_NOT_IN_TIME}")?,
+                }
+                out.flush()?;
+            }
+            if refresh(&domain, &project) {
+                writeln!(out, "  {}", crate::tracker::trigger::STARTED_LINE)?;
+            }
+            Ok(())
         }
-        Some(Resolution::Domain(dir)) => crate::inject::domain::domain_context(config, config_dir, &dir, now, today),
-        None => String::new(),
+        Some(Resolution::Domain(dir)) => out.write_all(crate::inject::domain::domain_context(config, config_dir, &dir, now, today).as_bytes()),
+        None => Ok(()),
     }
 }
 
@@ -64,6 +116,10 @@ mod tests {
         crate::config::loader::load(Some(&root.join("config.yml"))).unwrap()
     }
 
+    fn none(_: &str, _: &str) -> bool {
+        false
+    }
+
     const PROJECT: &str = "**personal/corr-platform** (active): Ship C1.\n  Next: Open the PR.\n  Last history entry 2 days ago. Last decision 10 days ago.\n";
     const TRACKER: &str = "  Tracker mirror. Last pulled 1 hour ago. Not authoritative.\n";
 
@@ -73,7 +129,7 @@ mod tests {
         let code = tmp.path().join("code/corrtex");
         repo(&code);
         let config = setup(tmp.path(), &code, true);
-        let out = output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today());
+        let out = output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none);
         assert_eq!(out, format!("{PROJECT}{TRACKER}"));
     }
 
@@ -83,7 +139,7 @@ mod tests {
         let code = tmp.path().join("code/corrtex");
         repo(&code);
         let config = setup(tmp.path(), &code, false);
-        assert_eq!(output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today()), PROJECT);
+        assert_eq!(output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none), PROJECT);
     }
 
     #[test]
@@ -94,8 +150,63 @@ mod tests {
         let linked = tmp.path().join("worktrees/cm-9");
         git(&code, &["worktree", "add", "-q", "-b", "cm-9", linked.to_str().unwrap()]);
         let config = setup(tmp.path(), &code, true);
-        let out = output(&linked, &config, tmp.path(), crate::inject::git::dirs, now(), today());
+        let out = output(&linked, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none);
         assert_eq!(out, format!("{PROJECT}{TRACKER}"));
+    }
+
+    #[test]
+    fn a_started_refresh_adds_one_line_under_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code/corrtex");
+        repo(&code);
+        let config = setup(tmp.path(), &code, true);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let started = |domain: &str, project: &str| {
+            asked.borrow_mut().push(format!("{domain}/{project}"));
+            true
+        };
+        let out = output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &started);
+        assert_eq!(out, format!("{PROJECT}{TRACKER}  Refresh started in the background.\n"));
+        assert_eq!(*asked.borrow(), vec!["personal/corr-platform"]);
+    }
+
+    #[test]
+    fn the_refresh_line_prints_once_for_repeated_session_starts() {
+        struct WritesStart(std::path::PathBuf, DateTime<Utc>);
+        impl crate::tracker::trigger::Spawner for WritesStart {
+            fn spawn(&self, _: &str, _: &[&str]) -> Result<(), String> {
+                crate::tracker::state::record(&self.0, "linear", crate::tracker::state::Record::Started(std::process::id()), self.1)
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code/corrtex");
+        repo(&code);
+        let config = setup(tmp.path(), &code, true);
+        let later = now() + chrono::TimeDelta::hours(1) + chrono::TimeDelta::minutes(1);
+        let spawner = WritesStart(crate::tracker::state::path(tmp.path(), "personal", "corr-platform"), later);
+        let places = crate::tracker::trigger::Places { config: &config, config_dir: tmp.path(), vault_bound: crate::tracker::bounded::VAULT_BOUND };
+        let probes = crate::tracker::trigger::Probes { alive: &crate::tracker::freshness::process_alive, can_pull: &|_| true };
+        let refresh = |domain: &str, project: &str| {
+            crate::tracker::trigger::refresh(&places, domain, project, later, &spawner, &probes) == crate::tracker::trigger::Outcome::Started
+        };
+        let first = output(&code, &config, tmp.path(), crate::inject::git::dirs, later, today(), &refresh);
+        let second = output(&code, &config, tmp.path(), crate::inject::git::dirs, later, today(), &refresh);
+        assert_eq!(first.matches("Refresh started in the background.").count(), 1, "{first}");
+        assert!(!second.contains("Refresh started"), "{second}");
+    }
+
+    #[test]
+    fn a_domain_or_an_unmapped_directory_never_asks_for_a_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code/corrtex");
+        let other = tmp.path().join("code/scratch");
+        repo(&other);
+        let work = tmp.path().join("code/work");
+        std::fs::create_dir_all(&work).unwrap();
+        let config = setup(tmp.path(), &code, true);
+        let never = |_: &str, _: &str| -> bool { panic!("no refresh outside a resolved project") };
+        assert_eq!(output(&other, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &never), "");
+        assert!(!output(&work, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &never).is_empty());
     }
 
     #[test]
@@ -105,7 +216,7 @@ mod tests {
         let other = tmp.path().join("code/scratch");
         repo(&other);
         let config = setup(tmp.path(), &code, true);
-        assert_eq!(output(&other, &config, tmp.path(), crate::inject::git::dirs, now(), today()), "");
+        assert_eq!(output(&other, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none), "");
     }
 
     #[test]
@@ -115,7 +226,7 @@ mod tests {
         let work = tmp.path().join("code/work");
         std::fs::create_dir_all(&work).unwrap();
         let config = setup(tmp.path(), &code, false);
-        let out = output(&work, &config, tmp.path(), crate::inject::git::dirs, now(), today());
+        let out = output(&work, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none);
         let domain = crate::inject::domain::domain_context(&config, tmp.path(), &tmp.path().join("vault/work"), now(), today());
         assert_eq!(out, domain);
         assert_eq!(out, "**work/alpha** (active): Alpha focus.\n");
@@ -128,7 +239,7 @@ mod tests {
         repo(&code);
         let config = setup(tmp.path(), &code, false);
         std::fs::remove_dir_all(tmp.path().join("vault/personal/corr-platform")).unwrap();
-        assert_eq!(output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today()), "");
+        assert_eq!(output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none), "");
     }
 
     #[test]
@@ -141,6 +252,6 @@ mod tests {
         let feature = code.join(".worktrees/feature");
         git(&unmapped, &["worktree", "add", "-q", "-b", "f", feature.to_str().unwrap()]);
         let config = setup(tmp.path(), &code, true);
-        assert_eq!(output(&feature, &config, tmp.path(), crate::inject::git::dirs, now(), today()), "");
+        assert_eq!(output(&feature, &config, tmp.path(), crate::inject::git::dirs, now(), today(), &none), "");
     }
 }

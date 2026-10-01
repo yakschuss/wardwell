@@ -219,6 +219,26 @@ fn restored(event: &Event, summary: &LogSummary) -> Option<Event> {
     Some(restored)
 }
 
+/// Append one marker without reading the log: a line that starts on a
+/// fresh line, so a torn tail cannot swallow it, and the header first when
+/// the file is new. Readers skip the blank line this may leave.
+pub fn append_marker(path: &Path, event: &Event) -> Result<(), String> {
+    use std::io::Write;
+    let failed = || format!("could not append to {}", path.display());
+    let (light, _) = split_raw(event.clone());
+    let line = serde_json::to_string(&light).map_err(|_| failed())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| failed())?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|_| failed())?;
+    let new = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+    let text = match new {
+        true => format!("{SCHEMA_HEADER}\n{line}\n"),
+        false => format!("\n{line}\n"),
+    };
+    file.write_all(text.as_bytes()).map_err(|_| failed())
+}
+
 /// The event without its raw payload, and the payload.
 pub fn split_raw(mut event: Event) -> (Event, Value) {
     let raw = std::mem::take(&mut common_mut(&mut event).raw);
@@ -235,6 +255,7 @@ fn common_mut(event: &mut Event) -> &mut crate::tracker::events::Common {
         | Event::IssueRemoved { common }
         | Event::FullResync { common, .. }
         | Event::PullCompleted { common, .. }
+        | Event::PullStarted { common, .. }
         | Event::PullFailed { common, .. } => common,
     }
 }
@@ -424,6 +445,24 @@ mod tests {
         assert_eq!(summary.event_count, 1);
         assert_eq!(summary.unreadable_lines, 0);
         assert!(summary.open_issues.contains_key("COR-1"));
+    }
+
+    /// A reader skips a row whose kind or code it does not know and counts
+    /// it unreadable. That is how 0.13.0 reads `pull_started` rows and
+    /// `pull_failed` rows with the `timeout` code, so the schema stays 1.0.
+    #[test]
+    fn rows_of_an_unknown_kind_or_code_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        let completed = r#"{"kind":"pull_completed","id":"p","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T12:00:00Z","title":"p"}"#;
+        let future_kind = r#"{"kind":"pull_paused","id":"x","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T12:01:00Z","title":"x"}"#;
+        let future_code = r#"{"kind":"pull_failed","id":"y","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T12:02:00Z","title":"y","code":"melted"}"#;
+        std::fs::write(&path, format!("{}\n{completed}\n{future_kind}\n{future_code}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+        let summary = read(&path).unwrap();
+        assert_eq!(summary.unreadable_lines, 2);
+        assert_eq!(summary.last_pull_at, Some(Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap()));
+        assert_eq!(summary.last_failure, None);
+        assert_eq!(crate::tracker::events::SCHEMA_HEADER, r#"{"_schema":"tracker","_version":"1.0"}"#);
     }
 
     #[test]

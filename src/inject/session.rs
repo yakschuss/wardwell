@@ -6,6 +6,7 @@
 
 use crate::config::loader::WardwellConfig;
 use crate::tracker::events::{FailureCode, StateCategory};
+use crate::tracker::freshness::{self, Freshness, State};
 use crate::tracker::view::{MirrorView, age_words};
 use chrono::{DateTime, Local, NaiveDate, TimeDelta, Utc};
 use std::path::Path;
@@ -21,14 +22,47 @@ pub fn project_rot_line(project_dir: &Path, today: NaiveDate) -> String {
     rot_line(last_history_date(project_dir), last_decision_date(project_dir), today)
 }
 
-/// The tracker section for a project folder, or None when it is not bound.
-/// Runs the offline doctor check against credentials in `config_dir`.
+/// The tracker section for a project folder, or None when it is not bound
+/// or has nothing to say. The log is parsed once and the view shared. The
+/// issue binding gives the section; each other binding adds one freshness
+/// line when it is not fresh. Runs the offline doctor check against
+/// credentials in `config_dir`.
 pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain: &str, project_dir: &Path, now: DateTime<Utc>) -> Option<Vec<String>> {
     let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    let binding = config.tracker_for(domain, project)?;
-    let blocked = crate::tracker::doctor::check_offline(config_dir, binding).err().map(|(code, _)| code);
-    let view = MirrorView::read_for(&project_dir.join(crate::tracker::events::FILE_NAME), &binding.provider).unwrap_or_default();
-    Some(tracker_section(&view, now, blocked))
+    let bindings: Vec<crate::config::loader::TrackerBinding> = config.bindings_for(domain, project).into_iter().cloned().collect();
+    tracker_lines_for(&bindings, config_dir, domain, project_dir, now)
+}
+
+/// `project_tracker_lines` for the project's `bindings`, so a helper thread
+/// can run it without the whole config.
+pub fn tracker_lines_for(bindings: &[crate::config::loader::TrackerBinding], config_dir: &Path, domain: &str, project_dir: &Path, now: DateTime<Utc>) -> Option<Vec<String>> {
+    let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if bindings.is_empty() {
+        return None;
+    }
+    let mut read = MirrorView::read_by_provider(&project_dir.join(crate::tracker::events::FILE_NAME));
+    // Each binding takes its own provider's view out of the one parse; no copy.
+    let mut view_of = |provider: &str| match &mut read {
+        Ok(views) => Ok(views.remove(provider).unwrap_or_default()),
+        Err(error) => Err(error.clone()),
+    };
+    let mut lines = Vec::new();
+    for binding in bindings {
+        let view = view_of(&binding.provider);
+        let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, domain, project), &binding.provider);
+        let fresh = freshness::assess_read(&view, local.as_ref(), now, &freshness::process_alive);
+        match crate::tracker::mirrors_issues(&binding.provider) {
+            true => {
+                let blocked = crate::tracker::doctor::check_offline(config_dir, binding).err().map(|(code, _)| code);
+                lines.extend(tracker_section(&view.unwrap_or_default(), &fresh, now, blocked));
+            }
+            false if fresh.state != State::Fresh => {
+                lines.push(format!("{} mirror. {}", crate::tracker::provider_label(&binding.provider), fresh.sentence()));
+            }
+            false => {}
+        }
+    }
+    (!lines.is_empty()).then_some(lines)
 }
 
 /// `Last history entry 12 days ago. Last decision 3 days ago.`
@@ -46,24 +80,29 @@ fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
     }
 }
 
-/// The tracker section for a mirror at `now`. When pulls cannot run
-/// (`blocked`, from the offline doctor check), one line with the code and
-/// the age. A mirror never pulled says only that. A failed or stale last
-/// pull shows only the age and the notice; otherwise up to ten started
-/// issues, most recently updated first.
-pub fn tracker_section(view: &MirrorView, now: DateTime<Utc>, blocked: Option<FailureCode>) -> Vec<String> {
+/// The tracker section for a mirror at `now`, with its freshness. When
+/// pulls cannot run (`blocked`, from the offline doctor check), one line
+/// with the code and the age. Otherwise the first line is the freshness
+/// sentence in every state but fresh: never pulled with its reason,
+/// running, stale, or unreadable. A mirror never pulled or unreadable
+/// lists no issues, nor does one whose last pull failed or that is over 24
+/// hours old; otherwise up to ten started issues, most recently updated first.
+pub fn tracker_section(view: &MirrorView, fresh: &Freshness, now: DateTime<Utc>, blocked: Option<FailureCode>) -> Vec<String> {
     let age = view.last_pull_at.map(|at| age_words(now - at));
     if let Some(code) = blocked {
         let pulled = age.map_or("Never pulled.".to_string(), |age| format!("Last pulled {age} ago."));
         return vec![format!("Tracker mirror. Pulls cannot run: {}. {pulled}", code.as_str())];
     }
-    let Some(age) = age else {
-        return vec!["Tracker mirror. Never pulled. Not authoritative.".to_string()];
+    let mut lines = match (fresh.state, &age) {
+        (State::Fresh, Some(age)) => vec![format!("Tracker mirror. Last pulled {age} ago. Not authoritative.")],
+        _ => vec![format!("Tracker mirror. {}", fresh.sentence())],
     };
-    let mut lines = vec![format!("Tracker mirror. Last pulled {age} ago. Not authoritative.")];
+    if age.is_none() || matches!(fresh.state, State::Unreadable(_)) {
+        return lines;
+    }
     let failed = view.failed_since_last_pull();
     let stale = view.last_pull_at.is_some_and(|at| now - at > STALE_AFTER);
-    if let Some(code) = failed {
+    if let (Some(code), false) = (failed, matches!(fresh.state, State::Stale(_))) {
         lines.push(format!("The last pull failed: {}. Run `wardwell tracker status`.", code.as_str()));
     }
     if stale {
@@ -178,6 +217,20 @@ mod tests {
         assert_eq!(rot_line(None, None, date(30)), "No history entries. No decisions.");
     }
 
+    /// The section as session start builds it; `alive` answers for every process id.
+    fn section(view: &MirrorView, blocked: Option<FailureCode>, alive: bool) -> Vec<String> {
+        let fresh = freshness::assess(view, now(), &|_| alive);
+        tracker_section(view, &fresh, now(), blocked)
+    }
+
+    fn with_attempt(mut view: MirrorView, attempt: crate::tracker::view::Attempt) -> MirrorView {
+        view.last_attempt = Some(attempt);
+        if let crate::tracker::view::Attempt::Failed { at, code } = attempt {
+            view.last_failure = Some((at, code));
+        }
+        view
+    }
+
     #[test]
     fn a_fresh_mirror_lists_started_issues_newest_first_capped_at_ten() {
         let mut issues: Vec<MirroredIssue> = (1..=12).map(|n| issue(n, StateCategory::Started)).collect();
@@ -185,8 +238,8 @@ mod tests {
         let mut archived = issue(0, StateCategory::Started);
         archived.issue.archived_at = Some(now());
         issues.push(archived);
-        let lines = tracker_section(&view(3, issues), now(), None);
-        assert_eq!(lines[0], "Tracker mirror. Last pulled 3 hours ago. Not authoritative.");
+        let lines = section(&view(1, issues), None, false);
+        assert_eq!(lines[0], "Tracker mirror. Last pulled 1 hour ago. Not authoritative.");
         assert_eq!(lines.len(), 1 + MAX_STARTED);
         assert_eq!(lines[1], "- COR-1 Work 1 (In Progress)");
         assert_eq!(lines[10], "- COR-10 Work 10 (In Progress)");
@@ -194,40 +247,78 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_mirror_shows_only_the_age_and_the_notice() {
-        let lines = tracker_section(&view(25, vec![issue(1, StateCategory::Started)]), now(), None);
+    fn a_mirror_two_to_24_hours_old_says_stale_and_why_and_still_lists_issues() {
+        let lines = section(&view(5, vec![issue(1, StateCategory::Started)]), None, false);
         assert_eq!(lines, vec![
-            "Tracker mirror. Last pulled 1 day ago. Not authoritative.",
+            "Tracker mirror. Last pulled 5h ago. Stale. Reason: No pull was tried.",
+            "- COR-1 Work 1 (In Progress)",
+        ]);
+    }
+
+    #[test]
+    fn a_stale_mirror_names_a_pull_that_did_not_finish() {
+        let started = crate::tracker::view::Attempt::Started { at: now() - TimeDelta::hours(1), pid: 4242 };
+        let lines = section(&with_attempt(view(5, vec![]), started), None, false);
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 5h ago. Stale. Reason: A pull started at 2026-09-30T11:00:00Z and did not finish."]);
+    }
+
+    #[test]
+    fn a_running_pull_says_since_when() {
+        let started = crate::tracker::view::Attempt::Started { at: now() - TimeDelta::minutes(2), pid: 4242 };
+        let lines = section(&with_attempt(view(5, vec![issue(1, StateCategory::Started)]), started), None, true);
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 5h ago; pull running since 2026-09-30T11:58:00Z.", "- COR-1 Work 1 (In Progress)"]);
+        let never = section(&with_attempt(MirrorView::default(), started), None, true);
+        assert_eq!(never, vec!["Tracker mirror. Never pulled; pull running since 2026-09-30T11:58:00Z."]);
+    }
+
+    #[test]
+    fn a_mirror_over_24_hours_old_hides_the_issue_list() {
+        let lines = section(&view(25, vec![issue(1, StateCategory::Started)]), None, false);
+        assert_eq!(lines, vec![
+            "Tracker mirror. Last pulled 25h ago. Stale. Reason: No pull was tried.",
             "The mirror is more than 24 hours old. Run `wardwell tracker pull`.",
         ]);
     }
 
     #[test]
-    fn a_failed_last_pull_shows_only_the_age_and_the_failure() {
-        let mut failed = view(2, vec![issue(1, StateCategory::Started)]);
-        failed.last_failure = Some((now() - TimeDelta::hours(1), FailureCode::Auth));
-        let lines = tracker_section(&failed, now(), None);
+    fn a_stale_mirror_whose_last_pull_failed_names_the_code_and_hides_the_list() {
+        let failed = crate::tracker::view::Attempt::Failed { at: now() - TimeDelta::hours(1), code: FailureCode::Auth };
+        let lines = section(&with_attempt(view(2, vec![issue(1, StateCategory::Started)]), failed), None, false);
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 2h ago. Stale. Reason: The last pull failed: auth."]);
+    }
+
+    #[test]
+    fn a_fresh_mirror_whose_last_pull_failed_shows_only_the_age_and_the_failure() {
+        let failed = crate::tracker::view::Attempt::Failed { at: now() - TimeDelta::minutes(30), code: FailureCode::Auth };
+        let lines = section(&with_attempt(view(1, vec![issue(1, StateCategory::Started)]), failed), None, false);
         assert_eq!(lines, vec![
-            "Tracker mirror. Last pulled 2 hours ago. Not authoritative.",
+            "Tracker mirror. Last pulled 1 hour ago. Not authoritative.",
             "The last pull failed: auth. Run `wardwell tracker status`.",
         ]);
     }
 
+    /// The old assertion pinned "Tracker mirror. Never pulled. Not
+    /// authoritative." That line left out the stale reason the card
+    /// requires in every surface, so a mirror whose first pull failed read
+    /// the same as one never tried.
     #[test]
-    fn a_mirror_never_pulled_says_only_that() {
-        let lines = tracker_section(&MirrorView::default(), now(), None);
-        assert_eq!(lines, vec!["Tracker mirror. Never pulled. Not authoritative."]);
+    fn a_mirror_never_pulled_says_why() {
+        let lines = section(&MirrorView::default(), None, false);
+        assert_eq!(lines, vec!["Tracker mirror. Never pulled. Stale. Reason: No pull was tried."]);
+        let failed = crate::tracker::view::Attempt::Failed { at: now() - TimeDelta::minutes(5), code: FailureCode::Auth };
+        let lines = section(&with_attempt(MirrorView::default(), failed), None, false);
+        assert_eq!(lines, vec!["Tracker mirror. Never pulled. Stale. Reason: The last pull failed: auth."]);
     }
 
     #[test]
     fn a_mirror_whose_pulls_cannot_run_is_not_presented_as_current() {
         let fresh = view(1, vec![issue(1, StateCategory::Started)]);
         assert_eq!(
-            tracker_section(&fresh, now(), Some(FailureCode::Credential)),
+            section(&fresh, Some(FailureCode::Credential), false),
             vec!["Tracker mirror. Pulls cannot run: credential. Last pulled 1 hour ago."]
         );
         assert_eq!(
-            tracker_section(&MirrorView::default(), now(), Some(FailureCode::UnsupportedProvider)),
+            section(&MirrorView::default(), Some(FailureCode::UnsupportedProvider), false),
             vec!["Tracker mirror. Pulls cannot run: unsupported_provider. Never pulled."]
         );
     }
@@ -249,7 +340,7 @@ mod tests {
         let path = crate::tracker::credential::path_in(dir.path(), "c").unwrap();
         crate::tracker::credential::save(&path, "t").unwrap();
         let ready = project_tracker_lines(&config, dir.path(), "work", &project, now()).unwrap();
-        assert_eq!(ready, vec!["Tracker mirror. Never pulled. Not authoritative."]);
+        assert_eq!(ready, vec!["Tracker mirror. Never pulled. Stale. Reason: No pull was tried."]);
         assert!(project_tracker_lines(&config, dir.path(), "work", &vault.join("work/ops"), now()).is_none());
     }
 
@@ -264,10 +355,22 @@ mod tests {
         let both = crate::config::loader::parse(&yaml("    - provider: github\n      repository: acme/app\n    - provider: linear\n      team: COR\n      credential: c\n")).unwrap();
         crate::tracker::credential::save(&crate::tracker::credential::path_in(dir.path(), "c").unwrap(), "t").unwrap();
         let lines = project_tracker_lines(&both, dir.path(), "work", &project, now()).unwrap();
-        assert_eq!(lines, vec!["Tracker mirror. Last pulled 1 hour ago. Not authoritative.", "- COR-1 Claims inbox (In Progress)"]);
+        assert_eq!(lines, vec![
+            "GitHub mirror. Never pulled. Stale. Reason: The last pull failed: provider.",
+            "Tracker mirror. Last pulled 1 hour ago. Not authoritative.",
+            "- COR-1 Claims inbox (In Progress)",
+        ], "one freshness line per binding that is not fresh");
 
         let github_only = crate::config::loader::parse(&yaml("    provider: github\n    repository: acme/app\n")).unwrap();
-        assert!(project_tracker_lines(&github_only, dir.path(), "work", &project, now()).is_none(), "no issue binding, no section");
+        assert_eq!(
+            project_tracker_lines(&github_only, dir.path(), "work", &project, now()).unwrap(),
+            vec!["GitHub mirror. Never pulled. Stale. Reason: The last pull failed: provider."]
+        );
+        std::fs::write(project.join("tracker.jsonl"), b"\xff").unwrap();
+        assert_eq!(
+            project_tracker_lines(&both, dir.path(), "work", &project, now()).unwrap(),
+            vec!["GitHub mirror. Could not read the mirror log: log_read.", "Tracker mirror. Could not read the mirror log: log_read."]
+        );
     }
 
     #[test]

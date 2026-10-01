@@ -46,6 +46,19 @@ pub fn domain_context(config: &WardwellConfig, config_dir: &Path, domain_dir: &P
 /// line, and its tracker section when bound. Nothing when the project has
 /// no vault folder.
 pub fn project_context(config: &WardwellConfig, config_dir: &Path, domain: &str, project: &str, now: DateTime<Utc>, today: NaiveDate) -> String {
+    let mut out = project_head(config, domain, project, today);
+    if out.is_empty() {
+        return out;
+    }
+    let dir = config.vault_path.join(domain).join(project);
+    let tracker = project_tracker_lines(config, config_dir, domain, &dir, now).unwrap_or_default();
+    tracker.iter().for_each(|line| push_line(&mut out, &format!("  {line}")));
+    out
+}
+
+/// A mapped project's summary or header and its rot line, without the
+/// tracker section. Nothing when the project has no vault folder.
+pub fn project_head(config: &WardwellConfig, domain: &str, project: &str, today: NaiveDate) -> String {
     let dir = config.vault_path.join(domain).join(project);
     if !dir.is_dir() {
         return String::new();
@@ -55,8 +68,6 @@ pub fn project_context(config: &WardwellConfig, config_dir: &Path, domain: &str,
         push_line(&mut out, &format!("**{domain}/{project}**"));
     }
     push_line(&mut out, &format!("  {}", project_rot_line(&dir, today)));
-    let tracker = project_tracker_lines(config, config_dir, domain, &dir, now).unwrap_or_default();
-    tracker.iter().for_each(|line| push_line(&mut out, &format!("  {line}")));
     out
 }
 

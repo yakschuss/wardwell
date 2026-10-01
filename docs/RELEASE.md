@@ -3,6 +3,47 @@
 The owner runs these steps. An agent prepares the release commit but never
 tags or pushes a tag.
 
+## 0.13.1
+
+The steps are the ones for 0.13.0 below, with `0.13.1` in place of `0.13.0`.
+
+0.13.1 drops the background pull service. Session start and the running
+server now refresh the tracker mirror when it is over an hour old. After the
+upgrade, run `wardwell setup`. When your vault is under iCloud Drive,
+`~/Documents`, `~/Desktop` or `~/Downloads`, the plan shows REMOVE + BACKUP for
+the old `com.wardwell.tracker-pull` agent. The old agent waits on a macOS
+privacy prompt after every upgrade, so it is the reason a mirror went stale
+without a word.
+
+Then check the words:
+
+```sh
+wardwell tracker status
+wardwell doctor
+```
+
+A stale mirror says so and says why. Start a Claude Code session in a mapped
+project. When the mirror is over an hour old, the session prints "Refresh
+started in the background." `wardwell tracker status` then shows `pull
+running since <time>`, and later a fresh last pull.
+
+Sessions and servers started before the upgrade keep the old binary. The old
+binary skips `pull_started` rows and `timeout` and `spawn` failures as
+unreadable lines. It does not start background pulls. Restart them.
+
+## No Homebrew `service` block
+
+Do not add a `service` block to the formula in `yakschuss/homebrew-wardwell`,
+and do not run `brew services start wardwell`. A Homebrew service is a launchd
+agent. It waits on the same macOS privacy prompt after every upgrade, when
+the vault is under a protected folder. The session refresh needs no prompt.
+If an earlier note had you add the block, remove it from the formula. If you
+started the service, stop it:
+
+```sh
+brew services stop wardwell
+```
+
 ## 0.13.0
 
 ### 1. Check main
@@ -66,28 +107,8 @@ can read a github marker as Linear's. It then shows a wrong Linear pull time,
 and its on-miss refresh can start from the wrong point. Restart those
 sessions. The daily full Linear pull repairs anything the old binary missed.
 
-The hooks and the pull service name the path you ran `wardwell` from, such as
+The hooks name the path you ran `wardwell` from, such as
 `/opt/homebrew/bin/wardwell`, never the versioned Cellar path behind it, so
 they survive `brew upgrade`. Start a new Claude Code session afterwards;
 running sessions keep their old hooks.
 
-## Homebrew `service` block (optional)
-
-This is a change to the formula in `yakschuss/homebrew-wardwell`, not to this
-repository. Wardwell does not depend on it: `wardwell setup` installs its own
-launchd agent, `com.wardwell.tracker-pull`, whenever a tracker binding exists.
-
-```ruby
-  service do
-    run [opt_bin/"wardwell", "tracker", "pull"]
-    run_type :interval
-    interval 3600
-    log_path var/"log/wardwell-tracker-pull.log"
-    error_log_path var/"log/wardwell-tracker-pull.log"
-  end
-```
-
-If you start it with `brew services start wardwell`, both agents pull. The
-per-project tracker lock keeps two pulls from writing at once, but each pull
-still calls the provider. Use one. `wardwell setup` installs its own agent again
-whenever it is missing, so the setup agent is the one to rely on.
