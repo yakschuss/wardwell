@@ -61,6 +61,31 @@ enum Commands {
         #[command(subcommand)]
         command: TrackerCommand,
     },
+    /// Link working directories to vault projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommand {
+    /// Link a directory to a vault project in config.yml, with a backup
+    Link {
+        /// <domain>/<project>; defaults to the one vault project named like the directory
+        target: Option<String>,
+        /// Directory to link (defaults to the current directory)
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
+        /// Show the change without writing it
+        #[arg(long)]
+        dry_run: bool,
+        /// Apply without asking
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show each linked project and its directories
+    List,
 }
 
 #[derive(Subcommand)]
@@ -185,11 +210,39 @@ async fn main() {
         Commands::Seed { ref target } => run_seed(target),
         Commands::MigrateAttachments => run_migrate_attachments(),
         Commands::Tracker { command } => run_tracker(command),
+        Commands::Project { command } => run_project(command),
     };
     if let Err(e) = result {
         eprintln!("wardwell: {e}");
         std::process::exit(1);
     }
+}
+
+fn run_project(command: ProjectCommand) -> Result<(), Box<dyn std::error::Error>> {
+    use wardwell::install::project;
+    let config_dir = wardwell::config::loader::config_dir();
+    let mut out = std::io::stdout();
+    match command {
+        ProjectCommand::Link { target, path, dry_run, yes } => {
+            let dir = std::path::absolute(path.unwrap_or_else(|| std::path::PathBuf::from(".")))?;
+            let request = project::LinkRequest { key: target.as_deref(), dir: &dir, dry_run, yes };
+            project::link(&config_dir, &request, wardwell::inject::git::dirs, confirm_link, &mut out)?;
+        }
+        ProjectCommand::List => project::list(&config_dir, &mut out)?,
+    }
+    Ok(())
+}
+
+fn confirm_link() -> bool {
+    use std::io::Write;
+    print!("\n  Apply this change to config.yml? [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let answer = input.trim();
+    answer.is_empty() || answer.eq_ignore_ascii_case("y")
 }
 
 fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>> {

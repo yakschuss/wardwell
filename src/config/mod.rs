@@ -1,3 +1,4 @@
+pub mod edit;
 pub mod types;
 pub mod loader;
 

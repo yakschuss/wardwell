@@ -205,8 +205,12 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         });
     }
 
-    let contents = std::fs::read_to_string(&config_path)?;
-    let raw: RawConfig = serde_yaml::from_str(&contents)?;
+    parse(&std::fs::read_to_string(&config_path)?)
+}
+
+/// Parse config.yml text. Domains still load from the vault it names.
+pub fn parse(contents: &str) -> Result<WardwellConfig, ConfigError> {
+    let raw: RawConfig = serde_yaml::from_str(contents)?;
 
     let vault_path = expand_tilde(&raw.vault_path);
 

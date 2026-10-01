@@ -1,0 +1,275 @@
+//! `wardwell project link` and `wardwell project list`: record which
+//! directories belong to a vault project in config.yml, preview first, with
+//! a backup, idempotently. A linked worktree records its main checkout.
+//!
+//! Does NOT create vault folders, resolve sessions (inject/resolve.rs does),
+//! or touch any client settings.
+
+use crate::companion::install::{atomic_write, backup_file, read_optional};
+use crate::config::edit::add_project_path;
+use crate::config::loader::{WardwellConfig, parse};
+use crate::inject::git::{GitDirs, canonical};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// What the user asked `link` to do.
+pub struct LinkRequest<'a> {
+    /// `<domain>/<project>`, or None to infer it from the directory name.
+    pub key: Option<&'a str>,
+    /// The directory to link, absolute.
+    pub dir: &'a Path,
+    pub dry_run: bool,
+    pub yes: bool,
+}
+
+/// Plan, preview, confirm and apply one link in `config_dir/config.yml`.
+/// `confirm` is asked once, only when a write is planned without `yes`.
+pub fn link(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) -> Option<GitDirs>, confirm: impl FnOnce() -> bool, out: &mut dyn Write) -> Result<(), String> {
+    let path = config_dir.join("config.yml");
+    let (before, config) = read_config(&path)?;
+    let dir = recorded_dir(request.dir, git)?;
+    let key = match request.key {
+        Some(key) => key.to_string(),
+        None => infer_key(&config, &dir)?,
+    };
+    require_vault_folder(&config, &key)?;
+    let say = |out: &mut dyn Write, line: String| writeln!(out, "{line}").map_err(|e| e.to_string());
+    say(out, format!("wardwell project link\n\n  Link {} to {key}.\n  Proposed changes:", dir.display()))?;
+    if let Some(through) = covering_path(&config, &key, &dir)? {
+        say(out, format!("    {:<15} {}", "UNCHANGED", path.display()))?;
+        return say(out, format!("\n  Already linked through {}. Nothing changed.", through.display()));
+    }
+    let after = add_project_path(&before, &key, &dir)?;
+    say(out, format!("    {:<15} {}", "UPDATE + BACKUP", path.display()))?;
+    if request.dry_run {
+        return say(out, "\n  Dry run complete. Nothing changed.".into());
+    }
+    if !request.yes && !confirm() {
+        return say(out, "\n  Cancelled. Nothing changed.".into());
+    }
+    let backup = write(&path, &before, &after)?;
+    say(out, format!("\n  OK linked.\n    backup: {}", backup.display()))?;
+    say(out, format!("\n  New sessions started in {} or its worktrees load {key}.\n  Sessions already running do not change.", dir.display()))
+}
+
+/// Every mapping in `config_dir/config.yml`, one project per block.
+pub fn list(config_dir: &Path, out: &mut dyn Write) -> Result<(), String> {
+    let (_, config) = read_config(&config_dir.join("config.yml"))?;
+    let mut text = String::from("wardwell project list\n\n");
+    if config.projects.is_empty() {
+        text.push_str("  No directories are linked. Run `wardwell project link` in a repository.\n");
+    }
+    for (key, mapping) in &config.projects {
+        text.push_str(&format!("  {key}\n"));
+        mapping.paths.iter().for_each(|p| text.push_str(&format!("    {}\n", p.display())));
+    }
+    out.write_all(text.as_bytes()).map_err(|e| e.to_string())
+}
+
+fn read_config(path: &Path) -> Result<(String, WardwellConfig), String> {
+    let bytes = read_optional(path)?.ok_or_else(|| format!("No config at {}. Run `wardwell init` first.", path.display()))?;
+    let text = String::from_utf8(bytes).map_err(|_| "config.yml is not UTF-8".to_string())?;
+    let config = parse(&text).map_err(|e| format!("config.yml does not parse: {e}"))?;
+    Ok((text, config))
+}
+
+/// The directory as it will be recorded: canonical, and for a linked
+/// worktree, the same place in the main checkout.
+fn recorded_dir(dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>) -> Result<PathBuf, String> {
+    if !dir.is_dir() {
+        return Err(format!("{} is not a directory; nothing changed.", dir.display()));
+    }
+    let dir = canonical(dir);
+    let in_main = git(&dir).and_then(|g| g.in_main_worktree(&dir));
+    Ok(in_main.unwrap_or(dir))
+}
+
+/// The one vault project named like `dir`, or what to type instead.
+fn infer_key(config: &WardwellConfig, dir: &Path) -> Result<String, String> {
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let found: Vec<String> = subfolders(&config.vault_path)
+        .into_iter()
+        .filter(|domain| domain.join(name).is_dir())
+        .filter_map(|domain| Some(format!("{}/{name}", domain.file_name()?.to_str()?)))
+        .collect();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("No vault project is named {name}. Name it: `wardwell project link <domain>/<project>`. Nothing changed.")),
+        many => Err(format!("Several vault projects are named {name}: {}. Name one: `wardwell project link <domain>/<project>`. Nothing changed.", many.join(", "))),
+    }
+}
+
+fn subfolders(dir: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .unwrap_or_default();
+    found.retain(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !n.starts_with('.') && !n.starts_with('_')));
+    found.sort();
+    found
+}
+
+fn require_vault_folder(config: &WardwellConfig, key: &str) -> Result<(), String> {
+    let (domain, project) = key
+        .split_once('/')
+        .filter(|(d, p)| !d.is_empty() && !p.is_empty() && !p.contains('/'))
+        .ok_or_else(|| format!("{key} is not <domain>/<project>; nothing changed."))?;
+    let folder = config.vault_path.join(domain).join(project);
+    if !folder.is_dir() {
+        return Err(format!("{key} has no folder in the vault at {}. Create it with `wardwell seed {key}`, then link again. Nothing changed.", folder.display()));
+    }
+    Ok(())
+}
+
+/// The path of `key` that already contains `dir`. Err when another project
+/// lists exactly `dir`.
+fn covering_path(config: &WardwellConfig, key: &str, dir: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some((other, _)) = config.projects.iter().find(|(k, m)| *k != key && m.paths.iter().any(|p| canonical(p) == dir)) {
+        return Err(format!("{} is already linked to {other}. Remove it there first. Nothing changed.", dir.display()));
+    }
+    let own = config.projects.get(key).map(|m| m.paths.as_slice()).unwrap_or_default();
+    Ok(own.iter().find(|p| dir.starts_with(canonical(p))).cloned())
+}
+
+/// Back up `before` beside `path`, then replace `path` with `after`,
+/// keeping its permissions. Refuses when the file changed since it was read.
+fn write(path: &Path, before: &str, after: &str) -> Result<PathBuf, String> {
+    if read_optional(path)?.as_deref() != Some(before.as_bytes()) {
+        return Err("config.yml changed while the plan was made. Nothing changed; run the command again.".into());
+    }
+    let mode = std::fs::metadata(path).map(|m| m.permissions()).map_err(|_| "Could not inspect config.yml")?;
+    let backup = backup_file(path, before.as_bytes())?;
+    atomic_write(path, after.as_bytes()).map_err(|e| format!("{e}; the backup is at {}", backup.display()))?;
+    std::fs::set_permissions(path, mode).map_err(|_| "Could not restore the permissions of config.yml")?;
+    Ok(backup)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::inject::git::testing::{git as run_git, repo};
+
+    const HEAD: &str = "# my config\nvault_path: VAULT # keep\nsession_sources: []\n";
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        cfg: PathBuf,
+        code: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let vault = tmp.path().join("vault");
+        std::fs::create_dir_all(vault.join("personal/corrtex")).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("config.yml"), HEAD.replace("VAULT", &vault.display().to_string())).unwrap();
+        let code = canonical(tmp.path()).join("code/corrtex");
+        repo(&code);
+        Fixture { _tmp: tmp, cfg, code }
+    }
+
+    fn run(f: &Fixture, key: Option<&str>, dir: &Path, dry_run: bool, answer: bool) -> Result<String, String> {
+        let mut out = Vec::new();
+        let request = LinkRequest { key, dir, dry_run, yes: false };
+        link(&f.cfg, &request, crate::inject::git::dirs, || answer, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn config_text(f: &Fixture) -> String {
+        std::fs::read_to_string(f.cfg.join("config.yml")).unwrap()
+    }
+
+    fn backups(f: &Fixture) -> Vec<PathBuf> {
+        std::fs::read_dir(&f.cfg).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().contains(".wardwell-backup-")).collect()
+    }
+
+    #[test]
+    fn link_previews_writes_with_a_private_backup_and_a_second_run_changes_nothing() {
+        let f = fixture();
+        let original = config_text(&f);
+        let out = run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+        assert!(out.contains(&format!("UPDATE + BACKUP {}", f.cfg.join("config.yml").display())), "{out}");
+        assert!(out.contains("Sessions already running do not change."), "{out}");
+        let text = config_text(&f);
+        assert!(text.starts_with(&original), "every existing byte kept: {text}");
+        assert!(text.ends_with(&format!("- \"{}\"\n", f.code.display())), "no trailing slash: {text}");
+        let config = parse(&text).unwrap();
+        assert_eq!(config.projects["personal/corrtex"].paths, vec![f.code.clone()]);
+        let saved = backups(&f);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), original);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&saved[0]).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let again = run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+        assert!(again.contains("UNCHANGED") && again.contains("Nothing changed."), "{again}");
+        assert_eq!(config_text(&f), text);
+        assert_eq!(backups(&f).len(), 1);
+    }
+
+    #[test]
+    fn dry_run_and_a_declined_prompt_write_nothing() {
+        let f = fixture();
+        let original = config_text(&f);
+        let out = run(&f, Some("personal/corrtex"), &f.code, true, true).unwrap();
+        assert!(out.contains("UPDATE + BACKUP") && out.contains("Dry run complete. Nothing changed."), "{out}");
+        let out = run(&f, Some("personal/corrtex"), &f.code, false, false).unwrap();
+        assert!(out.contains("Cancelled. Nothing changed."), "{out}");
+        assert_eq!(config_text(&f), original);
+        assert!(backups(&f).is_empty());
+    }
+
+    #[test]
+    fn a_project_missing_from_the_vault_is_refused() {
+        let f = fixture();
+        let error = run(&f, Some("personal/nope"), &f.code, false, true).unwrap_err();
+        assert!(error.contains("has no folder in the vault") && error.contains("wardwell seed personal/nope"), "{error}");
+        assert!(backups(&f).is_empty());
+    }
+
+    #[test]
+    fn a_linked_worktree_records_the_main_checkout() {
+        let f = fixture();
+        let linked = f.code.parent().unwrap().join("corrtex-wt");
+        run_git(&f.code, &["worktree", "add", "-q", "-b", "wt", linked.to_str().unwrap()]);
+        run(&f, Some("personal/corrtex"), &linked, false, true).unwrap();
+        assert_eq!(parse(&config_text(&f)).unwrap().projects["personal/corrtex"].paths, vec![f.code.clone()]);
+    }
+
+    #[test]
+    fn without_a_key_the_directory_name_picks_the_one_vault_project() {
+        let f = fixture();
+        run(&f, None, &f.code, false, true).unwrap();
+        assert!(parse(&config_text(&f)).unwrap().projects.contains_key("personal/corrtex"));
+        let other = f.code.parent().unwrap().join("scratch");
+        std::fs::create_dir_all(&other).unwrap();
+        let error = run(&f, None, &other, false, true).unwrap_err();
+        assert!(error.contains("No vault project is named scratch"), "{error}");
+    }
+
+    #[test]
+    fn a_directory_linked_to_another_project_is_refused() {
+        let f = fixture();
+        run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+        let vault = parse(&config_text(&f)).unwrap().vault_path;
+        std::fs::create_dir_all(vault.join("work/other")).unwrap();
+        let error = run(&f, Some("work/other"), &f.code, false, true).unwrap_err();
+        assert!(error.contains("already linked to personal/corrtex"), "{error}");
+    }
+
+    #[test]
+    fn list_shows_each_project_and_its_paths() {
+        let f = fixture();
+        let mut out = Vec::new();
+        list(&f.cfg, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains("No directories are linked."));
+        run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+        let mut out = Vec::new();
+        list(&f.cfg, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), format!("wardwell project list\n\n  personal/corrtex\n    {}\n", f.code.display()));
+    }
+}

@@ -32,10 +32,7 @@ pub fn resolve(cwd: &Path, config: &WardwellConfig, git: impl Fn(&Path) -> Optio
 
 /// The directory as seen from the main checkout first, then as it is.
 fn candidates(cwd: &Path, git: impl Fn(&Path) -> Option<GitDirs>) -> Vec<PathBuf> {
-    let in_main = git(cwd).and_then(|dirs| {
-        let relative = cwd.strip_prefix(&dirs.toplevel).ok()?;
-        Some(dirs.main_worktree()?.join(relative))
-    });
+    let in_main = git(cwd).and_then(|dirs| dirs.in_main_worktree(cwd));
     in_main.into_iter().chain(std::iter::once(cwd.to_path_buf())).collect()
 }
 

@@ -25,6 +25,12 @@ impl GitDirs {
     pub fn main_worktree(&self) -> Option<PathBuf> {
         (self.common_dir.file_name()? == ".git").then(|| self.common_dir.parent().map(Path::to_path_buf))?
     }
+
+    /// Where `dir`, inside this work tree, sits in the main checkout.
+    pub fn in_main_worktree(&self, dir: &Path) -> Option<PathBuf> {
+        let relative = dir.strip_prefix(&self.toplevel).ok()?;
+        Some(self.main_worktree()?.join(relative).components().collect())
+    }
 }
 
 /// `git rev-parse` for `dir`, or None outside a repository or on any error.
