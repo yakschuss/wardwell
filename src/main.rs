@@ -24,7 +24,7 @@ enum Commands {
         #[command(subcommand)]
         command: CompanionCommand,
     },
-    /// First-run setup — generates config, injects MCP entries, installs hooks
+    /// First-run setup — generates config, connects agent clients, installs hooks
     Init,
     /// Set up or repair Wardwell on this computer
     Setup {

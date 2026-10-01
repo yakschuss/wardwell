@@ -433,7 +433,7 @@ fn print_client_status(
         println!("  {client:<30} · hosted app    account connector");
     }
     if status.legacy_remote {
-        println!("  {client:<30} · legacy MCP    \u{2717} static/proxy connection remains");
+        println!("  {client:<30} · old connection\u{2717} static/proxy connection remains");
         *all_ok = false;
     }
 }

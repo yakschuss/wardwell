@@ -171,14 +171,14 @@ fn preview_and_confirm(vault_path: &Path, config_path: &Path, binary_path: &Path
 
     let mcp_paths = McpConfigPaths::detect();
     println!(
-        "    RECONCILE  Claude Code MCP → {}",
+        "    RECONCILE  Claude Code connection → {}",
         mcp_paths.claude_code.display()
     );
     println!(
-        "    RECONCILE  Claude Desktop MCP → {}",
+        "    RECONCILE  Claude Desktop connection → {}",
         mcp_paths.claude_desktop.display()
     );
-    println!("    RECONCILE  Codex MCP → {}", mcp_paths.codex.display());
+    println!("    RECONCILE  Codex connection → {}", mcp_paths.codex.display());
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     match hooks_plan(binary_path) {
@@ -381,7 +381,7 @@ fn report_reconciliation(
         Err(error) => {
             println!("  \u{2717} {client} configuration unchanged: {error}");
             skipped.push(format!(
-                "{client} MCP: resolve the reported configuration conflict"
+                "{client}: resolve the reported configuration conflict"
             ));
         }
     }

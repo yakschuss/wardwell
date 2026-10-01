@@ -12,15 +12,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_paths = McpConfigPaths::detect();
 
     print_removal(
-        "Claude Code MCP entries",
+        "Claude Code connection entries",
         mcp_config::remove_owned_json_entries(&mcp_paths.claude_code, true),
     );
     print_removal(
-        "Claude Desktop MCP entries",
+        "Claude Desktop connection entries",
         mcp_config::remove_owned_json_entries(&mcp_paths.claude_desktop, true),
     );
     print_removal(
-        "Codex MCP entries",
+        "Codex connection entries",
         mcp_config::remove_owned_codex_entries(&mcp_paths.codex),
     );
 
@@ -99,7 +99,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("  Removed MCP entries, hooks, deny entries Wardwell added, the tracker pull, markers, and databases.");
+    println!("  Removed connection entries, hooks, deny entries Wardwell added, the tracker pull, markers, and databases.");
     println!("  Sessions already running keep their hooks until they end.");
     println!(
         "  Your vault and config preserved at {}.",
