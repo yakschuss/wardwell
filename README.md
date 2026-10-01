@@ -17,25 +17,58 @@ Or build from source:
 cargo install --path .
 ```
 
-Then run first-time setup:
+Then run three commands:
 
 ```bash
-wardwell init
+wardwell init       # first run: vault, config, agent entries, hooks, index
+wardwell setup      # preview, then install or repair hooks, tracker policy and the pull
+wardwell doctor     # check the wiring; it says what it cannot check
 ```
 
-This creates `~/.wardwell/`, generates a config, registers the MCP server in Claude Code, and installs the SessionStart hook. It walks you through each step interactively.
+`init` creates `~/.wardwell/`, writes a config, registers Wardwell in your
+agent clients, installs the hooks, and builds the index. It walks you through
+each step.
 
-On an additional computer, or to repair agent connections without touching the
-vault, run:
+`setup` is safe to run at any time, on any computer. It never reads or changes
+the vault. It shows a plan first, with CREATE, UPDATE + BACKUP or UNCHANGED on
+each line. `--dry-run` writes nothing. It asks once before it writes. `--yes`
+skips the question. A second run changes nothing and says so. Before any write
+it reads and checks every file it will change. A malformed or conflicting file
+stops the run, and nothing is written. It keeps every entry that is not
+Wardwell's. A hook is Wardwell's only when its program is a Wardwell binary
+and its arguments are exactly Wardwell's. Each changed file is saved beside
+itself first, with owner-only permissions, and written through a temp file
+and a rename.
+
+`setup` installs in two tiers:
+
+- **Memory, always.** The session-start hook and the Stop hook in
+  `~/.claude/settings.json`. When the Companion Stop hook is installed, it
+  already runs the history check, so no second Stop hook is added.
+- **Tracker policy, optional.** Only when a tracker binding has `provider:
+  linear` and `gate: true`. The Linear gate, a PreToolUse hook, and a deny
+  list for destructive Linear tools. See [Linear gate](#linear-gate).
+
+When any binding exists, `setup` also installs the hourly tracker pull, a
+launchd agent on macOS. On other hosts it prints a crontab line.
+
+Installed is not active. Claude Code reads hooks and permissions when a
+session starts. Sessions already running do not change. Start a new session,
+then run `wardwell doctor`.
+
+`setup` also reconciles Wardwell's MCP entries in Claude Code, Claude Desktop,
+and Codex. It preserves unrelated MCP servers and leaves hosted access
+disconnected until you approve OAuth.
+
+To remove Wardwell's wiring:
 
 ```bash
-wardwell setup --dry-run
-wardwell setup
+wardwell uninstall
 ```
 
-`setup` reconciles Wardwell's user-scoped entries in Claude Code, Claude
-Desktop, and Codex. It preserves unrelated MCP servers, backs up changed client
-configs, and leaves hosted access disconnected until you approve OAuth.
+It removes Wardwell's MCP entries, its hooks, the deny entries it added and no
+others, the pull service, and its CLAUDE.md markers. It never deletes the
+Wardwell folder.
 
 ## How It Works
 
@@ -183,6 +216,75 @@ The command adds the directory under `projects:` in config.yml. Comments and oth
 
 `wardwell project list` shows each project and its directories. Sessions already running do not change. The mapping applies from the next session.
 
+## Linear gate
+
+The tracker policy tier. Turn it on per binding with `gate: true`:
+
+```yaml
+trackers:
+  personal/corr-platform:
+    provider: linear
+    team: COR
+    credential: corr-linear
+    gate: true
+```
+
+Then run `wardwell setup`. The plan shows each line under "Tracker policy,
+optional". It adds two things to `~/.claude/settings.json`:
+
+- A PreToolUse hook with matcher `mcp__linear__save_comment|mcp__linear__save_issue`
+  that runs `wardwell gate linear`.
+- Deny entries for the destructive Linear tools: delete comment, delete
+  attachment, retire issue label, retire project label, save project, delete
+  status update, delete diff comment.
+
+When a hook entry runs the old Python gate, `linear-gate.py`, setup removes
+that entry and says so in the plan. The script file stays. With the policy
+off, setup leaves the Python entry in place and says how to replace it.
+Setting `gate: false` later and running setup removes the gate and the deny
+entries Wardwell added.
+
+The gate reads the PreToolUse payload on standard input. It prints a deny
+decision with the reason, or nothing to allow. It always exits 0. A payload it
+cannot read is allowed. The rules are the ruleset `linear-updates`, version 1,
+held as data in the binary:
+
+- A comment's first line starts with `Shipped:`, `Needs info:`, `Blocked:` or
+  `Follow-up:`, and text follows the colon.
+- The comment has a "For the team" section, and each field of its shape is
+  present and not empty.
+- A created issue has the fields Asked by, What changes for whom, and Done
+  when, and a parent issue or a template.
+- The team section has fewer than 80 words. Each sentence has 20 words or
+  fewer. No parentheses, semicolons, dashes, "e.g." or "i.e.".
+- A comment's team section has no backticks, paths, links, a number sign
+  followed by digits, snake_case or CamelCase tokens, file extensions, or the
+  words PR, merge, deploy, migration, webhook, adapter.
+- Each `COR-` key is `COR-` and digits. Each date is valid.
+- A session sets no priority. It sets no state, except `state: "Triage"` when
+  it creates an issue.
+
+A per-project override, such as a `.wardwell/tracker-updates.md` file, is a
+follow-up. This version does not read one.
+
+## Install record
+
+Some entries cannot be proven Wardwell's by their shape. A deny entry such as
+`mcp__linear__save_project` may also be one you added yourself. So setup
+records the deny entries it adds in `~/.wardwell/install-manifest.json`:
+
+```json
+{
+  "version": 1,
+  "claude_permissions_deny": ["mcp__linear__delete_comment"]
+}
+```
+
+An entry you already had is never recorded. Uninstall, or setup with the
+policy off, removes only the recorded entries. Hooks are not recorded; they
+are matched by binary name and arguments. The file lives under
+`WARDWELL_CONFIG_DIR` when that is set.
+
 ## Stop check
 
 When a session stops, Wardwell checks that work was recorded. In a mapped project with a vault folder, it counts the commits this worktree made since the session began. It reads the worktree's own HEAD reflog. A pull, a checkout, a rebase or a merge does not count, so other people's commits never do. With commits and no history entry written since then, it blocks the stop once with one line, for example:
@@ -219,10 +321,11 @@ The Companion Stop check runs first. When both block, one block carries both rea
 wardwell serve                Start the MCP server (full access)
 wardwell serve --domain work  Start scoped to a specific domain
 wardwell init                 First-run setup — interactive walkthrough
-wardwell setup --dry-run      Preview agent config repair; never changes the vault
-wardwell setup                Configure detected agents, with backups and one consent gate
+wardwell setup --dry-run      Preview agent config, hooks, tracker policy and pull; never changes the vault
+wardwell setup [--yes]        Apply that plan, with backups and one consent gate
 wardwell doctor               Check that everything is wired correctly
-wardwell uninstall            Clean removal — MCP entries, hooks, markers (preserves vault)
+wardwell uninstall            Remove Wardwell's entries, hooks, deny entries and pull (preserves vault)
+wardwell gate linear          PreToolUse hook: check a Linear write (reads JSON from stdin)
 wardwell inject .             Output project context for a directory, used by hooks
 wardwell project link [<d/p>] [--path <dir>] [--dry-run] [--yes]   Link a directory to a vault project
 wardwell project list         Show each linked project and its directories
@@ -242,7 +345,7 @@ Interactive setup that walks you through:
 1. Detecting or choosing your vault path (auto-detects Obsidian vaults)
 2. Previewing all mutations before making them
 3. Injecting the MCP server config into Claude Code and Claude Desktop
-4. Installing the SessionStart hook
+4. Installing the hooks, with the same preview, backups and exact matching as `setup`
 5. Injecting wardwell markers into CLAUDE.md
 6. Building the search index
 
@@ -252,8 +355,10 @@ Each step can be skipped. Skipped steps are listed at the end with manual instru
 
 Configures or repairs this computer after Wardwell itself is installed. Unlike
 `init`, it does not inspect, create, index, or change vault files. Before any
-write it preflights every detected client and aborts on malformed or conflicting
-configuration. OAuth approval and a successful publish/refresh remain required
+write it preflights every detected client and every settings file, and aborts
+on malformed or conflicting configuration. It installs the two tiers described
+under [Install](#install) and the tracker pull. `init` uses the same installer
+for its hooks. OAuth approval and a successful publish/refresh remain required
 before the hosted app is considered connected.
 
 ### wardwell seed
@@ -281,6 +386,10 @@ Checks that everything is wired correctly:
 - Local context and hosted-app MCP entries configured in Claude Code and Codex
 - Local context configured in Claude Desktop; hosted access remains an account connector
 - SessionStart hook registered
+- Gate ruleset: its name and version, `linear-updates v1`
+- Linear gate: installed when a linear binding has `gate: true`, and running this binary
+- Linear deny list: every destructive Linear tool denied
+- Tracker pull service: the plist is present and its program exists. Whether launchd loaded it is not checked.
 - Each linked project: whether each directory exists, the age of the last history entry and last decision, the last pull when bound, and the last stop-check block
 - Claude CLI available (for summarizer)
 
@@ -369,7 +478,7 @@ exclude:
 | `exclude` | Directory/file names to skip during indexing |
 | `domains` | Optional domain config with path patterns and aliases (migration path) |
 | `ai.summarize_model` | Claude model for session summarization (default: `haiku`) |
-| `trackers` | Optional `<domain>/<project>` bindings to an issue tracker (see Tracker mirror) |
+| `trackers` | Optional `<domain>/<project>` bindings to an issue tracker (see Tracker mirror). `gate: true` on a linear binding turns on the Linear gate (see Linear gate). |
 | `projects` | Optional `<domain>/<project>` entries, each with `paths:`, a list of directories. Session start and the Stop check use them. `~/` is expanded. Paths must be absolute. Any other key in an entry is an error. |
 | `stop_hook` | Set to `false` to turn off the Stop check. Default `true`. |
 
@@ -395,6 +504,7 @@ trackers:
     team: COR             # Linear team key
     credential: corr-linear
     readonly: true        # refuse kanban writes on this project
+    gate: true            # optional: install the Linear gate and deny list (see Linear gate)
 ```
 
 A binding's team key may not equal a native kanban prefix set under
@@ -586,6 +696,8 @@ load and every interval, using the binary you ran it with, and replaces any
 existing agent of the same label; output goes to `~/.wardwell/tracker-pull.log`.
 The interval must be 60 to 2147483647 seconds. On other hosts `schedule` prints a
 crontab line instead, marked approximate when cron cannot express the interval.
+`wardwell setup` installs the same agent at the hourly default when any binding
+exists, keeps an interval you set, and `wardwell uninstall` removes it.
 `unschedule` stops the agent and removes its plist. `status` reports the interval
 read from the plist on disk, not whether launchd has the job loaded.
 

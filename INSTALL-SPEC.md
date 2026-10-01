@@ -5,7 +5,10 @@
 One command. User's next Claude session has wardwell tools available automatically. They never see "MCP", "stdio", or "JSON-RPC". They just know Claude suddenly knows things.
 
 ```bash
-brew install wardwell && wardwell init
+brew install wardwell
+wardwell init      # first run
+wardwell setup     # preview, then install or repair; safe to rerun
+wardwell doctor    # verify; says what it cannot verify
 ```
 
 ## `wardwell init`
@@ -73,24 +76,11 @@ Scan all directories matching configured domain paths for existing CLAUDE.md fil
 4. If no markers: append the section
 5. Never touch content outside markers
 
-### Step 5 — Install Session Start Hook (Claude Code only)
+### Step 5 — Install Hooks (Claude Code only)
 
-Register a `SessionStart` hook in `~/.claude/settings.json`:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "type": "command",
-        "command": "/path/to/wardwell inject \"$(pwd)\""
-      }
-    ]
-  }
-}
-```
-
-Preserves existing hooks. Uses absolute binary path detected at init time.
+`init` calls the same installer as `wardwell setup`. Its preview lists the
+installer's plan lines, and the step applies that plan. See `wardwell setup`
+below for what is installed and how.
 
 ### Step 6 — Initial Index Build
 
@@ -108,6 +98,67 @@ If vault is empty:
 - Confirm CLAUDE.md pointers placed
 - Confirm hook installed
 - Print: "Done. Restart Claude Desktop and/or start a new Claude Code session."
+
+## `wardwell setup`
+
+Sets up or repairs this computer. Never reads or changes the vault.
+
+- One command. Preview first: each plan line is CREATE, UPDATE + BACKUP, UPDATE (a file only Wardwell writes), UNCHANGED, OFF or MANUAL. `--dry-run` writes nothing. It asks once. `--yes` skips the question.
+- Idempotent. A second run prints the plan with UNCHANGED lines and "Nothing to change."
+- Preflight: every client file, `~/.claude/settings.json`, `config.yml` and the install record are read and checked before any write. A malformed or conflicting file stops the run. Nothing is written.
+- Each file is checked again just before it is written. A file changed since the preview stops the run.
+- Backs up each changed file beside it, mode 0600. Writes through a temp file and a rename.
+- Ownership is exact. A hook handler is Wardwell's only when its program's file name is `wardwell` or `wardwell-<version>` and its arguments are exactly Wardwell's. A substring never matches.
+
+### Tier one: memory, always planned
+
+In `~/.claude/settings.json`:
+
+```json
+{"hooks": {
+  "SessionStart": [{"hooks": [{"type": "command", "command": "'/path/to/wardwell' inject \"$(pwd)\""}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "'/path/to/wardwell' resolve"}]}]
+}}
+```
+
+When the Companion Stop hook (`companion lifecycle stop --client claude`) is present, it runs the history check, so `resolve` is not added and an existing one is removed.
+
+### Tier two: "Tracker policy, optional"
+
+Planned only when a tracker binding has `provider: linear` and `gate: true`. Each line is labelled "Tracker policy, optional".
+
+```json
+{"hooks": {"PreToolUse": [{
+  "matcher": "mcp__linear__save_comment|mcp__linear__save_issue",
+  "hooks": [{"type": "command", "command": "'/path/to/wardwell' gate linear", "timeout": 5}]
+}]},
+"permissions": {"deny": [
+  "mcp__linear__delete_comment", "mcp__linear__delete_attachment",
+  "mcp__linear__retire_issue_label", "mcp__linear__retire_project_label",
+  "mcp__linear__save_project", "mcp__linear__delete_status_update",
+  "mcp__linear__delete_diff_comment"
+]}}
+```
+
+- A hook entry that runs `linear-gate.py` (directly or through a Python interpreter) is removed, with its own plan line. The script file is not deleted. With the policy off, the entry is kept and the plan says how to replace it.
+- With the policy off, a gate and recorded deny entries left by an earlier run are removed.
+- The rules are the ruleset `linear-updates`, version 1, held as data in the binary. A per-project override file is a follow-up.
+
+### Install record
+
+`~/.wardwell/install-manifest.json` (under `WARDWELL_CONFIG_DIR` when set) lists the deny entries Wardwell added. An entry the user already had is not recorded. Uninstall removes only recorded entries.
+
+```json
+{"version": 1, "claude_permissions_deny": ["mcp__linear__delete_comment"]}
+```
+
+### Tracker pull
+
+When any binding exists, setup plans the hourly pull through `tracker schedule`'s code: a launchd agent, `~/Library/LaunchAgents/com.wardwell.tracker-pull.plist`. An interval already set is kept. Off macOS, the plan line is MANUAL with a crontab line.
+
+### Activation
+
+Installed is not active. Claude Code reads hooks and permissions when a session starts. Sessions already running do not change. Setup says this after it writes.
 
 ## `wardwell project link`
 
@@ -137,13 +188,14 @@ Runs inside the Stop hook: `wardwell companion lifecycle stop`, and `wardwell re
 
 ## `wardwell uninstall`
 
-Clean removal. Reverse of init.
+Removes only Wardwell's entries.
 
-1. Remove wardwell entry from Desktop MCP config (preserve others)
-2. Remove wardwell entry from Code MCP config (preserve others)
-3. Remove `<!-- wardwell:start -->` to `<!-- wardwell:end -->` from all CLAUDE.md files
-4. Remove hook script
-5. **Do NOT delete `~/.wardwell/`** — that's the user's data. Print: "Your vault and config are preserved at ~/.wardwell/. Delete manually if desired."
+1. Remove Wardwell's entries from the Desktop, Code and Codex MCP configs (preserve others)
+2. Remove `<!-- wardwell:start -->` to `<!-- wardwell:end -->` from all CLAUDE.md files
+3. Remove Wardwell's hook handlers from `~/.claude/settings.json` by exact match: session start, Stop, the Linear gate, and the Companion lifecycle hooks. Back up the file first.
+4. Remove the deny entries the install record lists, and no others. Empty the record; do not delete it.
+5. Remove the tracker pull service.
+6. **Do NOT delete `~/.wardwell/`** — that's the user's data. Print: "Your vault and config are preserved at ~/.wardwell/. Delete manually if desired."
 
 ## `wardwell doctor`
 
@@ -159,6 +211,12 @@ Diagnostic command. Checks everything is wired correctly.
 - Binary path in MCP configs matches actual binary location ✓/✗
 - Session sources exist and have N sessions ✓/✗
 - Each linked project: each directory exists, ages of the last history entry and decision, the last pull when bound, the last stop-check block ✓/✗
+- Gate ruleset name and version ✓
+- Linear gate installed when a linear binding has `gate: true`, and its binary path is this binary ✓/✗
+- Linear deny list complete ✓/✗
+- Tracker pull service plist present and its program exists ✓/✗. Whether launchd loaded it is not checked.
+
+All checks are offline.
 
 ## Distribution
 
@@ -177,11 +235,11 @@ wardwell init
 Homebrew tap initially, move to core if there's demand.
 
 ### Phase 3 — Binary releases
-GitHub releases with prebuilt binaries for macOS (arm64, x86_64) and Linux. Curl-pipe-bash installer that downloads binary + runs init.
+GitHub releases with prebuilt binaries for macOS (arm64) and Linux (x86_64). The old curl-pipe-bash `install.sh` was deleted in 0.12.0; it cloned a placeholder repository. Release steps are in `docs/RELEASE.md`.
 
 ## Upgrade Path
 
-`wardwell init` is idempotent. On upgrade:
+`wardwell init` and `wardwell setup` are idempotent. On upgrade, run `wardwell setup`:
 - Re-run init to update MCP config paths if binary moved
 - Migrate config if schema changed (versioned config with migration)
 - Re-inject CLAUDE.md pointers (template may have changed)
