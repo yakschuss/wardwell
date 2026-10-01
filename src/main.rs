@@ -754,10 +754,17 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     let cwd = std::path::absolute(cwd)?;
     let today = chrono::Local::now().date_naive();
+    let config_dir = loader::config_dir();
+    let now = chrono::Utc::now();
+    // Reads the project's markers and, when due, starts a detached pull and
+    // returns at once; it never waits on the pull or opens the network.
+    let refresh = |domain: &str, project: &str| {
+        wardwell::tracker::trigger::refresh_detached(&config, &config_dir, domain, project, now) == wardwell::tracker::trigger::Outcome::Started
+    };
     // No match prints nothing. Don't pollute non-project sessions.
     print!(
         "{}",
-        wardwell::inject::start::output(&cwd, &config, &loader::config_dir(), wardwell::inject::git::dirs, chrono::Utc::now(), today)
+        wardwell::inject::start::output(&cwd, &config, &config_dir, wardwell::inject::git::dirs, now, today, &refresh)
     );
     Ok(())
 }

@@ -88,6 +88,15 @@ pub fn refresh(config: &WardwellConfig, domain: &str, project: &str, now: DateTi
     }
 }
 
+/// `refresh` with the real spawner and probes: this binary started in its
+/// own session, `kill -0` for live processes, and the offline doctor check
+/// against credentials in `config_dir`.
+pub fn refresh_detached(config: &WardwellConfig, config_dir: &Path, domain: &str, project: &str, now: DateTime<Utc>) -> Outcome {
+    let spawner = DetachedPull::this_binary(config_dir);
+    let can_pull = |binding: &TrackerBinding| crate::tracker::doctor::check_offline(config_dir, binding).is_ok();
+    refresh(config, domain, project, now, &spawner, &Probes { alive: &freshness::process_alive, can_pull: &can_pull })
+}
+
 /// The last completed pull is older than `REFRESH_AFTER`, or none exists.
 fn is_due(view: &MirrorView, now: DateTime<Utc>) -> bool {
     view.last_pull_at.is_none_or(|at| now - at > REFRESH_AFTER)
@@ -118,10 +127,12 @@ pub struct DetachedPull {
 }
 
 impl DetachedPull {
-    /// The spawner for the running binary, logging to `tracker-pull.log` in `config_dir`.
-    pub fn this_binary(config_dir: &Path) -> Result<Self, String> {
-        let program = std::env::current_exe().map_err(|_| "could not find the running binary".to_string())?;
-        Ok(Self { program, log: crate::tracker::schedule::log_path(config_dir) })
+    /// The spawner for the running binary, logging to `tracker-pull.log`
+    /// in `config_dir`. When the binary cannot be found, every spawn fails
+    /// and is recorded as a `spawn` marker.
+    pub fn this_binary(config_dir: &Path) -> Self {
+        let program = std::env::current_exe().unwrap_or_default();
+        Self { program, log: crate::tracker::schedule::log_path(config_dir) }
     }
 
     fn open_log(&self) -> Result<std::fs::File, String> {
