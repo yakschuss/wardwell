@@ -268,21 +268,11 @@ pub fn add_denies(root: &mut Value, tools: &[&str]) -> Result<Vec<String>, Strin
     Ok(missing)
 }
 
-/// Remove exactly these entries from `permissions.deny`. A deny list, then a
-/// permissions object, left empty by the removal goes too.
+/// Remove exactly these entries from `permissions.deny`. An empty list or
+/// object is left for the installer, which knows whether Wardwell created it.
 pub fn remove_denies(root: &mut Value, tools: &[String]) {
-    let Some(permissions) = root.get_mut("permissions").and_then(Value::as_object_mut) else { return };
-    let Some(deny) = permissions.get_mut("deny").and_then(Value::as_array_mut) else { return };
-    let before = deny.len();
+    let Some(deny) = root.get_mut("permissions").and_then(|p| p.get_mut("deny")).and_then(Value::as_array_mut) else { return };
     deny.retain(|entry| !entry.as_str().is_some_and(|e| tools.iter().any(|t| t == e)));
-    if before > 0 && deny.is_empty() {
-        permissions.remove("deny");
-        if permissions.is_empty()
-            && let Some(object) = root.as_object_mut()
-        {
-            object.remove("permissions");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -378,10 +368,6 @@ mod tests {
         assert!(add_denies(&mut root, &["mcp__linear__delete_comment"]).unwrap().is_empty());
         remove_denies(&mut root, &added);
         assert_eq!(root["permissions"]["deny"], json!(["Bash(rm:*)", "mcp__linear__save_project"]));
-        let mut fresh = json!({});
-        let added = add_denies(&mut fresh, &["a"]).unwrap();
-        remove_denies(&mut fresh, &added);
-        assert_eq!(fresh, json!({}));
     }
 
     #[test]

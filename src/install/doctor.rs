@@ -778,6 +778,16 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_row_checks_the_matcher_as_well_as_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/w/wardwell gate linear"}]}]}}"#);
+        let (rows, ok) = policy_rows(&policy_config(home, true), home, Path::new("/w/wardwell"), false);
+        assert!(!ok);
+        assert!(rows[1].contains("\u{2717} not installed"), "{}", rows[1]);
+    }
+
+    #[test]
     fn policy_rows_say_off_without_gate_true_and_skip_the_pull_without_bindings() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();

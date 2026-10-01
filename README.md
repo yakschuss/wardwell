@@ -57,8 +57,8 @@ Installed is not active. Claude Code reads hooks and permissions when a
 session starts. Sessions already running do not change. Start a new session,
 then run `wardwell doctor`.
 
-`setup` also reconciles Wardwell's MCP entries in Claude Code, Claude Desktop,
-and Codex. It preserves unrelated MCP servers and leaves hosted access
+`setup` also reconciles Wardwell's connection entries in Claude Code, Claude
+Desktop, and Codex. It preserves unrelated connections and leaves hosted access
 disconnected until you approve OAuth.
 
 To remove Wardwell's wiring:
@@ -277,12 +277,16 @@ records the deny entries it adds in `~/.wardwell/install-manifest.json`:
 ```json
 {
   "version": 1,
-  "claude_permissions_deny": ["mcp__linear__delete_comment"]
+  "claude_permissions_deny": ["mcp__linear__delete_comment"],
+  "created_keys": ["hooks"]
 }
 ```
 
-An entry you already had is never recorded. Uninstall, or setup with the
-policy off, removes only the recorded entries. Hooks are not recorded; they
+An entry you already had is never recorded, and no entry is listed twice.
+Uninstall, or setup with the policy off, removes only the recorded entries.
+The record also lists the settings keys Wardwell created, `hooks`,
+`permissions` and `permissions.deny`, as `created_keys`. Uninstall removes
+such a key only when it is listed there and is empty, so a key you had stays. Hooks are not recorded; they
 are matched by binary name and arguments. The file lives under
 `WARDWELL_CONFIG_DIR` when that is set.
 
@@ -345,7 +349,7 @@ Interactive setup that walks you through:
 
 1. Detecting or choosing your vault path (auto-detects Obsidian vaults)
 2. Previewing all mutations before making them
-3. Injecting the MCP server config into Claude Code and Claude Desktop
+3. Adding Wardwell's connection to Claude Code and Claude Desktop
 4. Installing the hooks, with the same preview, backups and exact matching as `setup`
 5. Injecting wardwell markers into CLAUDE.md
 6. Building the search index
@@ -384,7 +388,7 @@ Checks that everything is wired correctly:
 - Vault directory exists with indexed files
 - Domains detected
 - Index built
-- Local context and hosted-app MCP entries configured in Claude Code and Codex
+- Local context and hosted-app connection entries configured in Claude Code and Codex
 - Local context configured in Claude Desktop; hosted access remains an account connector
 - SessionStart hook registered
 - Gate ruleset: its name and version, `linear-updates v1`

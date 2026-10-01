@@ -94,7 +94,7 @@ If vault is empty:
 ### Step 7 — Verify
 
 - Confirm config written
-- Confirm MCP entries injected
+- Confirm connection entries added
 - Confirm CLAUDE.md pointers placed
 - Confirm hook installed
 - Print: "Done. Restart Claude Desktop and/or start a new Claude Code session."
@@ -108,7 +108,8 @@ Sets up or repairs this computer. Never reads or changes the vault.
 - Preflight: every client file, `~/.claude/settings.json`, `config.yml` and the install record are read and checked before any write. A malformed or conflicting file stops the run. Nothing is written.
 - Each file is checked again just before it is written. A file changed since the preview stops the run.
 - Backs up each changed file beside it, mode 0600. Writes through a temp file and a rename.
-- Ownership is exact. A hook handler is Wardwell's only when its program's file name is `wardwell` or `wardwell-<version>` and its arguments are exactly Wardwell's. A substring never matches.
+- Ownership is exact. A hook handler is Wardwell's only when its program's file name is `wardwell` or `wardwell-<digits>.<digits>...`, its arguments are exactly Wardwell's, and its group has Wardwell's matcher. A group with another matcher is the user's and is never moved or edited. A substring never matches.
+- Rewrites keep what the user wrote: key order, number text, and the file's permission mode.
 
 ### Tier one: memory, always planned
 
@@ -149,7 +150,7 @@ Planned only when a tracker binding has `provider: linear` and `gate: true`. Eac
 `~/.wardwell/install-manifest.json` (under `WARDWELL_CONFIG_DIR` when set) lists the deny entries Wardwell added. An entry the user already had is not recorded. Uninstall removes only recorded entries.
 
 ```json
-{"version": 1, "claude_permissions_deny": ["mcp__linear__delete_comment"]}
+{"version": 1, "claude_permissions_deny": ["mcp__linear__delete_comment"], "created_keys": ["hooks"]}
 ```
 
 ### Tracker pull

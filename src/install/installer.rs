@@ -123,7 +123,8 @@ fn restore_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
 enum Pull {
     Keep,
     Manual,
-    Install { home: PathBuf, config_dir: PathBuf, binary: PathBuf, interval: u32 },
+    /// `backup`: the plist on disk was edited by hand; save it before replacing it.
+    Install { home: PathBuf, config_dir: PathBuf, binary: PathBuf, interval: u32, backup: bool },
     Remove { home: PathBuf },
 }
 
@@ -284,10 +285,13 @@ pub fn plan(inputs: &Inputs) -> Result<Plan, String> {
         let mut draft = Draft::read(settings_path(inputs.home), false)?;
         let quoted = shell_quote(inputs.binary)?;
         let mut record = recorded.as_ref().map(|(_, m)| m.claude_permissions_deny.clone()).unwrap_or_default();
+        let mut created = recorded.as_ref().map(|(_, m)| m.created_keys.clone()).unwrap_or_default();
         memory_steps(&mut draft, &mut lines, &quoted)?;
         policy_steps(&mut draft, &mut lines, &quoted, policy, &mut record)?;
+        prune_created(&mut draft.value, &mut created);
+        note_created(&draft.original, &draft.value, &mut created);
         changes.extend(draft.into_change()?);
-        let next = Manifest { claude_permissions_deny: record, ..Manifest::default() };
+        let next = Manifest { claude_permissions_deny: record, created_keys: created, ..Manifest::default() };
         changes.extend(manifest_change(inputs.config_dir, recorded, &next, &mut lines)?);
     }
     let pull = pull_step(inputs, &mut lines);
@@ -347,13 +351,54 @@ fn policy_steps(draft: &mut Draft, lines: &mut Vec<Line>, quoted: &str, policy: 
     Ok(())
 }
 
+/// Settings keys whose creation the install record notes, innermost first.
+const CREATED_KEYS: [&str; 3] = ["permissions.deny", "permissions", "hooks"];
+
+fn key_at<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    match key.split_once('.') {
+        Some((outer, inner)) => value.get(outer)?.get(inner),
+        None => value.get(key),
+    }
+}
+
+/// Note the keys this run created; forget the ones that are gone.
+fn note_created(original: &Value, value: &Value, created: &mut Vec<String>) {
+    for key in CREATED_KEYS {
+        let listed = created.iter().any(|k| k == key);
+        match (key_at(original, key).is_some(), key_at(value, key).is_some()) {
+            (false, true) if !listed => created.push(key.to_string()),
+            (_, false) => created.retain(|k| k != key),
+            _ => {}
+        }
+    }
+}
+
+/// Remove each key Wardwell created that is now empty, and forget it.
+fn prune_created(value: &mut Value, created: &mut Vec<String>) {
+    for key in CREATED_KEYS {
+        let empty = key_at(value, key).is_some_and(|v| v.as_object().is_some_and(|o| o.is_empty()) || v.as_array().is_some_and(|a| a.is_empty()));
+        if !empty || !created.iter().any(|k| k == key) {
+            continue;
+        }
+        let parent = match key.split_once('.') {
+            Some((outer, _)) => value.get_mut(outer),
+            None => Some(&mut *value),
+        };
+        if let Some(object) = parent.and_then(Value::as_object_mut) {
+            object.remove(key.rsplit('.').next().unwrap_or(key));
+        }
+        created.retain(|k| k != key);
+    }
+}
+
 fn manifest_change(config_dir: &Path, recorded: Option<(Vec<u8>, Manifest)>, next: &Manifest, lines: &mut Vec<Line>) -> Result<Option<Change>, String> {
     let path = manifest::path(config_dir);
-    let label = "Install record (deny entries Wardwell added)".to_string();
+    let label = "Install record (entries and keys Wardwell added)".to_string();
+    let next = &manifest::normalized(next);
     let (action, before) = match recorded {
         Some((_, old)) if old == *next => (Action::Unchanged, None),
         Some((bytes, _)) => (Action::UpdateBackup, Some(bytes)),
-        None if next.claude_permissions_deny.is_empty() => return Ok(None),
+        None if *next == Manifest::default() => return Ok(None),
         None => (Action::Create, None),
     };
     lines.push(Line { action, label, path: Some(path.clone()) });
@@ -362,6 +407,17 @@ fn manifest_change(config_dir: &Path, recorded: Option<(Vec<u8>, Manifest)>, nex
     }
     let mode = mode_of(&path);
     Ok(Some(Change { path, before, after: manifest::encode(next)?, mode }))
+}
+
+/// True when `current` is exactly what Wardwell writes for its own program
+/// and interval, so replacing it loses nothing the user wrote.
+fn is_generated(current: &str, inputs: &Inputs) -> bool {
+    let program = schedule::scheduled_program(inputs.home);
+    let interval = schedule::schedule_status(inputs.home);
+    match (program, interval) {
+        (Some(program), Some(interval)) => current == schedule::launch_agent_plist(&program, interval, &schedule::log_path(inputs.config_dir)),
+        _ => false,
+    }
 }
 
 fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
@@ -385,7 +441,8 @@ fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
     let expected = schedule::launch_agent_plist(&binary, interval, &schedule::log_path(inputs.config_dir));
     let action = match std::fs::read_to_string(&path) {
         Ok(current) if current == expected => Action::Unchanged,
-        Ok(_) => Action::Update,
+        Ok(current) if is_generated(&current, inputs) => Action::Update,
+        Ok(_) => Action::UpdateBackup,
         Err(_) => Action::Create,
     };
     lines.push(Line { action, label: format!("Tracker pull service, every {interval}s"), path: Some(path) });
@@ -396,6 +453,7 @@ fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
             config_dir: inputs.config_dir.to_path_buf(),
             binary: inputs.binary.to_path_buf(),
             interval,
+            backup: action == Action::UpdateBackup,
         },
     }
 }
@@ -465,6 +523,8 @@ fn settings_removal(mut draft: Draft, config_dir: &Path, lines: &mut Vec<Line>, 
             client_hooks::remove_denies(v, &denies);
             Ok(())
         })?;
+        let mut created = recorded.as_ref().map(|(_, m)| m.created_keys.clone()).unwrap_or_default();
+        prune_created(&mut draft.value, &mut created);
     }
     changes.extend(draft.into_change()?);
     if let Some(recorded) = recorded {
@@ -544,7 +604,19 @@ fn apply_with(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Resul
         }
     }
     let pull = match &plan.pull {
-        Pull::Install { home, config_dir, binary, interval } => {
+        Pull::Install { home, config_dir, binary, interval, backup } => {
+            let saved = match backup {
+                true => read_optional(&schedule::plist_path(home))
+                    .and_then(|bytes| bytes.map(|bytes| backup_file(&schedule::plist_path(home), &bytes)).transpose()),
+                false => Ok(None),
+            };
+            match saved {
+                Ok(Some(saved)) => {
+                    lines.push(format!("    backup: {}", saved.display()));
+                }
+                Ok(None) => {}
+                Err(error) => return Err(stop(&lines, format!("Tracker pull service: {error}; the plist was not replaced."))),
+            }
             uid().and_then(|uid| schedule::schedule(home, config_dir, *interval, runner, binary, uid)).map(Some)
         }
         Pull::Remove { home } => uid().and_then(|uid| schedule::unschedule(home, runner, uid)).map(Some),
@@ -688,7 +760,7 @@ mod tests {
         assert_eq!(client_hooks::commands(&s, &SESSION_START), vec![format!("'{BIN}' inject \"$(pwd)\"")]);
         assert_eq!(client_hooks::commands(&s, &STOP), vec![format!("'{BIN}' resolve")]);
         assert!(s.get("permissions").is_none());
-        assert!(!manifest::path(&h.cfg).exists());
+        assert_eq!(manifest::read(&h.cfg).unwrap().unwrap().1.created_keys, vec!["hooks"]);
         let second = plan_for(&h, &BTreeMap::new(), false);
         assert!(second.is_noop(), "{}", rendered(&second));
         assert!(second.lines.iter().all(|l| matches!(l.action, Action::Unchanged | Action::Off)));
@@ -1069,6 +1141,54 @@ mod tests {
         for (relative, text) in others {
             assert_eq!(fs::read_to_string(h.home.join(relative)).unwrap(), text, "{relative}");
         }
+    }
+
+    #[test]
+    fn uninstall_removes_an_empty_hooks_object_only_when_setup_created_it() {
+        let h = home();
+        put_settings(&h, json!({"model": "keep"}));
+        run(&h, &binding("linear", true));
+        apply(&uninstall_plan(&h.home, &h.cfg), &Fake::new(&[]), &|| Ok(501)).unwrap();
+        assert_eq!(settings(&h), json!({"model": "keep"}));
+        let h = home();
+        put_settings(&h, json!({"model": "keep", "hooks": {}, "permissions": {"deny": []}}));
+        run(&h, &binding("linear", true));
+        apply(&uninstall_plan(&h.home, &h.cfg), &Fake::new(&[]), &|| Ok(501)).unwrap();
+        assert_eq!(settings(&h), json!({"model": "keep", "hooks": {}, "permissions": {"deny": []}}));
+    }
+
+    #[test]
+    fn the_record_never_lists_an_entry_twice() {
+        let h = home();
+        put_settings(&h, json!({"permissions": {"deny": ["mcp__linear__delete_comment"]}}));
+        fs::write(manifest::path(&h.cfg), r#"{"version": 1, "claude_permissions_deny": ["mcp__linear__delete_comment", "mcp__linear__delete_comment"]}"#).unwrap();
+        run(&h, &binding("linear", true));
+        let record = manifest::read(&h.cfg).unwrap().unwrap().1;
+        let mut unique = record.claude_permissions_deny.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), record.claude_permissions_deny.len(), "{record:?}");
+        assert_eq!(record.claude_permissions_deny.len(), 7);
+    }
+
+    #[test]
+    fn a_hand_edited_plist_is_backed_up_before_it_is_replaced() {
+        let h = home();
+        let plist = schedule::plist_path(&h.home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let generated_elsewhere = schedule::launch_agent_plist(Path::new("/old/wardwell"), 3600, &schedule::log_path(&h.cfg));
+        fs::write(&plist, &generated_elsewhere).unwrap();
+        assert_eq!(action_of(&plan_for(&h, &binding("linear", false), true), "Tracker pull service"), Action::Update);
+        let edited = generated_elsewhere.replace("<key>RunAtLoad</key>", "<key>Nice</key><integer>5</integer><key>RunAtLoad</key>");
+        fs::write(&plist, &edited).unwrap();
+        let plan = plan_for(&h, &binding("linear", false), true);
+        assert_eq!(action_of(&plan, "Tracker pull service"), Action::UpdateBackup);
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let lines = apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
+        let backup = lines.iter().find_map(|l| l.trim().strip_prefix("backup: ")).unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), edited);
     }
 
     #[test]
