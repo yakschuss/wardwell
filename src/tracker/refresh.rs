@@ -88,6 +88,7 @@ mod tests {
             credential: "c".into(),
             readonly: true,
             gate: false,
+            repository: None,
         }
     }
 

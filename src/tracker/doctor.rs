@@ -38,9 +38,10 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, n
     }
     let mut lines = Vec::new();
     let mut healthy = true;
-    for (key, binding) in &config.trackers {
+    for binding in &config.trackers {
+        let key = binding.key();
         let mut checks = check_binding(config_dir, binding, probe);
-        checks.push(("kanban prefix".to_string(), prefix_outcome(binding, native.get(key))));
+        checks.push(("kanban prefix".to_string(), prefix_outcome(binding, native.get(&key))));
         healthy &= checks.iter().all(|(_, outcome)| matches!(outcome, Outcome::Ok));
         lines.extend(checks.into_iter().map(|(name, outcome)| format!("{key}: {name} {}", outcome.describe())));
     }
@@ -68,11 +69,8 @@ pub fn native_prefixes(config: &WardwellConfig, kanban_db: &Path) -> BTreeMap<St
         return BTreeMap::new();
     };
     config
-        .trackers
-        .iter()
-        .filter_map(|(key, b)| {
-            crate::kanban::store::native_prefix_in(&conn, &b.project, &config.kanban_prefixes).map(|prefix| (key.clone(), prefix))
-        })
+        .issue_bindings()
+        .filter_map(|b| crate::kanban::store::native_prefix_in(&conn, &b.project, &config.kanban_prefixes).map(|prefix| (b.key(), prefix)))
         .collect()
 }
 
@@ -248,7 +246,7 @@ mod tests {
     #[test]
     fn an_unknown_provider_is_a_provider_failure_not_a_credential_one() {
         let (dir, mut config) = setup(true);
-        config.trackers.get_mut("work/claims").unwrap().provider = "jira".into();
+        config.trackers[0].provider = "jira".into();
         let (lines, healthy) = run(&config, dir.path(), &connect_transport);
         assert_eq!(
             lines,
@@ -260,13 +258,13 @@ mod tests {
     #[test]
     fn offline_checks_read_the_credential_and_provider_without_a_probe() {
         let (dir, config) = setup(true);
-        let binding = &config.trackers["work/claims"];
+        let binding = &config.trackers[0];
         assert_eq!(check_offline(dir.path(), binding), Ok(()));
         let mut unknown = binding.clone();
         unknown.provider = "jira".into();
         assert_eq!(check_offline(dir.path(), &unknown), Err((FailureCode::UnsupportedProvider, None)));
         let (empty, config) = setup(false);
-        let (code, detail) = check_offline(empty.path(), &config.trackers["work/claims"]).unwrap_err();
+        let (code, detail) = check_offline(empty.path(), &config.trackers[0]).unwrap_err();
         assert_eq!(code, FailureCode::Credential);
         assert!(detail.unwrap().contains("not configured"));
     }

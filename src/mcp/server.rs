@@ -3666,8 +3666,7 @@ impl WardwellServer {
 
     fn named_bindings(&self, p: &KanbanParams) -> Vec<&crate::config::loader::TrackerBinding> {
         self.config
-            .trackers
-            .values()
+            .issue_bindings()
             .filter(|b| p.project.as_deref().is_none_or(|name| b.project == name))
             .filter(|b| p.domain.as_deref().is_none_or(|domain| b.domain == domain))
             .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
@@ -3789,8 +3788,7 @@ impl WardwellServer {
             .filter(|key| self.lookup_item_domain(kanban, key).is_none())
             .find_map(|key| {
                 self.config
-                    .trackers
-                    .values()
+                    .issue_bindings()
                     .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
                     .filter(|b| self.prefix_collision(b).is_none())
                     .find_map(|b| self.mirror_view(b)?.get(key).map(|issue| crate::tracker::mirrored_key_refusal(&issue.key, b)))

@@ -23,6 +23,7 @@ pub(super) fn binding(readonly: bool) -> TrackerBinding {
         credential: "corr-linear".into(),
         readonly,
         gate: false,
+        repository: None,
     }
 }
 
@@ -38,8 +39,7 @@ pub(super) fn fixture(events: &[Event], readonly: bool) -> Fixture {
         .unwrap();
     write_mirror(&vault, events);
     let index = Arc::new(crate::index::store::IndexStore::open(&dir.path().join("index.db")).unwrap());
-    let mut trackers = std::collections::BTreeMap::new();
-    trackers.insert("work/claims".to_string(), binding(readonly));
+    let trackers = vec![binding(readonly)];
     let config = crate::config::loader::WardwellConfig {
         vault_path: vault,
         registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
@@ -433,7 +433,7 @@ fn domain_picks_between_two_projects_of_the_same_name() {
     crate::tracker::log::append_new(&personal, &[snapshot("COR-50", "Personal only", "Todo", StateCategory::Unstarted, now), pulled(now - chrono::TimeDelta::hours(1))], &mut summary).unwrap();
     let mut other = binding(true);
     other.domain = "personal".into();
-    Arc::get_mut(&mut f.server.config).unwrap().trackers.insert("personal/claims".into(), other);
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.push(other);
 
     let work_only = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-50", "project": "claims", "domain": "work"}));
     assert_eq!(work_only["refresh_reason"], "still_missing", "{work_only}");
@@ -450,8 +450,7 @@ fn domain_picks_between_two_projects_of_the_same_name() {
 #[test]
 fn two_servers_on_one_vault_share_the_cooldown_through_the_log() {
     let (first, calls) = refresh_fixture(vec![], None);
-    let mut trackers = std::collections::BTreeMap::new();
-    trackers.insert("work/claims".to_string(), binding(true));
+    let trackers = vec![binding(true)];
     let config = crate::config::loader::WardwellConfig {
         vault_path: first.server.vault_root.clone(),
         registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
@@ -666,7 +665,7 @@ fn a_mirror_only_project_keeps_its_mirror_when_the_team_key_is_the_prefix_it_wou
     let mut intake = binding(true);
     intake.project = "intake".into();
     intake.team = derived.clone();
-    Arc::get_mut(&mut f.server.config).unwrap().trackers.insert("work/intake".to_string(), intake);
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.push(intake);
     std::fs::create_dir_all(f.server.vault_root.join("work/intake")).unwrap();
     let path = crate::tracker::log::path_for(&f.server.vault_root, "work", "intake");
     let mut summary = crate::tracker::log::read(&path).unwrap();
@@ -684,7 +683,7 @@ fn a_mirror_only_project_keeps_its_mirror_when_the_team_key_is_the_prefix_it_wou
 fn a_team_key_equal_to_the_derived_native_prefix_leaves_the_mirror_out_with_a_note() {
     let now = chrono::Utc::now();
     let mut f = fixture(&[], false);
-    Arc::get_mut(&mut f.server.config).unwrap().trackers.get_mut("work/claims").unwrap().team = "CL".into();
+    Arc::get_mut(&mut f.server.config).unwrap().trackers[0].team = "CL".into();
     write_mirror(&f.server.vault_root, &[snapshot("CL-5", "Mirrored five", "In Progress", StateCategory::Started, now), pulled(now)]);
     let sentence = "Tracker team key CL of work/claims equals the native kanban prefix CL of project claims. Set a different native prefix for claims in kanban.prefixes.";
     for args in [

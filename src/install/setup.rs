@@ -2,7 +2,6 @@ use crate::config::loader::{self, TrackerBinding};
 use crate::install::detect;
 use crate::install::installer;
 use crate::tracker::schedule::{SystemRunner, current_uid};
-use std::collections::BTreeMap;
 use crate::install::mcp_config::{self, ChangeStatus, McpConfigPaths, ReconcileResult};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -122,10 +121,10 @@ pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 /// The tracker bindings in config.yml. No config means none; a config that
 /// does not parse stops setup before anything changes.
-pub(crate) fn tracker_bindings(config_dir: &Path) -> Result<BTreeMap<String, TrackerBinding>, String> {
+pub(crate) fn tracker_bindings(config_dir: &Path) -> Result<Vec<TrackerBinding>, String> {
     let path = config_dir.join("config.yml");
     if !path.exists() {
-        return Ok(BTreeMap::new());
+        return Ok(Vec::new());
     }
     loader::load(Some(&path))
         .map(|config| config.trackers)

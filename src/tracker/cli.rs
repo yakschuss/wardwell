@@ -99,14 +99,14 @@ pub fn doctor(config: &WardwellConfig, config_dir: &Path, probe: &crate::tracker
     }
 }
 
-fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(&'a String, &'a TrackerBinding)>, String> {
-    match only {
-        None => Ok(config.trackers.iter().collect()),
-        Some(key) => config
-            .trackers
-            .get_key_value(key)
-            .map(|pair| vec![pair])
-            .ok_or_else(|| format!("no tracker is bound to '{key}' in config.yml")),
+/// Each selected binding with its `<domain>/<project>` key: every binding,
+/// or every binding of the project `only`.
+fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(String, &'a TrackerBinding)>, String> {
+    let chosen: Vec<(String, &TrackerBinding)> =
+        config.trackers.iter().map(|b| (b.key(), b)).filter(|(key, _)| only.is_none_or(|only| key == only)).collect();
+    match (only, chosen.is_empty()) {
+        (Some(key), true) => Err(format!("no tracker is bound to '{key}' in config.yml")),
+        _ => Ok(chosen),
     }
 }
 
@@ -120,7 +120,7 @@ pub fn status(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, sc
         false => config
             .trackers
             .iter()
-            .map(|(key, binding)| status_line(&config.vault_path, config_dir, key, binding, now))
+            .map(|binding| status_line(&config.vault_path, config_dir, &binding.key(), binding, now))
             .collect(),
     };
     lines.push(schedule_line(scheduled));
@@ -431,7 +431,7 @@ mod tests {
         assert!(!lines.iter().any(|l| l.contains("no errors")), "{lines:?}");
 
         connect(dir.path(), "corr-linear", "t").unwrap();
-        config.trackers.get_mut("work/ops").unwrap().provider = "jira".into();
+        config.trackers.iter_mut().find(|b| b.project == "ops").unwrap().provider = "jira".into();
         let lines = status(&config, dir.path(), now(), None);
         assert!(lines[0].ends_with("never pulled, no errors"), "{lines:?}");
         assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider)"), "{lines:?}");

@@ -320,9 +320,10 @@ fn tracker_rows_with(
     let rows = config
         .trackers
         .iter()
-        .map(|(key, binding)| {
+        .map(|binding| {
+            let key = binding.key();
             let label = format!("Tracker {key}");
-            let collision = crate::tracker::doctor::prefix_failure(binding, native.get(key))
+            let collision = crate::tracker::doctor::prefix_failure(binding, native.get(&key))
                 .map(|sentence| (crate::tracker::events::FailureCode::PrefixCollision, Some(sentence)));
             match crate::tracker::doctor::check_offline(config_dir, binding).and(collision.map_or(Ok(()), Err)) {
                 Ok(()) => format!("  {label:<38} \u{2713} credential ok; {LIVE}"),
@@ -603,7 +604,7 @@ mod tests {
         );
         std::fs::write(dir.join("config.yml"), yaml).unwrap();
         let mut config = loader::load(Some(&dir.join("config.yml"))).unwrap();
-        config.trackers.get_mut("work/claims").unwrap().provider = provider.into();
+        config.trackers[0].provider = provider.into();
         config
     }
 
@@ -748,7 +749,7 @@ mod tests {
 
     fn policy_config(dir: &Path, gate: bool) -> crate::config::loader::WardwellConfig {
         let mut config = tracker_config(dir, "linear");
-        config.trackers.get_mut("work/claims").unwrap().gate = gate;
+        config.trackers[0].gate = gate;
         config
     }
 

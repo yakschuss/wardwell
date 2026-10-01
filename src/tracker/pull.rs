@@ -481,6 +481,7 @@ mod tests {
             credential: "corr-linear".into(),
             readonly: true,
             gate: false,
+            repository: None,
         }
     }
 
