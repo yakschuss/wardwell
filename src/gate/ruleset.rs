@@ -37,8 +37,6 @@ pub struct Ruleset {
     pub banned_words: &'static [&'static str],
     /// The tracker key prefix, e.g. `COR` for `COR-12`.
     pub key_prefix: &'static str,
-    /// Issue fields a session must never set.
-    pub locked_fields: &'static [&'static str],
     /// The only `state` values a session may set, and only on create.
     pub create_states: &'static [&'static str],
     /// The only `state` values a session may set on an existing issue (the owner's rule of 2026-10-01).
@@ -81,7 +79,6 @@ pub const LINEAR_UPDATES: Ruleset = Ruleset {
     ],
     banned_words: &["PR", "merge", "deploy", "migration", "webhook", "adapter"],
     key_prefix: "COR",
-    locked_fields: &["state", "priority"],
     create_states: &["Triage"],
     update_states: &["Done"],
     denied_tools: &[
