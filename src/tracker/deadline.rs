@@ -23,13 +23,14 @@ pub const PULL_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// of the built binary can see the watchdog fire.
 pub const DEADLINE_VARIABLE: &str = "WARDWELL_PULL_DEADLINE_SECONDS";
 
-/// `PULL_DEADLINE`, or the whole seconds in `DEADLINE_VARIABLE` when set and above zero.
+/// `PULL_DEADLINE`, or the whole seconds in `DEADLINE_VARIABLE` when they
+/// are 1 through 3600. Any other value uses the default.
 pub fn pull_deadline() -> Duration {
     deadline_from(std::env::var(DEADLINE_VARIABLE).ok().as_deref())
 }
 
 fn deadline_from(value: Option<&str>) -> Duration {
-    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| *s > 0).map_or(PULL_DEADLINE, Duration::from_secs)
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| (1..=3600).contains(s)).map_or(PULL_DEADLINE, Duration::from_secs)
 }
 
 /// A deadline in words: `15 minutes`, `2 seconds`, `1 second`.
@@ -204,6 +205,11 @@ mod tests {
         assert_eq!(deadline_from(Some("2")), Duration::from_secs(2));
         assert_eq!(deadline_from(Some("0")), PULL_DEADLINE);
         assert_eq!(deadline_from(Some("soon")), PULL_DEADLINE);
+        assert_eq!(deadline_from(Some("1")), Duration::from_secs(1));
+        assert_eq!(deadline_from(Some("3600")), Duration::from_secs(3600));
+        assert_eq!(deadline_from(Some("3601")), PULL_DEADLINE);
+        assert_eq!(deadline_from(Some("18446744073709551615")), PULL_DEADLINE);
+        assert_eq!(deadline_from(Some("-5")), PULL_DEADLINE);
         assert_eq!(describe(PULL_DEADLINE), "15 minutes");
         assert_eq!(describe(Duration::from_secs(2)), "2 seconds");
     }
