@@ -160,6 +160,27 @@ pub async fn every(period: std::time::Duration, mut task: impl FnMut()) {
     }
 }
 
+/// Every `period`, the first time one `period` after the call, run `round`
+/// with `config_dir` on a blocking thread. A round that fails or panics is
+/// logged by the round or lost with its thread; it never stops the timer.
+pub async fn serve_refresh(period: std::time::Duration, config_dir: PathBuf, round: fn(&Path)) {
+    every(period, move || {
+        let dir = config_dir.clone();
+        tokio::task::spawn_blocking(move || round(&dir));
+    })
+    .await;
+}
+
+/// One server refresh round at `now`: the config read fresh through
+/// `load`, then the refresh trigger with the real spawner for every bound
+/// project. Returns the lines to log; a config that does not read is one.
+pub fn serve_round(config_dir: &Path, load: impl FnOnce() -> Result<WardwellConfig, String>, now: DateTime<Utc>) -> Vec<String> {
+    match load() {
+        Ok(config) => refresh_bound(&config, &|domain, project| refresh_detached(&config, config_dir, domain, project, now)),
+        Err(error) => vec![format!("tracker refresh skipped; config could not be read ({error})")],
+    }
+}
+
 /// The time since `at`, or None when `at` is in the future: a future stamp
 /// counts as old.
 fn age(at: DateTime<Utc>, now: DateTime<Utc>) -> Option<TimeDelta> {
@@ -578,6 +599,33 @@ mod tests {
             let _ = tokio::time::timeout(std::time::Duration::from_millis(150), timer).await;
         });
         assert!((2..=4).contains(&count.get()), "{}", count.get());
+    }
+
+    static ROUNDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_round(dir: &Path) {
+        assert!(dir.ends_with("cfg"));
+        ROUNDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_serve_timer_runs_rounds_on_its_injected_interval_after_one_interval() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_time().build().unwrap();
+        runtime.block_on(async {
+            let timer = tokio::spawn(serve_refresh(std::time::Duration::from_millis(100), PathBuf::from("/nowhere/cfg"), count_round));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(ROUNDS.load(std::sync::atomic::Ordering::SeqCst), 0, "nothing at start");
+            tokio::time::sleep(std::time::Duration::from_millis(330)).await;
+            timer.abort();
+        });
+        let rounds = ROUNDS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((2..=4).contains(&rounds), "{rounds}");
+    }
+
+    #[test]
+    fn a_serve_round_logs_a_config_that_does_not_read_and_does_not_fail() {
+        let lines = serve_round(Path::new("/nowhere"), || Err("bad yaml".to_string()), now());
+        assert_eq!(lines, vec!["tracker refresh skipped; config could not be read (bad yaml)"]);
     }
 
     #[test]

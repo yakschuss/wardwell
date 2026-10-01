@@ -40,8 +40,9 @@ fn session_start_starts_a_detached_pull_of_a_stale_mirror_and_returns_at_once() 
     for dir in [&home, &cfg, &stub, &code, &project] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    // Every `gh pr list` read answers with no merged pull requests.
-    script(&stub.join("gh"), "#!/bin/sh\necho '[]'\n");
+    // Every `gh pr list` read answers with no merged pull requests, after a
+    // second, so the detached pull can be seen while it runs.
+    script(&stub.join("gh"), "#!/bin/sh\n/bin/sleep 1\necho '[]'\n");
     std::fs::write(cfg.join("config.yml"), format!(
         "vault_path: {}\nsession_sources: []\nprojects:\n  work/claims:\n    paths:\n      - {}\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
         root.join("vault").display(),
@@ -73,6 +74,19 @@ fn session_start_starts_a_detached_pull_of_a_stale_mirror_and_returns_at_once() 
     assert!(out.status.success(), "{text}");
     assert!(took < Duration::from_secs(3), "session start took {took:?}: {text}");
     assert_eq!(text.matches("Refresh started in the background.").count(), 1, "{text}");
+
+    // While it runs, the detached pull leads its own session and process
+    // group, and its parent is gone: launchd or init adopted it.
+    let running_pid = loop {
+        if let Some(pid) = rows(&log).iter().find(|(kind, _)| kind == "pull_started").and_then(|(_, pid)| *pid) {
+            break pid;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "no pull_started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let ps = Command::new("/bin/ps").args(["-o", "ppid=,pgid=", "-p", &running_pid.to_string()]).output().unwrap();
+    let fields: Vec<u64> = String::from_utf8_lossy(&ps.stdout).split_whitespace().map(|f| f.parse().unwrap()).collect();
+    assert_eq!(fields, vec![1, running_pid], "parent 1 and its own group: {}", String::from_utf8_lossy(&ps.stdout));
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let finished = loop {
@@ -113,7 +127,7 @@ fn twenty_session_starts_in_one_second_start_one_pull_and_one_provider_read() {
         std::fs::create_dir_all(dir).unwrap();
     }
     let reads = root.join("gh-reads");
-    script(&stub.join("gh"), &format!("#!/bin/sh\necho read >> '{}'\nsleep 0.3\necho '[]'\n", reads.display()));
+    script(&stub.join("gh"), &format!("#!/bin/sh\necho read >> '{}'\n/bin/sleep 0.3\necho '[]'\n", reads.display()));
     std::fs::write(cfg.join("config.yml"), format!(
         "vault_path: {}\nsession_sources: []\nprojects:\n  work/claims:\n    paths:\n      - {}\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
         root.join("vault").display(),
@@ -156,4 +170,40 @@ fn twenty_session_starts_in_one_second_start_one_pull_and_one_provider_read() {
     assert_eq!(kinds.iter().filter(|k| *k == "pull_started").count(), 1, "{kinds:?}");
     assert_eq!(std::fs::read_to_string(&reads).unwrap().lines().count(), 1, "one provider read");
     assert!(!cfg.join("refresh/work__claims.claim").exists(), "the pull released its claim");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pull_past_its_deadline_is_stopped_and_records_the_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (home, cfg, stub, project) = (root.join("home"), root.join("cfg"), root.join("stub"), root.join("vault/work/claims"));
+    for dir in [&home, &cfg, &stub, &project] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    script(&stub.join("gh"), "#!/bin/sh\n/bin/sleep 20\necho '[]'\n");
+    std::fs::write(cfg.join("config.yml"), format!(
+        "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
+        root.join("vault").display()
+    )).unwrap();
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_wardwell"))
+        .args(["tracker", "pull", "--project", "work/claims"])
+        .env_clear()
+        .env("HOME", &home)
+        .env("WARDWELL_CONFIG_DIR", &cfg)
+        .env("PATH", &stub)
+        .env("WARDWELL_GH_CANDIDATES", "")
+        .env("WARDWELL_PULL_DEADLINE_SECONDS", "2")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "{text}");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(text.contains("tracker pull stopped after 2 seconds; recorded timeout for work/claims github"), "{text}");
+    let state = std::fs::read_to_string(cfg.join("refresh/work__claims.json")).unwrap();
+    assert!(state.contains("\"code\":\"timeout\""), "{state}");
+    let kinds: Vec<String> = rows(&project.join("tracker.jsonl")).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(kinds, vec!["pull_started", "pull_failed"], "the timeout marker follows the start");
+    assert!(std::fs::read_to_string(project.join("tracker.jsonl")).unwrap().contains("\"code\":\"timeout\""));
 }

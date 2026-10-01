@@ -19,6 +19,27 @@ use std::time::Duration;
 /// a pull that is stuck.
 pub const PULL_DEADLINE: Duration = Duration::from_secs(15 * 60);
 
+/// Names a deadline in seconds that replaces `PULL_DEADLINE`, so a test
+/// of the built binary can see the watchdog fire.
+pub const DEADLINE_VARIABLE: &str = "WARDWELL_PULL_DEADLINE_SECONDS";
+
+/// `PULL_DEADLINE`, or the whole seconds in `DEADLINE_VARIABLE` when set and above zero.
+pub fn pull_deadline() -> Duration {
+    deadline_from(std::env::var(DEADLINE_VARIABLE).ok().as_deref())
+}
+
+fn deadline_from(value: Option<&str>) -> Duration {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| *s > 0).map_or(PULL_DEADLINE, Duration::from_secs)
+}
+
+/// A deadline in words: `15 minutes`, `2 seconds`.
+pub fn describe(deadline: Duration) -> String {
+    match (deadline.as_secs() >= 60, deadline.as_secs() % 60) {
+        (true, 0) => format!("{} minutes", deadline.as_secs() / 60),
+        _ => format!("{} seconds", deadline.as_secs()),
+    }
+}
+
 /// How long the watchdog waits for its timeout markers to be written
 /// before the process stops anyway. The write itself may hang on a vault
 /// folder that does not answer.
@@ -156,6 +177,16 @@ mod tests {
         let marked = record_timeouts(&vault, &config_dir, &[binding("mine")], 4242, now());
         assert_eq!(marked, vec!["work/mine linear"]);
         assert_eq!(state::provider(&state_path, "linear").unwrap().open_failure(), Some((now(), FailureCode::Timeout)));
+    }
+
+    #[test]
+    fn the_deadline_reads_its_override_and_says_itself_in_words() {
+        assert_eq!(deadline_from(None), PULL_DEADLINE);
+        assert_eq!(deadline_from(Some("2")), Duration::from_secs(2));
+        assert_eq!(deadline_from(Some("0")), PULL_DEADLINE);
+        assert_eq!(deadline_from(Some("soon")), PULL_DEADLINE);
+        assert_eq!(describe(PULL_DEADLINE), "15 minutes");
+        assert_eq!(describe(Duration::from_secs(2)), "2 seconds");
     }
 
     #[test]

@@ -278,7 +278,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         TrackerCommand::Pull { project, full, allow_empty, provider } => {
             use wardwell::tracker::pull::Mode;
             let only = project.clone();
-            let _watchdog = wardwell::tracker::deadline::arm(wardwell::tracker::deadline::PULL_DEADLINE, move || expire_pull(only));
+            let _watchdog = wardwell::tracker::deadline::arm(wardwell::tracker::deadline::pull_deadline(), move || expire_pull(only));
             let config = wardwell::config::loader::load(None)?;
             let now = chrono::Utc::now();
             let mode = match (full, allow_empty) {
@@ -317,7 +317,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
 /// pull this process started and did not end, waiting a bounded time for
 /// the write, then stop the process.
 fn expire_pull(only: Option<String>) {
-    use wardwell::tracker::deadline::{MARKER_WAIT, PULL_DEADLINE, record_timeouts};
+    use wardwell::tracker::deadline::{MARKER_WAIT, describe, pull_deadline, record_timeouts};
     let pid = std::process::id();
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -336,7 +336,7 @@ fn expire_pull(only: Option<String>) {
         Ok(Ok(marked)) if !marked.is_empty() => format!("recorded timeout for {}", marked.join(", ")),
         _ => "no timeout marker was written".to_string(),
     };
-    eprintln!("wardwell: tracker pull stopped after {} minutes; {marked}", PULL_DEADLINE.as_secs() / 60);
+    eprintln!("wardwell: tracker pull stopped after {}; {marked}", describe(pull_deadline()));
     std::process::exit(1);
 }
 
@@ -692,33 +692,14 @@ async fn run_serve(domain: Option<String>) -> Result<(), Box<dyn std::error::Err
     });
     // Refresh each bound project's mirror on the hour while the server runs,
     // the first time one hour after it starts. A failure is logged only.
-    let refresh_config_dir = config_dir.clone();
-    tokio::spawn(wardwell::tracker::trigger::every(wardwell::tracker::trigger::SERVE_INTERVAL, move || {
-        let config_dir = refresh_config_dir.clone();
-        tokio::task::spawn_blocking(move || refresh_bound_projects(&config_dir));
+    tokio::spawn(wardwell::tracker::trigger::serve_refresh(wardwell::tracker::trigger::SERVE_INTERVAL, config_dir.clone(), |dir| {
+        let lines = wardwell::tracker::trigger::serve_round(dir, || wardwell::config::loader::load(None).map_err(|e| e.to_string()), chrono::Utc::now());
+        lines.iter().for_each(|line| eprintln!("wardwell: {line}"));
     }));
     let service = server.serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
 
     Ok(())
-}
-
-/// One server refresh round: the refresh trigger for every bound project,
-/// with the config read fresh. Every outcome is a log line; none is fatal.
-fn refresh_bound_projects(config_dir: &std::path::Path) {
-    use wardwell::tracker::trigger;
-    let config = match wardwell::config::loader::load(None) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("wardwell: tracker refresh skipped; config could not be read ({error})");
-            return;
-        }
-    };
-    let now = chrono::Utc::now();
-    let refresh = |domain: &str, project: &str| trigger::refresh_detached(&config, config_dir, domain, project, now);
-    for line in trigger::refresh_bound(&config, &refresh) {
-        eprintln!("wardwell: {line}");
-    }
 }
 
 async fn run_daemon_loop(
