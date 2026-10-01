@@ -752,7 +752,7 @@ mod tests {
         let binary = home.join("bin/wardwell");
         put(home, "bin/wardwell", "");
         let deny: Vec<&str> = crate::gate::ruleset::LINEAR_UPDATES.denied_tools.to_vec();
-        let settings = serde_json::json!({"permissions": {"deny": deny}, "hooks": {"PreToolUse": [{"matcher": "x",
+        let settings = serde_json::json!({"permissions": {"deny": deny}, "hooks": {"PreToolUse": [{"matcher": crate::gate::linear::MATCHER,
             "hooks": [{"type": "command", "command": format!("'{}' gate linear", binary.display())}]}]}});
         put(home, ".claude/settings.json", &settings.to_string());
         put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist",
@@ -769,7 +769,7 @@ mod tests {
     fn policy_rows_fail_on_a_stale_gate_path_missing_denies_and_no_plist() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "/old/wardwell gate linear"}]}]}}"#);
+        put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "mcp__linear__save_comment|mcp__linear__save_issue", "hooks": [{"type": "command", "command": "/old/wardwell gate linear"}]}]}}"#);
         let (rows, ok) = policy_rows(&policy_config(home, true), home, Path::new("/new/wardwell"), true);
         assert!(!ok);
         assert!(rows[1].contains("\u{2717} runs /old/wardwell, not this binary /new/wardwell; run `wardwell setup`"), "{}", rows[1]);

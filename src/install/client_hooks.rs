@@ -75,14 +75,18 @@ fn event_groups<'a>(root: &'a mut Value, event: &str) -> Result<&'a mut Vec<Valu
         .ok_or(format!("hooks.{event} must be an array"))
 }
 
-/// Leave exactly one handler for `spec` running `command`. An owned handler
-/// in a fitting group is updated in place so the file's order is kept.
+/// Leave exactly one handler for `spec` running `command` among the groups
+/// whose matcher is `spec`'s. An owned handler there is updated in place so
+/// the file's order is kept. Groups with another matcher are not touched.
 pub fn ensure(root: &mut Value, spec: &Handler, command: &str) -> Result<(), String> {
     let groups = event_groups(root, spec.event)?;
     let mut kept = false;
     let mut emptied = Vec::new();
     for (index, group) in groups.iter_mut().enumerate() {
-        let fits = matcher_fits(group, spec.matcher);
+        // A group scoped by another matcher is the user's; never move or edit it.
+        if !matcher_fits(group, spec.matcher) {
+            continue;
+        }
         if group.get("hooks").is_none() && is_owned(group, spec.args) {
             emptied.push(index);
             continue;
@@ -93,7 +97,7 @@ pub fn ensure(root: &mut Value, spec: &Handler, command: &str) -> Result<(), Str
             if !is_owned(handler, spec.args) {
                 return true;
             }
-            if kept || !fits {
+            if kept {
                 return false;
             }
             kept = true;
@@ -140,6 +144,11 @@ fn remove_indices(groups: &mut Vec<Value>, indices: &[usize]) {
 /// Remove every handler, in every event, whose command satisfies `owned`.
 /// Groups and events left empty by the removal go too. Returns the count.
 pub fn remove_where(root: &mut Value, owned: impl Fn(&str) -> bool) -> usize {
+    remove_where_in(root, |_, _| true, owned)
+}
+
+/// `remove_where`, only in groups `scope(event, group)` accepts.
+fn remove_where_in(root: &mut Value, scope: impl Fn(&str, &Value) -> bool, owned: impl Fn(&str) -> bool) -> usize {
     let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else { return 0 };
     let owned_handler = |handler: &Value| handler["type"] == "command" && handler["command"].as_str().is_some_and(&owned);
     let mut removed = 0;
@@ -149,6 +158,9 @@ pub fn remove_where(root: &mut Value, owned: impl Fn(&str) -> bool) -> usize {
         let had_groups = !groups.is_empty();
         let mut emptied = Vec::new();
         for (index, group) in groups.iter_mut().enumerate() {
+            if !scope(event, group) {
+                continue;
+            }
             if group.get("hooks").is_none() && owned_handler(group) {
                 emptied.push(index);
                 removed += 1;
@@ -173,16 +185,22 @@ pub fn remove_where(root: &mut Value, owned: impl Fn(&str) -> bool) -> usize {
     removed
 }
 
-/// Remove every handler running `spec`'s arguments from a Wardwell binary.
+/// Remove every handler running `spec`'s arguments from a Wardwell binary,
+/// in `spec`'s event and in groups with `spec`'s matcher only.
 pub fn remove(root: &mut Value, spec: &Handler) -> usize {
-    remove_where(root, |command| wardwell_args(command) == Some(spec.args))
+    remove_where_in(
+        root,
+        |event, group| event == spec.event && matcher_fits(group, spec.matcher),
+        |command| wardwell_args(command) == Some(spec.args),
+    )
 }
 
-/// Commands of the handlers for `spec`, in file order.
+/// Commands of the handlers for `spec` in groups with its matcher, in file order.
 pub fn commands(root: &Value, spec: &Handler) -> Vec<String> {
     let Some(groups) = root["hooks"][spec.event].as_array() else { return Vec::new() };
     groups
         .iter()
+        .filter(|group| matcher_fits(group, spec.matcher))
         .flat_map(|group| match group.get("hooks").and_then(Value::as_array) {
             Some(handlers) => handlers.clone(),
             None => vec![group.clone()],
@@ -301,16 +319,19 @@ mod tests {
     }
 
     #[test]
-    fn ensure_collapses_duplicates_and_moves_out_of_a_wrong_matcher() {
+    fn ensure_collapses_duplicates_and_never_touches_another_matcher_group() {
+        let user = json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "/a/wardwell gate linear"}, {"type": "command", "command": "rtk"}]});
         let mut root = json!({"hooks": {"PreToolUse": [
-            {"matcher": "Bash", "hooks": [{"type": "command", "command": "/a/wardwell gate linear"}, {"type": "command", "command": "rtk"}]},
+            user.clone(),
             {"matcher": crate::gate::linear::MATCHER, "hooks": [{"type": "command", "command": "/b/wardwell gate linear"}]},
             {"matcher": crate::gate::linear::MATCHER, "hooks": [{"type": "command", "command": "/c/wardwell gate linear"}]}
         ]}});
         ensure(&mut root, &GATE, &cmd("gate linear")).unwrap();
         assert_eq!(commands(&root, &GATE), vec![cmd("gate linear")]);
-        assert_eq!(root["hooks"]["PreToolUse"][0]["hooks"], json!([{"type": "command", "command": "rtk"}]));
+        assert_eq!(root["hooks"]["PreToolUse"][0], user);
         assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(remove(&mut root, &GATE), 1);
+        assert_eq!(root["hooks"]["PreToolUse"], json!([user]));
     }
 
     #[test]

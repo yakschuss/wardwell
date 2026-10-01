@@ -12,6 +12,7 @@ use crate::companion::install::{atomic_write, backup_file, read_optional, shell_
 use crate::config::loader::TrackerBinding;
 use crate::gate::ruleset::LINEAR_UPDATES;
 use crate::install::client_hooks::{self, GATE, Handler, SESSION_START, STOP};
+use crate::install::json_doc;
 use crate::install::manifest::{self, Manifest};
 use crate::tracker::schedule::{self, LaunchctlRunner};
 use serde_json::{Value, json};
@@ -86,6 +87,33 @@ struct Change {
     path: PathBuf,
     before: Option<Vec<u8>>,
     after: Vec<u8>,
+    /// The file's permission bits before the change, restored after it.
+    mode: Option<u32>,
+}
+
+fn mode_of(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).ok().map(|meta| meta.permissions().mode() & 0o7777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn restore_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|_| format!("Could not restore the permissions of {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -147,6 +175,8 @@ pub fn policy_enabled(trackers: &BTreeMap<String, TrackerBinding>) -> bool {
 struct Draft {
     path: PathBuf,
     before: Option<Vec<u8>>,
+    /// The original text as a document, so a rewrite keeps what the user wrote.
+    doc: Option<json_doc::Node>,
     original: Value,
     value: Value,
     removing: bool,
@@ -176,7 +206,12 @@ impl Draft {
             ));
         }
         client_hooks::validate(&value).map_err(|error| format!("{error} in {}; no files changed", path.display()))?;
-        Ok(Draft { path, before, original: value.clone(), value, removing })
+        let doc = match before.as_deref().map(std::str::from_utf8) {
+            Some(Ok(text)) if !text.trim().is_empty() => Some(json_doc::parse(text)?),
+            Some(Err(_)) => return Err(format!("{} is not UTF-8; no files changed", path.display())),
+            _ => None,
+        };
+        Ok(Draft { path, before, doc, original: value.clone(), value, removing })
     }
 
     /// Apply one edit and record its plan line.
@@ -201,9 +236,16 @@ impl Draft {
         if self.value == self.original {
             return Ok(None);
         }
-        let mut after = serde_json::to_vec_pretty(&self.value).map_err(|_| "Could not encode Claude settings")?;
-        after.push(b'\n');
-        Ok(Some(Change { path: self.path, before: self.before, after }))
+        let after = match &self.doc {
+            Some(doc) => json_doc::render(&json_doc::reconcile(doc, &self.value)).into_bytes(),
+            None => {
+                let mut after = serde_json::to_vec_pretty(&self.value).map_err(|_| "Could not encode Claude settings")?;
+                after.push(b'\n');
+                after
+            }
+        };
+        let mode = mode_of(&self.path);
+        Ok(Some(Change { path: self.path, before: self.before, after, mode }))
     }
 }
 
@@ -308,7 +350,8 @@ fn manifest_change(config_dir: &Path, recorded: Option<(Vec<u8>, Manifest)>, nex
     if action == Action::Unchanged {
         return Ok(None);
     }
-    Ok(Some(Change { path, before, after: manifest::encode(next)? }))
+    let mode = mode_of(&path);
+    Ok(Some(Change { path, before, after: manifest::encode(next)?, mode }))
 }
 
 fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
@@ -404,6 +447,7 @@ pub fn apply(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Result
         let backup = change.before.as_ref().map(|bytes| backup_file(&change.path, bytes)).transpose()?;
         atomic_write(&change.path, &change.after)
             .map_err(|error| format!("{error}; any earlier changed files have .wardwell-backup files for rollback"))?;
+        restore_mode(&change.path, change.mode)?;
         report.push(format!("  OK {}", change.path.display()));
         if let Some(backup) = backup {
             report.push(format!("    backup: {}", backup.display()));
@@ -624,6 +668,31 @@ mod tests {
         assert!(plan(&inputs).unwrap_err().contains("install record"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    const USER_TEXT: &str = "{\n  \"zeta\": 12345678901234567890123,\n  \"alpha\": 1e3,\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"startup\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/usr/local/bin/wardwell inject \\\"$(pwd)\\\"\"\n          }\n        ]\n      }\n    ]\n  }\n}\n";
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_and_uninstall_keep_what_the_user_wrote() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = home();
+        let path = settings_path(&h.home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, USER_TEXT).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        run(&h, &binding("linear", true));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("{\n  \"zeta\": 12345678901234567890123,\n  \"alpha\": 1e3,\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"startup\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/usr/local/bin/wardwell inject"), "{text}");
+        let s = settings(&h);
+        assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 2, "{text}");
+        assert_eq!(client_hooks::commands(&s, &SESSION_START), vec![format!("'{BIN}' inject \"$(pwd)\"")]);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+        assert!(plan_for(&h, &binding("linear", true), false).is_noop());
+        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), USER_TEXT);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
     }
 
     #[test]
