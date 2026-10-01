@@ -1,6 +1,12 @@
 //! `wardwell gate linear`: checks Linear comment and issue writes against the
 //! "linear-updates" ruleset and returns the PreToolUse deny JSON, or nothing to
 //! allow. Fails open: a malformed payload or an internal error allows.
+//! A payload this parser cannot read is allowed. Three known cases differ
+//! from the Python hook it replaces, which read them: a lone surrogate escape
+//! such as `\ud83d` (serde_json rejects it), nesting deeper than serde_json's
+//! recursion limit of 128, and input over the 1 MiB size cap in `main`.
+//! Line breaks are `\r\n`, `\n`, and a bare `\r`, as the Python hook's
+//! `splitlines` treated them; its other Unicode separators are not.
 //! Does NOT read project files, call Linear, or install the hook.
 
 use super::ruleset::{LINEAR_UPDATES, Ruleset};
@@ -59,7 +65,7 @@ fn shape_names(rules: &Ruleset) -> String {
 
 fn check_comment(rules: &Ruleset, body: &str) -> Verdict {
     let names = shape_names(rules);
-    let first = body.trim().lines().next().unwrap_or("");
+    let first = split_lines(body.trim()).first().copied().unwrap_or("");
     let found = rules
         .comment_shapes
         .iter()
@@ -160,9 +166,24 @@ fn regex(pattern: &str, case_insensitive: bool) -> Result<Regex, regex::Error> {
     RegexBuilder::new(pattern).case_insensitive(case_insensitive).build()
 }
 
+/// Lines split at `\r\n`, `\n`, or a bare `\r`; no empty line after a final break.
+fn split_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(['\r', '\n']) {
+        lines.push(&rest[..at]);
+        let width = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
+        rest = &rest[at + width..];
+    }
+    if !rest.is_empty() {
+        lines.push(rest);
+    }
+    lines
+}
+
 /// The text between the team heading and the divider, or None without a heading.
 fn team_section(rules: &Ruleset, body: &str) -> Option<String> {
-    let lines: Vec<&str> = body.lines().collect();
+    let lines = split_lines(body);
     let start = lines.iter().position(|line| line.trim().to_lowercase() == rules.team_heading)?;
     let section: Vec<&str> =
         lines.iter().skip(start + 1).take_while(|line| line.trim() != rules.divider).copied().collect();
@@ -201,7 +222,7 @@ fn style_problem(rules: &Ruleset, team: &str) -> Verdict {
     let date = regex(&date_pattern(), false)?;
     let label = regex(r"^\s*[^:]{1,60}:", false)?;
     let sentence_end = regex(r"[.?!](?:\s+|$)", false)?;
-    for line in team.lines() {
+    for line in split_lines(team) {
         let line = date.replace_all(line, "DATE");
         let line = label.replace(&line, "");
         for sentence in sentence_end.split(&line) {
@@ -245,7 +266,8 @@ fn key_or_date_problem(rules: &Ruleset, body: &str) -> Verdict {
     let padded = regex(r"^\d{4}-\d{2}-\d{2}$", false)?;
     for found in regex(r"\b\d{4}-\d{1,2}-\d{1,2}\b", false)?.find_iter(body) {
         let text = found.as_str();
-        if !padded.is_match(text) || chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_err() {
+        let valid = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").is_ok_and(|date| chrono::Datelike::year(&date) >= 1);
+        if !padded.is_match(text) || !valid {
             return Ok(Some(format!("unparseable date '{text}' (use YYYY-MM-DD)")));
         }
     }
@@ -265,7 +287,8 @@ fn written_date(text: &str) -> Option<chrono::NaiveDate> {
     let month = MONTHS
         .iter()
         .position(|name| name.eq_ignore_ascii_case(month) || name.get(..3).is_some_and(|abbr| abbr.eq_ignore_ascii_case(month)))?;
-    chrono::NaiveDate::from_ymd_opt(year.parse().ok()?, u32::try_from(month).ok()? + 1, day.parse().ok()?)
+    let year: i32 = year.parse().ok().filter(|year| *year >= 1)?;
+    chrono::NaiveDate::from_ymd_opt(year, u32::try_from(month).ok()? + 1, day.parse().ok()?)
 }
 
 #[cfg(test)]
@@ -566,6 +589,35 @@ Display only.";
     #[test]
     fn comment_without_a_body_is_denied() {
         denied(COMMENT_TOOL, json!({"issueId": "COR-1"}), "comment body is required");
+    }
+
+    #[test]
+    fn carriage_returns_are_line_breaks_like_python_splitlines() {
+        for (name, body) in [("SHIPPED", SHIPPED), ("BLOCKED", BLOCKED), ("FOLLOWUP", FOLLOWUP)] {
+            for newline in ["\r\n", "\r"] {
+                let converted = body.replace('\n', newline);
+                assert!(run(COMMENT_TOOL, comment(&converted)).is_none(), "{name} with {newline:?}");
+            }
+        }
+        let bad = SHIPPED.replace("Other columns look the same.", "It is (small).").replace('\n', "\r");
+        denied(COMMENT_TOOL, comment(&bad), "parenthesis");
+        let issue = ISSUE_BODY.replace('\n', "\r");
+        allowed(ISSUE_TOOL, json!({"title": "x", "description": issue, "parentId": "COR-3"}));
+    }
+
+    #[test]
+    fn a_date_in_year_zero_is_rejected() {
+        denied(COMMENT_TOOL, comment(&SHIPPED.replace("2026-10-05", "0000-01-01")), "unparseable date '0000-01-01'");
+        denied(COMMENT_TOOL, comment(&SHIPPED.replace("October 5, 2026", "October 5, 0000")), "unparseable date 'October 5, 0000'");
+    }
+
+    #[test]
+    fn payloads_the_parser_cannot_read_are_allowed() {
+        let lone_surrogate = r#"{"tool_name":"mcp__linear__save_comment","tool_input":{"body":"Done: x \ud83d"}}"#;
+        assert!(evaluate(lone_surrogate).is_none());
+        let deep = format!(r#"{{"tool_name":"mcp__linear__save_comment","tool_input":{{"body":"Done: x","junk":{}{}}}}}"#, "[".repeat(200), "]".repeat(200));
+        assert!(evaluate(&deep).is_none());
+        assert!(evaluate("").is_none());
     }
 
     #[test]
