@@ -319,8 +319,13 @@ fn expire_pull(only: Option<String>) {
     let (done, finished) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let marked = wardwell::config::loader::load(None).map(|config| {
+            let config_dir = wardwell::config::loader::config_dir();
             let bindings: Vec<_> = config.trackers.iter().filter(|b| only.as_deref().is_none_or(|key| b.key() == key)).cloned().collect();
-            record_timeouts(&config.vault_path, &wardwell::config::loader::config_dir(), &bindings, pid, chrono::Utc::now())
+            let marked = record_timeouts(&config.vault_path, &config_dir, &bindings, pid, chrono::Utc::now());
+            for binding in &bindings {
+                wardwell::tracker::state::release(&wardwell::tracker::state::claim_path(&config_dir, &binding.domain, &binding.project));
+            }
+            marked
         });
         let _ = done.send(marked);
     });

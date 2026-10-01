@@ -31,7 +31,8 @@ pub fn pull(
     let bindings = selected(config, only)?;
     let mut lines = Vec::new();
     let mut failures = Vec::new();
-    for (key, binding) in bindings {
+    for (key, binding) in &bindings {
+        let binding = *binding;
         match pull_binding(&config.vault_path, config_dir, binding, mode, now, connect) {
             Ok(outcome) => match (&outcome.failed_full, outcome.resync_due) {
                 (Some(failed), Some(due)) => failures.push(format!(
@@ -44,9 +45,18 @@ pub fn pull(
             Err(error) => failures.push(format!("{key}: {error}")),
         }
     }
+    release_claims(config_dir, &bindings);
     match failures.is_empty() {
         true => Ok(lines),
         false => Err(lines.into_iter().chain(failures).collect::<Vec<_>>().join("\n")),
+    }
+}
+
+/// Remove the refresh claim of each project pulled, so the next due
+/// refresh can start.
+pub fn release_claims(config_dir: &Path, bindings: &[(String, &TrackerBinding)]) {
+    for (_, binding) in bindings {
+        crate::tracker::state::release(&crate::tracker::state::claim_path(config_dir, &binding.domain, &binding.project));
     }
 }
 
@@ -282,6 +292,19 @@ mod tests {
         assert!(!message.contains("lin_api_secret"));
         let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
         assert_eq!(crate::tracker::credential::load(&path).unwrap().token(), "lin_api_secret");
+    }
+
+    #[test]
+    fn a_pull_releases_the_project_claim_on_success_and_on_failure() {
+        let (dir, config) = setup(false);
+        let claim = crate::tracker::state::claim_path(dir.path(), "work", "claims");
+        assert!(crate::tracker::state::claim(&claim, Utc::now()));
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap_err();
+        assert!(!claim.exists(), "released after a failed pull");
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        assert!(crate::tracker::state::claim(&claim, Utc::now()));
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
+        assert!(!claim.exists(), "released after a completed pull");
     }
 
     #[test]

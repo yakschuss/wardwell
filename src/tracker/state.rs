@@ -83,6 +83,54 @@ pub fn claim_path(config_dir: &Path, domain: &str, project: &str) -> PathBuf {
     config_dir.join(DIR).join(format!("{domain}__{project}.claim"))
 }
 
+/// A claim younger than this stops another start; an older one is replaced.
+pub const CLAIM_FOR: chrono::TimeDelta = chrono::TimeDelta::minutes(20);
+
+/// Take the claim at `path`: create it new, holding this process's id and
+/// `now`. An existing claim younger than `CLAIM_FOR` by its modified time,
+/// against the wall clock, wins and this returns false. An older one, or one stamped in the future,
+/// is moved aside by a rename, which only one taker can do, and the claim
+/// is created again.
+pub fn claim(path: &Path, now: DateTime<Utc>) -> bool {
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return false;
+    }
+    if create_claim(path, now) {
+        return true;
+    }
+    let fresh = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|modified| Utc::now() - DateTime::<Utc>::from(modified))
+        .is_ok_and(|age| age >= chrono::TimeDelta::zero() && age < CLAIM_FOR);
+    if fresh {
+        return false;
+    }
+    let aside = path.with_extension(format!("claim.stale.{}", uuid::Uuid::new_v4()));
+    if std::fs::rename(path, &aside).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&aside);
+    create_claim(path, now)
+}
+
+fn create_claim(path: &Path, now: DateTime<Utc>) -> bool {
+    use std::io::Write;
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{} {}", std::process::id(), now.to_rfc3339());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Remove the claim at `path`; a missing one is fine.
+pub fn release(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
 /// The state at `path`.
 pub fn read(path: &Path) -> Read {
     match std::fs::read(path) {
@@ -169,6 +217,29 @@ mod tests {
         assert_eq!(read(&file), Read::Unreadable);
         record(&file, "linear", Record::Completed, at(1)).unwrap();
         assert!(matches!(read(&file), Read::Found(_)));
+    }
+
+    fn age_claim(file: &Path, by: chrono::TimeDelta) {
+        let modified = std::time::SystemTime::from(Utc::now() - by);
+        std::fs::OpenOptions::new().write(true).open(file).unwrap().set_modified(modified).unwrap();
+    }
+
+    #[test]
+    fn a_young_claim_wins_and_an_old_one_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = claim_path(dir.path(), "work", "claims");
+        let now = Utc::now();
+        assert!(claim(&file, now));
+        assert!(!claim(&file, now), "held");
+        age_claim(&file, CLAIM_FOR - chrono::TimeDelta::minutes(1));
+        assert!(!claim(&file, now), "19 minutes old still holds");
+        age_claim(&file, CLAIM_FOR + chrono::TimeDelta::minutes(1));
+        assert!(claim(&file, now), "an old claim is replaced");
+        age_claim(&file, -chrono::TimeDelta::hours(1));
+        assert!(claim(&file, now), "a claim stamped in the future counts as old");
+        release(&file);
+        assert!(!file.exists());
+        assert!(claim(&file, now));
     }
 
     #[test]

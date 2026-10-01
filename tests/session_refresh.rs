@@ -102,3 +102,58 @@ fn session_start_starts_a_detached_pull_of_a_stale_mirror_and_returns_at_once() 
         .unwrap();
     assert!(!String::from_utf8_lossy(&again.stdout).contains("Refresh started"), "{}", String::from_utf8_lossy(&again.stdout));
 }
+
+#[cfg(unix)]
+#[test]
+fn twenty_session_starts_in_one_second_start_one_pull_and_one_provider_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (home, cfg, stub, code, project) = (root.join("home"), root.join("cfg"), root.join("stub"), root.join("code/app"), root.join("vault/work/claims"));
+    for dir in [&home, &cfg, &stub, &code, &project] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let reads = root.join("gh-reads");
+    script(&stub.join("gh"), &format!("#!/bin/sh\necho read >> '{}'\nsleep 0.3\necho '[]'\n", reads.display()));
+    std::fs::write(cfg.join("config.yml"), format!(
+        "vault_path: {}\nsession_sources: []\nprojects:\n  work/claims:\n    paths:\n      - {}\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
+        root.join("vault").display(),
+        code.display()
+    )).unwrap();
+    let two_hours_ago = (chrono::Utc::now() - chrono::TimeDelta::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let log = project.join("tracker.jsonl");
+    std::fs::write(&log, format!(
+        "{{\"_schema\":\"tracker\",\"_version\":\"1.0\"}}\n{{\"kind\":\"pull_completed\",\"id\":\"seed\",\"provider\":\"github\",\"external_key\":\"acme/app\",\"external_id\":\"acme/app\",\"occurred_at\":\"{two_hours_ago}\",\"title\":\"seed\",\"through\":\"{two_hours_ago}\"}}\n"
+    )).unwrap();
+    let started = Instant::now();
+    let children: Vec<_> = (0..20)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_wardwell"))
+                .args(["inject", code.to_str().unwrap()])
+                .env_clear()
+                .env("HOME", &home)
+                .env("WARDWELL_CONFIG_DIR", &cfg)
+                .env("PATH", &stub)
+                .env("WARDWELL_GH_CANDIDATES", "")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    assert!(started.elapsed() < Duration::from_secs(1), "twenty session starts began within {:?}", started.elapsed());
+    let printed: usize = children
+        .into_iter()
+        .map(|child| String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).matches("Refresh started in the background.").count())
+        .sum();
+    assert_eq!(printed, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rows(&log).iter().skip(1).any(|(kind, _)| kind == "pull_completed") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let kinds: Vec<String> = rows(&log).into_iter().map(|(kind, _)| kind).collect();
+    assert_eq!(kinds.iter().filter(|k| *k == "pull_started").count(), 1, "{kinds:?}");
+    assert_eq!(std::fs::read_to_string(&reads).unwrap().lines().count(), 1, "one provider read");
+    assert!(!cfg.join("refresh/work__claims.claim").exists(), "the pull released its claim");
+}

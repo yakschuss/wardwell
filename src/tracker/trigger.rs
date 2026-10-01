@@ -44,6 +44,8 @@ pub enum Outcome {
     Cooldown,
     /// Every due binding fails the offline check, so a pull cannot run.
     Blocked,
+    /// Another start holds the project's claim.
+    Claimed,
     /// The pull could not start; the state and a `spawn` marker record it.
     SpawnFailed,
 }
@@ -64,7 +66,8 @@ pub struct Places<'a> {
 
 /// Start a detached pull of `<domain>/<project>` through `spawner` when it
 /// is due, deciding from the refresh state file alone. A missing or
-/// unreadable state file makes every binding due. A spawn error is
+/// unreadable state file makes every binding due. Before it spawns it takes
+/// the project's claim file; the pull releases it when it ends. A spawn error is
 /// recorded as a `spawn` failure in the state and in the log.
 pub fn refresh(places: &Places<'_>, domain: &str, project: &str, now: DateTime<Utc>, spawner: &dyn Spawner, probes: &Probes<'_>) -> Outcome {
     let bindings = places.config.bindings_for(domain, project);
@@ -90,9 +93,14 @@ pub fn refresh(places: &Places<'_>, domain: &str, project: &str, now: DateTime<U
         (false, true) => return Outcome::Blocked,
         (false, false) => {}
     }
+    let claim = state::claim_path(places.config_dir, domain, project);
+    if !state::claim(&claim, now) {
+        return Outcome::Claimed;
+    }
     match spawner.spawn(&format!("{domain}/{project}")) {
         Ok(()) => Outcome::Started,
         Err(_) => {
+            state::release(&claim);
             record_spawn_failure(places, &state_path, &pullable, now);
             Outcome::SpawnFailed
         }
@@ -330,6 +338,8 @@ mod tests {
     fn a_missing_or_unreadable_state_file_is_due() {
         let s = setup(false);
         assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Started);
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Claimed, "due once: the claim holds until the pull ends");
+        state::release(&state::claim_path(&s.config_dir, "work", "claims"));
         std::fs::create_dir_all(s.state.parent().unwrap()).unwrap();
         std::fs::write(&s.state, "{torn").unwrap();
         assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Started);
@@ -429,6 +439,48 @@ mod tests {
         assert_eq!(run(&s, &fake, true, true), Outcome::Started);
         assert_eq!(run(&s, &fake, true, true), Outcome::Running);
         assert_eq!(fake.started.borrow().len(), 1);
+    }
+
+    /// Counts starts across threads.
+    struct Counting(std::sync::Mutex<usize>);
+
+    impl Spawner for Counting {
+        fn spawn(&self, _: &str) -> Result<(), String> {
+            *self.0.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn twenty_parallel_triggers_against_one_stale_project_start_one_pull() {
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(120));
+        let spawner = Counting(std::sync::Mutex::new(0));
+        let barrier = std::sync::Barrier::new(20);
+        let outcomes: Vec<Outcome> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..20)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        let alive = |_: u32| false;
+                        let can_pull = |_: &TrackerBinding| true;
+                        let places = Places { config: &s.config, config_dir: &s.config_dir };
+                        refresh(&places, "work", "claims", Utc::now(), &spawner, &Probes { alive: &alive, can_pull: &can_pull })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(*spawner.0.lock().unwrap(), 1, "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| **o == Outcome::Started).count(), 1);
+        assert!(outcomes.iter().all(|o| matches!(o, Outcome::Started | Outcome::Claimed)), "{outcomes:?}");
+    }
+
+    #[test]
+    fn a_spawn_error_releases_the_claim() {
+        let s = setup(false);
+        assert_eq!(run(&s, &Fake { fail: true, ..Fake::new() }, false, true), Outcome::SpawnFailed);
+        assert!(!state::claim_path(&s.config_dir, "work", "claims").exists());
     }
 
     #[test]
