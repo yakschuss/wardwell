@@ -97,7 +97,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Mapped projects: paths, ages, last Stop-check block
-                let (rows, projects_ok) = project_rows(&config, &config_dir(), chrono::Utc::now());
+                let (rows, projects_ok) = project_rows(&config, &config_dir(), chrono::Utc::now(), crate::inject::git::dirs);
                 for row in rows {
                     println!("{row}");
                 }
@@ -258,8 +258,9 @@ fn tracker_rows_with(
 
 /// One row per mapped project: whether each path exists, the age of the
 /// last history entry and decision, the last pull when bound, and the last
-/// Stop-check block. A missing path or vault folder fails the row.
-fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> (Vec<String>, bool) {
+/// Stop-check block. A missing path, a path inside a linked worktree, or a
+/// missing vault folder fails the row.
+fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path, now: chrono::DateTime<chrono::Utc>, git: impl Fn(&Path) -> Option<crate::inject::git::GitDirs>) -> (Vec<String>, bool) {
     let mut ok = true;
     let rows = config
         .projects
@@ -267,8 +268,9 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
         .map(|(key, mapping)| {
             let label = format!("Project {key}");
             let folder = config.vault_path.join(&mapping.domain).join(&mapping.project);
-            let paths: Vec<String> = mapping.paths.iter().map(|p| format!("{} {}", p.display(), if p.is_dir() { "exists" } else { "missing" })).collect();
-            let row_ok = folder.is_dir() && mapping.paths.iter().all(|p| p.is_dir());
+            let checked: Vec<(String, bool)> = mapping.paths.iter().map(|p| path_status(p, &git)).collect();
+            let paths: Vec<String> = checked.iter().map(|(text, _)| text.clone()).collect();
+            let row_ok = folder.is_dir() && checked.iter().all(|(_, fine)| *fine);
             ok &= row_ok;
             let mark = if row_ok { '\u{2713}' } else { '\u{2717}' };
             if !folder.is_dir() {
@@ -280,6 +282,20 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
         })
         .collect();
     (rows, ok)
+}
+
+/// One mapped path as doctor reports it, and whether it is usable. A path
+/// inside a linked worktree is never used: worktrees resolve through their
+/// main checkout, so that is what to map.
+fn path_status(path: &Path, git: &impl Fn(&Path) -> Option<crate::inject::git::GitDirs>) -> (String, bool) {
+    if !path.is_dir() {
+        return (format!("{} missing", path.display()), false);
+    }
+    let real = crate::inject::git::canonical(path);
+    match git(&real).and_then(|dirs| dirs.in_main_worktree(&real)).filter(|main| *main != real) {
+        Some(main) => (format!("{} is a linked worktree and is never used; map its main checkout {} instead", path.display(), main.display()), false),
+        None => (format!("{} exists", path.display()), true),
+    }
 }
 
 /// ` Last pull 2 hours ago.` for a bound project, empty otherwise.
@@ -587,7 +603,7 @@ mod tests {
         let config = project_config(dir.path(), &[&code], false);
         let project = dir.path().join("vault/personal/corr");
         std::fs::write(project.join("history.jsonl"), "{\"date\":\"2026-09-28T10:00:00Z\",\"title\":\"x\"}\n").unwrap();
-        let (rows, ok) = project_rows(&config, dir.path(), noon());
+        let (rows, ok) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
         assert!(ok);
         assert_eq!(rows, vec![format!("  {:<38} \u{2713} {} exists. Last history entry 2 days ago. No decisions. No stop-check blocks.", "Project personal/corr", code.display())]);
         assert_eq!(rows[0].find('\u{2713}'), "  Config                                 \u{2713}".find('\u{2713}'), "marks line up");
@@ -595,7 +611,7 @@ mod tests {
         let state = crate::stop_check::state_dir(dir.path());
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join(crate::stop_check::LOG), "{\"at\":\"2026-09-30T09:00:00Z\",\"project\":\"personal/corr\",\"commits\":2,\"session_id\":\"s\",\"since\":\"2026-09-30T08:00:00Z\"}\n").unwrap();
-        let (rows, _) = project_rows(&config, dir.path(), noon());
+        let (rows, _) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
         assert!(rows[0].ends_with("Last stop-check block 3 hours ago, 2 commits."), "{}", rows[0]);
     }
 
@@ -606,14 +622,14 @@ mod tests {
         let gone = dir.path().join("gone");
         std::fs::create_dir_all(&code).unwrap();
         let config = project_config(dir.path(), &[&code, &gone], false);
-        let (rows, ok) = project_rows(&config, dir.path(), noon());
+        let (rows, ok) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
         assert!(!ok);
         assert!(rows[0].contains(&format!("\u{2717} {} exists, {} missing.", code.display(), gone.display())), "{}", rows[0]);
 
         std::fs::remove_dir_all(dir.path().join("vault/personal/corr")).unwrap();
         let config = project_config(dir.path(), &[&code], false);
         std::fs::remove_dir_all(dir.path().join("vault/personal/corr")).unwrap();
-        let (rows, ok) = project_rows(&config, dir.path(), noon());
+        let (rows, ok) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
         assert!(!ok);
         assert!(rows[0].contains("\u{2717}") && rows[0].contains("No vault folder; run `wardwell seed personal/corr`."), "{}", rows[0]);
     }
@@ -624,10 +640,28 @@ mod tests {
         let code = dir.path().join("code");
         std::fs::create_dir_all(&code).unwrap();
         let config = project_config(dir.path(), &[&code], true);
-        let (rows, _) = project_rows(&config, dir.path(), noon());
+        let (rows, _) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
         assert!(rows[0].contains("No decisions. Never pulled. No stop-check blocks."), "{}", rows[0]);
         let mut config = config;
         config.projects.clear();
-        assert_eq!(project_rows(&config, dir.path(), noon()), (vec![], true));
+        assert_eq!(project_rows(&config, dir.path(), noon(), |_: &Path| None), (vec![], true));
+    }
+
+    #[test]
+    fn a_mapped_linked_worktree_fails_the_row_and_names_the_main_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let main = root.join("code");
+        crate::inject::git::testing::repo(&main);
+        let linked = root.join("code-wt");
+        crate::inject::git::testing::git(&main, &["worktree", "add", "-q", "-b", "wt", linked.to_str().unwrap()]);
+        let config = project_config(&root, &[&linked], false);
+        let (rows, ok) = project_rows(&config, &root, noon(), crate::inject::git::dirs);
+        assert!(!ok);
+        assert!(rows[0].contains('\u{2717}'), "{}", rows[0]);
+        assert!(rows[0].contains(&format!("{} is a linked worktree and is never used; map its main checkout {} instead.", linked.display(), main.display())), "{}", rows[0]);
+        let config = project_config(&root, &[&main], false);
+        let (rows, ok) = project_rows(&config, &root, noon(), crate::inject::git::dirs);
+        assert!(ok, "{}", rows[0]);
     }
 }

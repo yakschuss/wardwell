@@ -179,7 +179,7 @@ wardwell project link personal/corr-platform
 
 Wardwell shows the change first. It asks once before writing. `--dry-run` writes nothing. `--yes` skips the question. `--path <dir>` links another directory. Leave out the project to use the one vault project named like the directory.
 
-The command adds the directory under `projects:` in config.yml. Comments and other keys stay as they are. The old file is saved beside it with owner-only permissions. A second run changes nothing and says so. A project folder that does not exist in the vault is refused; create it with `wardwell seed` first. Run from a linked worktree, it records the main checkout.
+The command adds the directory under `projects:` in config.yml. Comments and other keys stay as they are. The old file is saved beside it with owner-only permissions. A second run changes nothing and says so. A project folder that does not exist in the vault is refused; create it with `wardwell seed` first. A linked worktree is refused. Link its main checkout instead; worktrees resolve through it. `wardwell doctor` fails a mapped path that is a linked worktree and names the main checkout.
 
 `wardwell project list` shows each project and its directories. Sessions already running do not change. The mapping applies from the next session.
 

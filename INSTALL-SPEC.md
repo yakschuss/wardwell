@@ -120,7 +120,7 @@ Records which directories belong to a vault project, so session start finds it.
 - Backs up config.yml beside itself with mode 0600. Writes through a temp file and a rename.
 - Holds `config.yml.lock` from the read to the rename, created exclusively. A dry run takes no lock. It waits up to 10 seconds for another link, then stops with a message. The lock is released while the question waits for an answer. The lock is removed on every exit.
 - Refuses a project folder that does not exist in the vault, a directory linked to another project, and a `projects:` section written in flow style.
-- A linked worktree records its main checkout.
+- Refuses a linked worktree and names its main checkout. Doctor fails a mapped linked worktree the same way.
 
 ## Stop check
 

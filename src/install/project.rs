@@ -120,15 +120,18 @@ fn read_config(path: &Path) -> Result<(String, WardwellConfig), String> {
     Ok((text, config))
 }
 
-/// The directory as it will be recorded: canonical, and for a linked
-/// worktree, the same place in the main checkout.
+/// The directory as it will be recorded: canonical. A linked worktree is
+/// refused, naming its main checkout: worktrees resolve through it, so a
+/// worktree's own path would never be used.
 fn recorded_dir(dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>) -> Result<PathBuf, String> {
     if !dir.is_dir() {
         return Err(format!("{} is not a directory; nothing changed.", dir.display()));
     }
     let dir = canonical(dir);
-    let in_main = git(&dir).and_then(|g| g.in_main_worktree(&dir));
-    Ok(in_main.unwrap_or(dir))
+    match git(&dir).and_then(|g| g.in_main_worktree(&dir)).filter(|main| *main != dir) {
+        Some(main) => Err(format!("{} is a linked worktree. Link its main checkout {} instead; worktrees resolve through it. Nothing changed.", dir.display(), main.display())),
+        None => Ok(dir),
+    }
 }
 
 /// The one vault project named like `dir`, or what to type instead.
@@ -276,12 +279,14 @@ mod tests {
     }
 
     #[test]
-    fn a_linked_worktree_records_the_main_checkout() {
+    fn a_linked_worktree_is_refused_naming_the_main_checkout() {
         let f = fixture();
         let linked = f.code.parent().unwrap().join("corrtex-wt");
         run_git(&f.code, &["worktree", "add", "-q", "-b", "wt", linked.to_str().unwrap()]);
-        run(&f, Some("personal/corrtex"), &linked, false, true).unwrap();
-        assert_eq!(parse(&config_text(&f)).unwrap().projects["personal/corrtex"].paths, vec![f.code.clone()]);
+        let error = run(&f, Some("personal/corrtex"), &linked, false, true).unwrap_err();
+        assert!(error.contains("is a linked worktree") && error.contains(&format!("Link its main checkout {} instead", f.code.display())), "{error}");
+        assert!(parse(&config_text(&f)).unwrap().projects.is_empty());
+        assert!(backups(&f).is_empty());
     }
 
     #[test]
