@@ -346,7 +346,7 @@ wardwell seed <path>          Create domain or project folders
 wardwell tracker connect <name> --token-stdin   Store a tracker API token
 wardwell tracker pull [--project <d/p>] [--full] Mirror tracker events into the vault
 wardwell tracker status       Last pull, last error, last full resync, event count per project
-wardwell tracker doctor       Check each binding's credential, auth and team
+wardwell tracker doctor       Check each binding's credential, auth, and team or repository
 wardwell tracker compact [--project <d/p>] [--force]   Move raw payloads to the sidecar, drop duplicates
 ```
 
@@ -490,7 +490,7 @@ exclude:
 | `exclude` | Directory/file names to skip during indexing |
 | `domains` | Optional domain config with path patterns and aliases (migration path) |
 | `ai.summarize_model` | Claude model for session summarization (default: `haiku`) |
-| `trackers` | Optional `<domain>/<project>` bindings to an issue tracker (see Tracker mirror). `gate: true` on a linear binding turns on the Linear gate (see Linear gate). |
+| `trackers` | Optional `<domain>/<project>` bindings. Each entry is one binding or a list of bindings, at most one per provider (see Tracker mirror). `gate: true` on a linear binding turns on the Linear gate (see Linear gate). |
 | `projects` | Optional `<domain>/<project>` entries, each with `paths:`, a list of directories. Session start and the Stop check use them. `~/` is expanded. Paths must be absolute. Any other key in an entry is an error. |
 | `stop_hook` | Set to `false` to turn off the Stop check. Default `true`. |
 
@@ -500,24 +500,38 @@ Wardwell can mirror an external issue tracker into the vault as a read-only
 event log that pulls only append to. Each bound project gets `<domain>/<project>/tracker.jsonl`
 (header `{"_schema":"tracker","_version":"1.0"}`), indexed like any other JSONL,
 so `wardwell_search` finds tracker history. A ticket key in a query, such as
-`COR-12` or `COR-12 OR COR-13`, is matched as a key. Linear is the first
-provider. Wardwell never writes back to the tracker.
+`COR-12` or `COR-12 OR COR-13`, is matched as a key. There are two providers.
+`linear` mirrors a team's issues. `github` mirrors a repository's merged pull
+requests. Wardwell never writes back to either.
 
-One tracker per project: a binding maps one project folder to one team. A
-second tracker, or a second team, is a second project folder with its own
-binding and credential.
+A project takes a list of bindings, at most one per provider. A single
+mapping is a list of one. A second binding for the same provider is an error
+at load, and the error names the project and the provider. A second Linear
+team is a second project folder with its own binding. Both bindings of a
+project write to the same `tracker.jsonl`.
 
 Bind projects in `~/.wardwell/config.yml`:
 
 ```yaml
 trackers:
   work/claims:            # <domain>/<project>
+    - provider: linear
+      team: COR           # Linear team key
+      credential: corr-linear
+      readonly: true      # refuse kanban writes on this project
+      gate: true          # optional: install the Linear gate and deny list (see Linear gate)
+    - provider: github
+      repository: acme/claims-app   # <owner>/<name>
+  work/ops:               # one binding needs no list
     provider: linear
-    team: COR             # Linear team key
+    team: OPS
     credential: corr-linear
-    readonly: true        # refuse kanban writes on this project
-    gate: true            # optional: install the Linear gate and deny list (see Linear gate)
 ```
+
+A linear binding needs `team` and `credential`. A github binding needs
+`repository`. Its `credential` is optional and defaults to `github`. It takes
+no `team`, `readonly` or `gate`, since it mirrors no issues and Wardwell never
+writes to it.
 
 A binding's team key may not equal a native kanban prefix set under
 `kanban.prefixes`. `config.yml` is rejected at load when it does, and the
@@ -550,8 +564,8 @@ wardwell tracker compact [--project work/claims] [--force]
 ```
 
 Each event carries `kind`, which is one of `issue_upserted`, `comment_upserted`,
-`state_changed`, `link_added`, `issue_removed`, `full_resync`, `pull_completed`
-or `pull_failed`. It also carries `provider`, `external_key` such as `COR-12`,
+`state_changed`, `link_added`, `change_merged`, `issue_removed`, `full_resync`,
+`pull_completed` or `pull_failed`. It also carries `provider`, `external_key` such as `COR-12`,
 `external_id`, `actor`, `occurred_at`, and a readable `title`. An `issue_upserted` snapshot holds the
 issue's fields in provider-neutral names: `issue_title`, `description`,
 `state`, `state_category`, `priority`, `team`, `project`, `assignee`,
@@ -570,7 +584,9 @@ written by earlier versions carry `raw` inline and still read; `wardwell
 tracker compact` migrates them. There is no cursor file: each
 pull that delivers every page ends with a `pull_completed` marker whose `through`
 is the newest provider time seen, and the next incremental pull starts one hour
-before the latest marker's `through`. Pages are appended as they arrive and
+before the latest marker's `through`. Each marker carries its `provider`, and
+each provider's cursor comes only from its own markers. A marker written
+before a second provider existed has no `provider` and counts as linear. Pages are appended as they arrive and
 duplicate events are skipped by id, so a pull that fails part way keeps what it
 read but does not move the cursor; the next pull re-requests from the same
 point whatever order the provider returned pages in. With no marker, a pull
@@ -600,13 +616,15 @@ open appends a `pull_failed` marker with a closed `code` and no provider text.
 The codes are `auth` when the provider refuses the token, `provider` for any
 other provider failure, `empty_full_result`, `log_read` and `log_write`. Three failures write
 nothing to the log: a missing credential is `credential`, an unknown provider
-is `unsupported_provider`, and a held lock is `lock_busy`. `status` lists every
+is `unsupported_provider`, and a held lock is `lock_busy`. A github binding
+with neither `gh` nor a token is the exception: its pull appends a
+`pull_failed` marker with code `credential`. `status` lists every
 binding with its last error. It also checks, without a network call, that the
 provider is known and the credential reads, and prints `cannot pull` with the
 code when either fails; it says `no errors` only when both pass and no pull
 failed. `pull` exits non-zero when any binding failed.
 
-`doctor` prints four lines per binding. They check whether the credential
+`tracker doctor` prints four lines per linear binding. They check whether the credential
 file exists with owner-only permissions, whether the provider accepts the token on one
 cheap request, whether the team key resolves, and whether the team key
 differs from the project's native kanban prefix. A failure names one code:
@@ -694,9 +712,12 @@ offline doctor check. When pulls cannot run, the section is one line, such as
 "Tracker mirror. Pulls cannot run: credential. Last pulled 3 days ago." It
 lists no issues.
 
-`wardwell doctor` prints one row per binding. It checks only the credential
-file and the provider, with no network call, and names `wardwell tracker
-doctor` for the live check.
+`wardwell doctor` prints one row per binding, labelled with the project and
+the provider. It checks only the credential file and the provider, with no
+network call, and names `wardwell tracker doctor` for the live check. For a
+github binding it checks for a stored token or a `gh` on PATH. It looks for
+`gh` without running it. With neither, the row reads: "github: unreachable,
+run `wardwell tracker connect github`".
 
 ```sh
 wardwell tracker schedule [--interval-seconds 3600]
@@ -719,6 +740,53 @@ watcher. Each change to a tracker log makes the indexer hash every indexed
 line to detect a rewrite; an index on `vault_chunks(path, chunk_index)`,
 added to an existing `index.db` when it opens, keeps the stored-hash lookup
 to that file's rows.
+
+### Merged pull requests
+
+A github binding mirrors the merged pull requests of one repository. Each one
+becomes a `change_merged` event. Its id is `github:<owner>/<name>#<number>`.
+Its `change` holds `number`, `title`, `body`, `author`, `merged_at`, `url`,
+`base_branch`, and `keys`, the ticket keys in the title. Keys use the same
+pattern search uses, so a search for COR-12 finds the merged change that names
+it. A search for `acme/app#42` finds the change by its number. The raw pull
+request goes to the sidecar. A re-pull of a pull request already in the log
+appends nothing.
+
+The first pull reads the 200 most recently updated merged pull requests. Each
+later pull reads those merged since the GitHub cursor, less one hour. `wardwell
+tracker pull --full` reads every merged pull request. A github pull never runs
+full on its own, since merged pull requests are never removed.
+
+Wardwell reads GitHub in this order:
+
+1. `gh`, when it is on PATH and answers. It runs `gh pr list --repo
+   <owner>/<name> --state merged --json number,title,body,author,mergedAt,url,baseRefName,id`
+   with a limit and a search for the merge date.
+2. The REST API at `GET /repos/<owner>/<name>/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=<n>`,
+   with the token stored by `wardwell tracker connect github --token-stdin`.
+3. Neither: the pull fails with `credential` and names the connect command.
+
+`gh` is an optional accelerator. It saves you a second token when you already
+use `gh`. Only `tracker pull` and `tracker doctor` run it. The memory path,
+which is session start, the Stop check and the MCP tools, never runs `gh`.
+`setup` succeeds whether or not either reader works.
+
+Store a token only when `gh` is not installed or not signed in:
+
+```sh
+pbpaste | wardwell tracker connect github --token-stdin
+```
+
+The token goes to `~/.wardwell/trackers/github.json`, mode 0600, the same way
+as a Linear key. It is never printed.
+
+A github failure does not stop the linear pull of the same project, and the
+reverse. `pull` still exits non-zero when any binding failed. `status` prints
+one line per binding, each from its own provider's events. `tracker doctor`
+prints two lines for a github binding: `github token` and `github repository`,
+with the reader that answered. `compact` handles both providers in one log.
+`inject`, the kanban read path and the on-miss refresh read only the linear
+binding. They never show a merged change or a github marker.
 
 ## Domain Scoping
 

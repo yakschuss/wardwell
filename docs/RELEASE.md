@@ -3,14 +3,14 @@
 The owner runs these steps. An agent prepares the release commit but never
 tags or pushes a tag.
 
-## 0.12.0
+## 0.13.0
 
 ### 1. Check main
 
 ```sh
 git checkout main
 git pull --ff-only
-grep '^version' Cargo.toml          # version = "0.12.0"
+grep '^version' Cargo.toml          # version = "0.13.0"
 cargo clippy --lib --bin wardwell -- -D warnings
 cargo test
 ```
@@ -22,10 +22,10 @@ Linux x86_64 tarballs, creates the GitHub release, and sends the
 `update-formula` dispatch to `yakschuss/homebrew-wardwell`.
 
 ```sh
-git tag -a v0.12.0 -m "wardwell 0.12.0"
-git push origin v0.12.0
+git tag -a v0.13.0 -m "wardwell 0.13.0"
+git push origin v0.13.0
 gh run watch --repo yakschuss/wardwell "$(gh run list --repo yakschuss/wardwell --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
-gh release view v0.12.0 --repo yakschuss/wardwell
+gh release view v0.13.0 --repo yakschuss/wardwell
 ```
 
 ### 3. Check the tap
@@ -34,7 +34,7 @@ gh release view v0.12.0 --repo yakschuss/wardwell
 gh run list --repo yakschuss/homebrew-wardwell --limit 1
 brew update
 brew upgrade wardwell
-wardwell --version                  # wardwell 0.12.0
+wardwell --version                  # wardwell 0.13.0
 ```
 
 ### 4. Set up this computer
@@ -44,6 +44,20 @@ wardwell setup --dry-run
 wardwell setup
 wardwell doctor
 ```
+
+0.13.0 adds the github binding. To use it, add a `provider: github` entry with
+`repository: <owner>/<name>` to the project's `trackers` list. When `gh` is
+installed and signed in, nothing else is needed. Otherwise store a token:
+
+```sh
+pbpaste | wardwell tracker connect github --token-stdin
+wardwell tracker doctor
+wardwell tracker pull --project <domain>/<project>
+```
+
+The first github pull reads the 200 most recently updated merged pull
+requests. Run `wardwell tracker pull --project <domain>/<project> --full` once
+for the whole history.
 
 The hooks and the pull service name the path you ran `wardwell` from, such as
 `/opt/homebrew/bin/wardwell`, never the versioned Cellar path behind it, so
