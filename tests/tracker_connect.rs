@@ -15,6 +15,7 @@ fn connect_github_stores_the_token_privately_and_never_echoes_it() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_wardwell"))
         .args(["tracker", "connect", "github", "--token-stdin"])
         .env_clear()
+        .env("WARDWELL_GH_CANDIDATES", "")
         .env("HOME", &home)
         .env("WARDWELL_CONFIG_DIR", &cfg)
         .stdin(Stdio::piped())

@@ -41,6 +41,7 @@ fn a_staging_failure_prints_no_outcome_before_nothing_was_written() {
         .env("HOME", &home)
         .env("WARDWELL_CONFIG_DIR", &cfg)
         .env("PATH", &stub)
+        .env("WARDWELL_GH_CANDIDATES", "")
         .output()
         .unwrap();
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -79,6 +80,7 @@ fn a_github_binding_without_gh_or_a_token_sets_up_and_doctor_names_the_connect_c
             .env("HOME", &home)
             .env("WARDWELL_CONFIG_DIR", &cfg)
             .env("PATH", &stub)
+            .env("WARDWELL_GH_CANDIDATES", "")
             .output()
             .unwrap()
     };
@@ -89,12 +91,21 @@ fn a_github_binding_without_gh_or_a_token_sets_up_and_doctor_names_the_connect_c
 
     let doctor = run(&["doctor"]);
     let text = format!("{}{}", String::from_utf8_lossy(&doctor.stdout), String::from_utf8_lossy(&doctor.stderr));
-    // Doctor also looks at the fixed Homebrew paths, which a test cannot
-    // empty; on a host with gh there, the row says gh was found.
-    let host_gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].iter().any(|p| Path::new(p).is_file());
-    let expected = match host_gh {
-        true => "Tracker work/claims github             \u{2713} gh found or a token stored",
-        false => "github: unreachable, run `wardwell tracker connect github`",
-    };
-    assert!(text.contains(expected), "{text}");
+    assert!(text.contains("github: unreachable, run `wardwell tracker connect github`"), "{text}");
+
+    // A gh at a fixed candidate path is found though PATH lacks it.
+    let candidate = root.join("homebrew/gh");
+    std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    script(&candidate, "#!/bin/sh\nexit 1\n");
+    let doctor = Command::new(env!("CARGO_BIN_EXE_wardwell"))
+        .arg("doctor")
+        .env_clear()
+        .env("HOME", &home)
+        .env("WARDWELL_CONFIG_DIR", &cfg)
+        .env("PATH", &stub)
+        .env("WARDWELL_GH_CANDIDATES", &candidate)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&doctor.stdout).to_string();
+    assert!(text.contains("Tracker work/claims github             \u{2713} gh found or a token stored"), "{text}");
 }

@@ -289,9 +289,23 @@ pub fn locate_gh(path: Option<&std::ffi::OsStr>, candidates: &[std::path::PathBu
     on_path.chain(candidates.iter().cloned()).find(|file| is_executable(file))
 }
 
-/// `locate_gh` with this process's PATH and `GH_CANDIDATES`.
+/// The variable that, when set, replaces `GH_CANDIDATES` with a
+/// colon-separated list; an empty value means no fixed candidates. Tests
+/// set it so no result depends on what the host has installed.
+pub const GH_CANDIDATES_VARIABLE: &str = "WARDWELL_GH_CANDIDATES";
+
+/// The fixed candidates: `GH_CANDIDATES`, or the paths in `value`, the
+/// variable's value, when it is set.
+pub fn candidates_from(value: Option<&std::ffi::OsStr>) -> Vec<std::path::PathBuf> {
+    match value {
+        None => GH_CANDIDATES.iter().map(std::path::PathBuf::from).collect(),
+        Some(value) => std::env::split_paths(value).filter(|p| !p.as_os_str().is_empty()).collect(),
+    }
+}
+
+/// `locate_gh` with this process's PATH and fixed candidates.
 pub fn find_gh() -> Option<std::path::PathBuf> {
-    let candidates: Vec<std::path::PathBuf> = GH_CANDIDATES.iter().map(std::path::PathBuf::from).collect();
+    let candidates = candidates_from(std::env::var_os(GH_CANDIDATES_VARIABLE).as_deref());
     locate_gh(std::env::var_os("PATH").as_deref(), &candidates)
 }
 
@@ -991,6 +1005,18 @@ pub(crate) mod tests {
             assert_eq!(runner.run(&[]), GhOutcome::TimedOut(timeout), "{body}");
             assert!(started.elapsed() < timeout + Duration::from_millis(1500), "{body}: {:?}", started.elapsed());
         }
+    }
+
+    #[test]
+    fn fixed_candidates_come_from_the_environment_when_it_is_set() {
+        let defaults: Vec<std::path::PathBuf> = GH_CANDIDATES.iter().map(std::path::PathBuf::from).collect();
+        assert_eq!(candidates_from(None), defaults);
+        assert!(candidates_from(Some(std::ffi::OsStr::new(""))).is_empty(), "empty means no fixed candidates");
+        assert_eq!(
+            candidates_from(Some(std::ffi::OsStr::new("/stub/a/gh:/stub/b/gh"))),
+            vec![std::path::PathBuf::from("/stub/a/gh"), std::path::PathBuf::from("/stub/b/gh")]
+        );
+        assert_eq!(GH_CANDIDATES_VARIABLE, "WARDWELL_GH_CANDIDATES");
     }
 
     #[cfg(unix)]

@@ -717,7 +717,8 @@ the provider. It checks only the credential file and the provider, with no
 network call, and names `wardwell tracker doctor` for the live check. For a
 github binding it checks for a stored token or a `gh`. It looks for `gh` on
 PATH, then at `/opt/homebrew/bin/gh`, then at `/usr/local/bin/gh`, without
-running it. With neither, the row reads: "github: unreachable,
+running it. When `WARDWELL_GH_CANDIDATES` is set, its colon-separated paths
+replace those two fixed paths, and an empty value means none. With neither, the row reads: "github: unreachable,
 run `wardwell tracker connect github`".
 
 ```sh
