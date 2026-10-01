@@ -442,6 +442,22 @@ mod tests {
     }
 
     #[test]
+    fn times_stamped_in_the_future_count_as_old() {
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(180));
+        record(&s, "linear", Record::Failed(FailureCode::Provider), ago(-180));
+        assert_eq!(run(&s, &Fake::new(), true, true), Outcome::Started, "a failure 3 hours ahead does not hold");
+        state::release(&state::claim_path(&s.config_dir, "work", "claims"));
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(180));
+        record(&s, "linear", Record::Started(4242), ago(-10));
+        assert_eq!(run(&s, &Fake::new(), true, true), Outcome::Started, "a start 10 minutes ahead is neither running nor cooling");
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(-180));
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Started, "a completion 3 hours ahead is not fresh");
+    }
+
+    #[test]
     fn a_binding_that_cannot_pull_is_not_started() {
         let s = setup(false);
         let fake = Fake::new();

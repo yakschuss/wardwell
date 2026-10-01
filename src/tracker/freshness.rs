@@ -86,7 +86,7 @@ impl Freshness {
 pub fn assess(view: &MirrorView, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool) -> Freshness {
     let age = view.last_pull_at.map(|at| now - at);
     let reason = match view.last_attempt {
-        Some(Attempt::Started { at, pid }) if now - at < running_at_most() && alive(pid) => {
+        Some(Attempt::Started { at, pid }) if is_recent(now - at, running_at_most()) && alive(pid) => {
             return Freshness { age, state: State::Running(at), unfinished: None };
         }
         Some(Attempt::Started { at, .. }) => Reason::Unfinished(at),
@@ -97,11 +97,17 @@ pub fn assess(view: &MirrorView, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool
         Reason::Unfinished(at) => Some(at),
         _ => None,
     };
-    let state = match age.is_some_and(|age| age < FRESH_FOR) {
+    let state = match age.is_some_and(|age| is_recent(age, FRESH_FOR)) {
         true => State::Fresh,
         false => State::Stale(reason),
     };
     Freshness { age, state, unfinished }
+}
+
+/// An age at least zero and under `limit`. A negative age, from a time
+/// stamped in the future, counts as old.
+fn is_recent(age: TimeDelta, limit: TimeDelta) -> bool {
+    age >= TimeDelta::zero() && age < limit
 }
 
 /// Whether a process with id `pid` exists. A signal-0 probe: it sends
@@ -205,6 +211,17 @@ mod tests {
     fn a_start_older_than_the_deadline_is_never_running() {
         let old = assess(&view(Some(5), started(21)), now(), ALIVE);
         assert_eq!(old.state, State::Stale(Reason::Unfinished(now() - TimeDelta::minutes(21))));
+    }
+
+    #[test]
+    fn a_time_stamped_in_the_future_counts_as_old() {
+        let ahead = MirrorView { last_pull_at: Some(now() + TimeDelta::hours(3)), ..Default::default() };
+        assert_eq!(assess(&ahead, now(), GONE).state, State::Stale(Reason::NotTried), "a completed pull 3 hours ahead is not fresh");
+        let failed_ahead = Some(Attempt::Failed { at: now() + TimeDelta::hours(3), code: FailureCode::Provider });
+        assert_eq!(assess(&view(Some(5), failed_ahead), now(), GONE).state, State::Stale(Reason::Failed(FailureCode::Provider)));
+        let started_ahead = Some(Attempt::Started { at: now() + TimeDelta::minutes(10), pid: 4242 });
+        let fresh = assess(&view(Some(5), started_ahead), now(), ALIVE);
+        assert_eq!(fresh.state, State::Stale(Reason::Unfinished(now() + TimeDelta::minutes(10))), "a start 10 minutes ahead is not running");
     }
 
     #[test]
