@@ -515,3 +515,59 @@ fn a_write_to_a_mirrored_key_is_refused_and_writes_nothing() {
         }
     }
 }
+
+#[test]
+fn get_returns_removed_and_archived_issues_with_their_flags() {
+    let now = chrono::Utc::now();
+    let hour = chrono::TimeDelta::hours(1);
+    let mut archived = snapshot("COR-20", "Archived", "Done", StateCategory::Completed, now - hour * 3);
+    if let Event::IssueUpserted { issue, .. } = &mut archived {
+        issue.archived_at = Some(now - hour * 3);
+    }
+    let events = vec![
+        archived,
+        snapshot("COR-21", "Gone", "Todo", StateCategory::Unstarted, now - hour * 4),
+        Event::IssueRemoved { common: common("wardwell:issue_removed:COR-21", "COR-21", now - hour * 2) },
+        pulled(now - hour),
+    ];
+    let (f, calls) = refresh_fixture_over(&events, vec![], None);
+    let archived = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-20"}));
+    assert!(archived["item"]["archived_at"].is_string(), "{archived}");
+    assert_eq!(archived["refreshed"], false);
+    let removed = kanban(&f.server, json!({"action": "get", "ticket_id": "cor-21"}));
+    assert!(removed["item"]["removed_at"].is_string(), "{removed}");
+    assert_eq!(removed["item"]["ticket_id"], "COR-21");
+    assert!(calls.lock().unwrap().is_empty(), "a hit never refreshes");
+    let listed = kanban(&f.server, json!({"action": "list", "project": "claims", "include_done": true}));
+    assert!(!keys(&listed).iter().any(|k| k == "COR-20" || k == "COR-21"), "{listed}");
+}
+
+#[test]
+fn a_domain_scoped_session_sees_no_mirror_outside_its_domains() {
+    let (mut f, calls) = refresh_fixture(vec![], None);
+    f.server.allowed_domains = vec!["personal".into()];
+    let listed = kanban(&f.server, json!({"action": "list"}));
+    assert!(origins(&listed).iter().all(|o| o == "kanban"), "{listed}");
+    let searched = kanban(&f.server, json!({"action": "search", "query": "payer"}));
+    assert!(keys(&searched).is_empty(), "{searched}");
+    let queried = kanban(&f.server, json!({"action": "query", "question": "recent"}));
+    assert!(origins(&queried).iter().all(|o| o == "kanban"), "{queried}");
+    let got = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-12"}));
+    assert!(got.get("item").is_none(), "{got}");
+    assert_eq!(got["refresh_reason"], "no_binding");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn get_while_the_project_lock_is_held_fails_fast_with_lock_busy() {
+    let (f, calls) = refresh_fixture(vec![], None);
+    let path = crate::tracker::log::path_for(&f.server.vault_root, "work", "claims");
+    let _held = crate::tracker::lock::acquire(&path, std::time::Duration::ZERO).unwrap();
+    let started = std::time::Instant::now();
+    let response = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-77"}));
+    assert_eq!(response["refreshed"], false, "{response}");
+    assert_eq!(response["refresh_reason"], "pull_failed:lock_busy");
+    assert!(response["error"].is_string());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "waited {:?}", started.elapsed());
+    assert!(calls.lock().unwrap().is_empty(), "the adapter is never asked while the lock is held");
+}
