@@ -320,7 +320,7 @@ fn expire_pull(only: Option<String>) {
     std::thread::spawn(move || {
         let marked = wardwell::config::loader::load(None).map(|config| {
             let bindings: Vec<_> = config.trackers.iter().filter(|b| only.as_deref().is_none_or(|key| b.key() == key)).cloned().collect();
-            record_timeouts(&config.vault_path, &bindings, pid, chrono::Utc::now())
+            record_timeouts(&config.vault_path, &wardwell::config::loader::config_dir(), &bindings, pid, chrono::Utc::now())
         });
         let _ = done.send(marked);
     });

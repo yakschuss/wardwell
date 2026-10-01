@@ -219,6 +219,26 @@ fn restored(event: &Event, summary: &LogSummary) -> Option<Event> {
     Some(restored)
 }
 
+/// Append one marker without reading the log: a line that starts on a
+/// fresh line, so a torn tail cannot swallow it, and the header first when
+/// the file is new. Readers skip the blank line this may leave.
+pub fn append_marker(path: &Path, event: &Event) -> Result<(), String> {
+    use std::io::Write;
+    let failed = || format!("could not append to {}", path.display());
+    let (light, _) = split_raw(event.clone());
+    let line = serde_json::to_string(&light).map_err(|_| failed())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| failed())?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|_| failed())?;
+    let new = file.metadata().map(|m| m.len() == 0).unwrap_or(false);
+    let text = match new {
+        true => format!("{SCHEMA_HEADER}\n{line}\n"),
+        false => format!("\n{line}\n"),
+    };
+    file.write_all(text.as_bytes()).map_err(|_| failed())
+}
+
 /// The event without its raw payload, and the payload.
 pub fn split_raw(mut event: Event) -> (Event, Value) {
     let raw = std::mem::take(&mut common_mut(&mut event).raw);

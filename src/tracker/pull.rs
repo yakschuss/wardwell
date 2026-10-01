@@ -12,7 +12,7 @@ use crate::tracker::credential::{self, Credential};
 use crate::tracker::events::{Common, Event, FailureCode};
 use crate::tracker::github::{GhRunner, GitHub, HttpRest, Rest, SystemGh};
 use crate::tracker::linear::{HttpTransport, Linear};
-use crate::tracker::{GITHUB, lock, log, provider_label};
+use crate::tracker::{GITHUB, lock, log, provider_label, state};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::HashSet;
 use std::path::Path;
@@ -162,7 +162,9 @@ impl std::fmt::Display for PullError {
 }
 
 /// Load the binding's credential, then pull. A missing or unreadable
-/// credential fails before the log is read or written.
+/// credential fails before the log is read or written. The local refresh
+/// state in `config_dir` records the start, the completion, and any failure
+/// but a held lock.
 pub fn pull_binding(
     vault_root: &Path,
     config_dir: &Path,
@@ -170,6 +172,25 @@ pub fn pull_binding(
     mode: Mode,
     now: DateTime<Utc>,
     connect: &Connect<'_>,
+) -> Result<PullOutcome, PullError> {
+    let state = state::path(config_dir, &binding.domain, &binding.project);
+    let result = pull_binding_recorded(vault_root, config_dir, binding, mode, now, connect, &state);
+    if let Err(error) = &result
+        && error.code != FailureCode::LockBusy
+    {
+        let _ = state::record(&state, &binding.provider, state::Record::Failed(error.code), Utc::now());
+    }
+    result
+}
+
+fn pull_binding_recorded(
+    vault_root: &Path,
+    config_dir: &Path,
+    binding: &TrackerBinding,
+    mode: Mode,
+    now: DateTime<Utc>,
+    connect: &Connect<'_>,
+    state: &Path,
 ) -> Result<PullOutcome, PullError> {
     let wait = lock::DEFAULT_WAIT;
     let credential = load_credential(config_dir, binding)?;
@@ -180,9 +201,9 @@ pub fn pull_binding(
         _ => None,
     };
     let Some(due) = resync_due else {
-        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, wait);
+        return pull_recorded(vault_root, binding, adapter.as_ref(), mode, now, wait, Some(state));
     };
-    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, wait);
+    let pull = |mode| pull_recorded(vault_root, binding, adapter.as_ref(), mode, now, wait, Some(state));
     match pull(Mode::AutomaticFull) {
         Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), ..outcome }),
         // A failed automatic full must not stop the mirror moving.
@@ -226,9 +247,22 @@ pub fn pull_project_waiting(
     now: DateTime<Utc>,
     wait: Duration,
 ) -> Result<PullOutcome, PullError> {
+    pull_recorded(vault_root, binding, adapter, mode, now, wait, None)
+}
+
+/// `pull_project_waiting`, recording into the refresh state file `state` when given.
+fn pull_recorded(
+    vault_root: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    mode: Mode,
+    now: DateTime<Utc>,
+    wait: Duration,
+    state: Option<&Path>,
+) -> Result<PullOutcome, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     let lock = acquire_lock(&path, wait)?;
-    pull_held(&path, binding, adapter, mode, now, &lock)
+    pull_held(&path, binding, adapter, mode, now, &lock, state)
 }
 
 /// Take the project lock beside `log_path`, failing with `lock_busy` after `wait`.
@@ -256,12 +290,14 @@ pub fn pull_binding_held(
     let credential = load_credential(config_dir, binding)?;
     let adapter = connect(binding, credential.as_ref()).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock)
+    let state = state::path(config_dir, &binding.domain, &binding.project);
+    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock, Some(&state))
 }
 
-/// The pull itself, under `_lock`: a pull_started marker with this
-/// process's id before the first provider call, then the pull. A failure
-/// appends a pull_failed marker (best effort) before it returns.
+/// The pull itself, under `_lock`: the start in the refresh state `state`
+/// and a pull_started marker with this process's id before the first
+/// provider call, then the pull. A failure appends a pull_failed marker
+/// (best effort) and records it in the state before it returns.
 fn pull_held(
     path: &Path,
     binding: &TrackerBinding,
@@ -269,14 +305,29 @@ fn pull_held(
     mode: Mode,
     now: DateTime<Utc>,
     _lock: &lock::ProjectLock,
+    state: Option<&Path>,
 ) -> Result<PullOutcome, PullError> {
-    let mut summary = log::read_for(path, &binding.provider).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
-    let started = pull_started(binding, now, std::process::id(), mode == Mode::AutomaticFull);
-    let result = log::append_new(path, &[started], &mut summary)
-        .map_err(|message| PullError::new(FailureCode::LogWrite, message))
-        .and_then(|_| pull_locked(path, binding, adapter, mode, now, &mut summary));
-    if let Err(error) = &result {
-        let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
+    let record = |record| {
+        if let Some(state) = state {
+            let _ = state::record(state, &binding.provider, record, Utc::now());
+        }
+    };
+    record(state::Record::Started(std::process::id()));
+    let result = log::read_for(path, &binding.provider)
+        .map_err(|message| PullError::new(FailureCode::LogRead, message))
+        .and_then(|mut summary| {
+            let started = pull_started(binding, now, std::process::id(), mode == Mode::AutomaticFull);
+            let result = log::append_new(path, &[started], &mut summary)
+                .map_err(|message| PullError::new(FailureCode::LogWrite, message))
+                .and_then(|_| pull_locked(path, binding, adapter, mode, now, &mut summary));
+            if let Err(error) = &result {
+                let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
+            }
+            result
+        });
+    match &result {
+        Ok(_) => record(state::Record::Completed),
+        Err(error) => record(state::Record::Failed(error.code)),
     }
     result
 }

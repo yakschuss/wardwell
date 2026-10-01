@@ -8,7 +8,7 @@
 use crate::config::loader::TrackerBinding;
 use crate::tracker::events::FailureCode;
 use crate::tracker::view::{Attempt, MirrorView};
-use crate::tracker::{log, pull};
+use crate::tracker::{log, pull, state};
 use chrono::{DateTime, Utc};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -41,23 +41,33 @@ pub fn arm(after: Duration, on_expiry: impl FnOnce() + Send + 'static) -> Watchd
     Watchdog { _cancel: cancel }
 }
 
-/// Append a `timeout` pull_failed marker for each of `bindings` whose newest
-/// attempt is a pull this process (`pid`) started. Returns the keys of the
-/// bindings marked. A binding whose log cannot be read or written is skipped.
-pub fn record_timeouts(vault_root: &Path, bindings: &[TrackerBinding], pid: u32, now: DateTime<Utc>) -> Vec<String> {
+/// Record `timeout` for each of `bindings` whose open start, in the local
+/// refresh state under `config_dir` or in the log, is this process (`pid`).
+/// The state is written first, for every such binding, since it lives
+/// outside the vault; then a pull_failed marker goes to each log that can
+/// be written. Returns the keys of the bindings recorded.
+pub fn record_timeouts(vault_root: &Path, config_dir: &Path, bindings: &[TrackerBinding], pid: u32, now: DateTime<Utc>) -> Vec<String> {
+    let in_state: Vec<bool> = bindings.iter().map(|binding| {
+        let path = state::path(config_dir, &binding.domain, &binding.project);
+        let ours = state::provider(&path, &binding.provider).and_then(|s| s.open_start()).is_some_and(|(_, started)| started == Some(pid));
+        ours && state::record(&path, &binding.provider, state::Record::Failed(FailureCode::Timeout), now).is_ok()
+    }).collect();
     bindings
         .iter()
-        .filter(|binding| ours(vault_root, binding, pid))
-        .filter(|binding| {
-            let path = log::path_for(vault_root, &binding.domain, &binding.project);
-            let marker = pull::pull_failed(binding, now, FailureCode::Timeout, false);
-            log::read_for(&path, &binding.provider).and_then(|mut summary| log::append_new(&path, &[marker], &mut summary)).is_ok()
+        .zip(in_state)
+        .filter(|(binding, recorded)| {
+            let marked = ours_in_log(vault_root, binding, pid) && {
+                let path = log::path_for(vault_root, &binding.domain, &binding.project);
+                let marker = pull::pull_failed(binding, now, FailureCode::Timeout, false);
+                log::read_for(&path, &binding.provider).and_then(|mut summary| log::append_new(&path, &[marker], &mut summary)).is_ok()
+            };
+            *recorded || marked
         })
-        .map(|binding| format!("{} {}", binding.key(), binding.provider))
+        .map(|(binding, _)| format!("{} {}", binding.key(), binding.provider))
         .collect()
 }
 
-fn ours(vault_root: &Path, binding: &TrackerBinding, pid: u32) -> bool {
+fn ours_in_log(vault_root: &Path, binding: &TrackerBinding, pid: u32) -> bool {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     let view = MirrorView::read_for(&path, &binding.provider).unwrap_or_default();
     matches!(view.last_attempt, Some(Attempt::Started { pid: started, .. }) if started == pid)
@@ -126,12 +136,26 @@ mod tests {
         write(vault.path(), "other", &[started(7)]);
         write(vault.path(), "done", &[started(4242), COMPLETED.to_string()]);
         let bindings = [binding("mine"), binding("other"), binding("done"), binding("absent")];
-        let marked = record_timeouts(vault.path(), &bindings, 4242, now());
+        let marked = record_timeouts(vault.path(), &vault.path().join("cfg"), &bindings, 4242, now());
         assert_eq!(marked, vec!["work/mine linear"]);
         let view = MirrorView::read_for(&log::path_for(vault.path(), "work", "mine"), "linear").unwrap();
         assert_eq!(view.last_attempt, Some(Attempt::Failed { at: now(), code: FailureCode::Timeout }));
         assert!(!log::path_for(vault.path(), "work", "absent").exists(), "no log is created");
-        assert!(record_timeouts(vault.path(), &bindings, 4242, now()).is_empty(), "once marked, done");
+        assert!(record_timeouts(vault.path(), &vault.path().join("cfg"), &bindings, 4242, now()).is_empty(), "once marked, done");
+    }
+
+    #[test]
+    fn the_local_state_records_the_timeout_even_when_the_vault_cannot_be_written() {
+        let root = tempfile::tempdir().unwrap();
+        let config_dir = root.path().join("cfg");
+        let vault = root.path().join("vault");
+        let state_path = state::path(&config_dir, "work", "mine");
+        state::record(&state_path, "linear", state::Record::Started(4242), now() - chrono::TimeDelta::minutes(15)).unwrap();
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("work"), "a file where the domain folder should be").unwrap();
+        let marked = record_timeouts(&vault, &config_dir, &[binding("mine")], 4242, now());
+        assert_eq!(marked, vec!["work/mine linear"]);
+        assert_eq!(state::provider(&state_path, "linear").unwrap().open_failure(), Some((now(), FailureCode::Timeout)));
     }
 
     #[test]

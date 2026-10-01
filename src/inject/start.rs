@@ -132,16 +132,10 @@ mod tests {
 
     #[test]
     fn the_refresh_line_prints_once_for_repeated_session_starts() {
-        struct WritesStart(std::path::PathBuf);
+        struct WritesStart(std::path::PathBuf, DateTime<Utc>);
         impl crate::tracker::trigger::Spawner for WritesStart {
             fn spawn(&self, _: &str) -> Result<(), String> {
-                let row = format!(
-                    "{{\"kind\":\"pull_started\",\"id\":\"s\",\"provider\":\"linear\",\"external_key\":\"COR\",\"external_id\":\"COR\",\"occurred_at\":\"2026-09-30T13:01:00Z\",\"title\":\"s\",\"pid\":{}}}\n",
-                    std::process::id()
-                );
-                let body = std::fs::read_to_string(&self.0).unwrap();
-                std::fs::write(&self.0, body + &row).unwrap();
-                Ok(())
+                crate::tracker::state::record(&self.0, "linear", crate::tracker::state::Record::Started(std::process::id()), self.1)
             }
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -149,10 +143,11 @@ mod tests {
         repo(&code);
         let config = setup(tmp.path(), &code, true);
         let later = now() + chrono::TimeDelta::hours(1) + chrono::TimeDelta::minutes(1);
-        let spawner = WritesStart(tmp.path().join("vault/personal/corr-platform/tracker.jsonl"));
+        let spawner = WritesStart(crate::tracker::state::path(tmp.path(), "personal", "corr-platform"), later);
+        let places = crate::tracker::trigger::Places { config: &config, config_dir: tmp.path() };
         let probes = crate::tracker::trigger::Probes { alive: &crate::tracker::freshness::process_alive, can_pull: &|_| true };
         let refresh = |domain: &str, project: &str| {
-            crate::tracker::trigger::refresh(&config, domain, project, later, &spawner, &probes) == crate::tracker::trigger::Outcome::Started
+            crate::tracker::trigger::refresh(&places, domain, project, later, &spawner, &probes) == crate::tracker::trigger::Outcome::Started
         };
         let first = output(&code, &config, tmp.path(), crate::inject::git::dirs, later, today(), &refresh);
         let second = output(&code, &config, tmp.path(), crate::inject::git::dirs, later, today(), &refresh);

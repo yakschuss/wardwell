@@ -1,19 +1,20 @@
 //! Starts a detached `tracker pull` for one project when its mirror is due:
 //! the last completed pull of any binding is older than an hour, no pull of
 //! the project is running, and the 60 second cooldown allows. Session start
-//! and the running server both call `refresh`. It reads the markers and
-//! returns at once; the pull runs in its own process.
+//! and the running server both call `refresh`. It decides from the local
+//! refresh state file alone and returns at once; the pull runs in its own
+//! process.
 //!
-//! Does NOT pull, open the network, take the project lock, or wait on the
-//! pull it starts.
+//! Does NOT read the vault, parse the tracker log, pull, open the network,
+//! take the project lock, or wait on the pull it starts.
 
 use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::events::FailureCode;
-use crate::tracker::freshness::{self, State};
+use crate::tracker::freshness;
 use crate::tracker::refresh::COOLDOWN;
-use crate::tracker::view::MirrorView;
-use crate::tracker::{log, pull};
+use crate::tracker::state::{self, ProviderState};
 use chrono::{DateTime, TimeDelta, Utc};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// A binding whose last completed pull is older than this is due.
@@ -39,11 +40,11 @@ pub enum Outcome {
     NotDue,
     /// A pull of the project is running in a live process.
     Running,
-    /// A pull marker of the project is younger than the cooldown.
+    /// A start, completion or failure is younger than the cooldown.
     Cooldown,
     /// Every due binding fails the offline check, so a pull cannot run.
     Blocked,
-    /// The pull could not start; a `spawn` pull_failed marker records it.
+    /// The pull could not start; the state and a `spawn` marker record it.
     SpawnFailed,
 }
 
@@ -55,24 +56,34 @@ pub struct Probes<'a> {
     pub can_pull: &'a dyn Fn(&TrackerBinding) -> bool,
 }
 
+/// Where `refresh` reads and writes outside the vault.
+pub struct Places<'a> {
+    pub config: &'a WardwellConfig,
+    pub config_dir: &'a Path,
+}
+
 /// Start a detached pull of `<domain>/<project>` through `spawner` when it
-/// is due. Reads only the project's tracker log. A spawn error is written
-/// as a pull_failed marker with the code `spawn` for each due binding.
-pub fn refresh(config: &WardwellConfig, domain: &str, project: &str, now: DateTime<Utc>, spawner: &dyn Spawner, probes: &Probes<'_>) -> Outcome {
-    let bindings = config.bindings_for(domain, project);
+/// is due, deciding from the refresh state file alone. A missing or
+/// unreadable state file makes every binding due. A spawn error is
+/// recorded as a `spawn` failure in the state and in the log.
+pub fn refresh(places: &Places<'_>, domain: &str, project: &str, now: DateTime<Utc>, spawner: &dyn Spawner, probes: &Probes<'_>) -> Outcome {
+    let bindings = places.config.bindings_for(domain, project);
     if bindings.is_empty() {
         return Outcome::NoBinding;
     }
-    let path = log::path_for(&config.vault_path, domain, project);
-    let views: Vec<(&TrackerBinding, MirrorView)> =
-        bindings.into_iter().map(|b| (b, MirrorView::read_for(&path, &b.provider).unwrap_or_default())).collect();
-    if views.iter().any(|(_, view)| matches!(freshness::assess(view, now, probes.alive).state, State::Running(_))) {
+    let state_path = state::path(places.config_dir, domain, project);
+    let states: BTreeMap<String, ProviderState> = match state::read(&state_path) {
+        state::Read::Found(found) => found.providers,
+        state::Read::Missing | state::Read::Unreadable => BTreeMap::new(),
+    };
+    let of = |binding: &TrackerBinding| states.get(&binding.provider).cloned().unwrap_or_default();
+    if bindings.iter().any(|b| running(&of(b), now, probes.alive)) {
         return Outcome::Running;
     }
-    if views.iter().any(|(_, view)| cooling(view, now)) {
+    if bindings.iter().any(|b| cooling(&of(b), now)) {
         return Outcome::Cooldown;
     }
-    let due: Vec<&TrackerBinding> = views.iter().filter(|(_, view)| is_due(view, now)).map(|(b, _)| *b).collect();
+    let due: Vec<&TrackerBinding> = bindings.iter().copied().filter(|b| is_due(&of(b), now)).collect();
     let pullable: Vec<&TrackerBinding> = due.iter().copied().filter(|b| (probes.can_pull)(b)).collect();
     match (due.is_empty(), pullable.is_empty()) {
         (true, _) => return Outcome::NotDue,
@@ -82,7 +93,7 @@ pub fn refresh(config: &WardwellConfig, domain: &str, project: &str, now: DateTi
     match spawner.spawn(&format!("{domain}/{project}")) {
         Ok(()) => Outcome::Started,
         Err(_) => {
-            record_spawn_failure(&path, &pullable, now);
+            record_spawn_failure(places, &state_path, &pullable, now);
             Outcome::SpawnFailed
         }
     }
@@ -94,7 +105,8 @@ pub fn refresh(config: &WardwellConfig, domain: &str, project: &str, now: DateTi
 pub fn refresh_detached(config: &WardwellConfig, config_dir: &Path, domain: &str, project: &str, now: DateTime<Utc>) -> Outcome {
     let spawner = DetachedPull::this_binary(config_dir);
     let can_pull = |binding: &TrackerBinding| crate::tracker::doctor::check_offline(config_dir, binding).is_ok();
-    refresh(config, domain, project, now, &spawner, &Probes { alive: &freshness::process_alive, can_pull: &can_pull })
+    let places = Places { config, config_dir };
+    refresh(&places, domain, project, now, &spawner, &Probes { alive: &freshness::process_alive, can_pull: &can_pull })
 }
 
 /// How often the running server asks each bound project for a refresh.
@@ -131,23 +143,38 @@ pub async fn every(period: std::time::Duration, mut task: impl FnMut()) {
     }
 }
 
-/// The last completed pull is older than `REFRESH_AFTER`, or none exists.
-fn is_due(view: &MirrorView, now: DateTime<Utc>) -> bool {
-    view.last_pull_at.is_none_or(|at| now - at > REFRESH_AFTER)
+/// The time since `at`, or None when `at` is in the future: a future stamp
+/// counts as old.
+fn age(at: DateTime<Utc>, now: DateTime<Utc>) -> Option<TimeDelta> {
+    let age = now - at;
+    (age >= TimeDelta::zero()).then_some(age)
 }
 
-/// The newest completed, failed or started marker is younger than `COOLDOWN`.
-fn cooling(view: &MirrorView, now: DateTime<Utc>) -> bool {
-    let newest = [view.last_pull_at, view.last_failure.map(|(at, _)| at), view.last_started.map(|(at, _)| at)].into_iter().flatten().max();
+/// A pull started after the last completion and failure, in a live process,
+/// younger than the deadline allows.
+fn running(state: &ProviderState, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool) -> bool {
+    state.open_start().is_some_and(|(at, pid)| {
+        age(at, now).is_some_and(|age| age < freshness::running_at_most()) && pid.is_some_and(alive)
+    })
+}
+
+/// The newest start, completion or failure is younger than `COOLDOWN`.
+fn cooling(state: &ProviderState, now: DateTime<Utc>) -> bool {
     let cooldown = TimeDelta::from_std(COOLDOWN).unwrap_or(TimeDelta::seconds(60));
-    newest.is_some_and(|at| now - at < cooldown)
+    [state.started_at, state.completed_at, state.failed_at].into_iter().flatten().filter_map(|at| age(at, now)).any(|age| age < cooldown)
 }
 
-/// Best effort: a `spawn` pull_failed marker for each binding.
-fn record_spawn_failure(path: &Path, bindings: &[&TrackerBinding], now: DateTime<Utc>) {
+/// The last completed pull is older than `REFRESH_AFTER`, in the future, or absent.
+fn is_due(state: &ProviderState, now: DateTime<Utc>) -> bool {
+    state.completed_at.and_then(|at| age(at, now)).is_none_or(|age| age > REFRESH_AFTER)
+}
+
+/// Best effort: a `spawn` failure in the state and a marker in the log for each binding.
+fn record_spawn_failure(places: &Places<'_>, state_path: &Path, bindings: &[&TrackerBinding], now: DateTime<Utc>) {
     for binding in bindings {
-        let marker = pull::pull_failed(binding, now, FailureCode::Spawn, false);
-        let _ = log::read_for(path, &binding.provider).and_then(|mut summary| log::append_new(path, &[marker], &mut summary));
+        let _ = state::record(state_path, &binding.provider, state::Record::Failed(FailureCode::Spawn), now);
+        let log = crate::tracker::log::path_for(&places.config.vault_path, &binding.domain, &binding.project);
+        let _ = crate::tracker::log::append_marker(&log, &crate::tracker::pull::pull_failed(binding, now, FailureCode::Spawn, false));
     }
 }
 
@@ -219,30 +246,29 @@ fn new_session(command: &mut std::process::Command) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::tracker::state::Record;
     use chrono::TimeZone;
     use std::cell::RefCell;
 
     /// Records each project it is asked to start, fails when told to, and
-    /// can write the pull_started marker the real child would write.
+    /// can record the start the real child would record.
     struct Fake {
         started: RefCell<Vec<String>>,
         fail: bool,
-        writes_start: Option<(PathBuf, u32)>,
+        records_start: Option<(PathBuf, u32)>,
     }
 
     impl Fake {
         fn new() -> Self {
-            Fake { started: RefCell::new(Vec::new()), fail: false, writes_start: None }
+            Fake { started: RefCell::new(Vec::new()), fail: false, records_start: None }
         }
     }
 
     impl Spawner for Fake {
         fn spawn(&self, project: &str) -> Result<(), String> {
             self.started.borrow_mut().push(project.to_string());
-            if let Some((path, pid)) = &self.writes_start {
-                let row = started_row(now(), *pid, "linear");
-                let body = std::fs::read_to_string(path).unwrap_or_default();
-                std::fs::write(path, format!("{body}{row}\n")).unwrap();
+            if let Some((path, pid)) = &self.records_start {
+                state::record(path, "linear", Record::Started(*pid), now()).unwrap();
             }
             match self.fail {
                 true => Err("could not start /gone/wardwell".to_string()),
@@ -255,142 +281,154 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 10, 1, 9, 0, 0).unwrap()
     }
 
-    fn stamp(minutes_ago: i64) -> String {
-        freshness::stamp(now() - TimeDelta::minutes(minutes_ago))
+    fn ago(minutes: i64) -> DateTime<Utc> {
+        now() - TimeDelta::minutes(minutes)
     }
 
-    fn completed(minutes_ago: i64, provider: &str) -> String {
-        format!(r#"{{"kind":"pull_completed","id":"p{minutes_ago}{provider}","provider":"{provider}","external_key":"k","external_id":"k","occurred_at":"{}","title":"p"}}"#, stamp(minutes_ago))
+    struct Setup {
+        _dir: tempfile::TempDir,
+        config: WardwellConfig,
+        config_dir: PathBuf,
+        state: PathBuf,
     }
 
-    fn started_row(at: DateTime<Utc>, pid: u32, provider: &str) -> String {
-        format!(r#"{{"kind":"pull_started","id":"s{pid}{at}","provider":"{provider}","external_key":"k","external_id":"k","occurred_at":"{}","title":"s","pid":{pid}}}"#, freshness::stamp(at))
-    }
-
-    fn failed(minutes_ago: i64) -> String {
-        format!(r#"{{"kind":"pull_failed","id":"f{minutes_ago}","provider":"linear","external_key":"k","external_id":"k","occurred_at":"{}","title":"f","code":"provider"}}"#, stamp(minutes_ago))
-    }
-
-    /// A config binding work/claims to linear, and to github when `both`,
-    /// with `rows` in its log.
-    fn setup(both: bool, rows: &[String]) -> (tempfile::TempDir, WardwellConfig, PathBuf) {
+    /// A config binding work/claims to linear, and to github when `both`.
+    /// Its vault folder does not exist, so any vault read would find nothing.
+    fn setup(both: bool) -> Setup {
         let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().join("vault");
-        let path = log::path_for(&vault, "work", "claims");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        if !rows.is_empty() {
-            let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
-            std::fs::write(&path, format!("{}\n{body}", crate::tracker::events::SCHEMA_HEADER)).unwrap();
-        }
         let github = if both { "    - provider: github\n      repository: acme/app\n" } else { "" };
         let yaml = format!(
             "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: linear\n      team: COR\n      credential: c\n{github}",
-            vault.display()
+            dir.path().join("no-vault").display()
         );
-        (dir, crate::config::loader::parse(&yaml).unwrap(), path)
+        let config_dir = dir.path().join("cfg");
+        let state = state::path(&config_dir, "work", "claims");
+        Setup { config: crate::config::loader::parse(&yaml).unwrap(), config_dir, state, _dir: dir }
     }
 
-    fn run(config: &WardwellConfig, spawner: &Fake, alive: bool, can_pull: bool) -> Outcome {
+    fn record(setup: &Setup, provider: &str, record: Record, at: DateTime<Utc>) {
+        state::record(&setup.state, provider, record, at).unwrap();
+    }
+
+    fn run(setup: &Setup, spawner: &Fake, alive: bool, can_pull: bool) -> Outcome {
         let alive = move |_: u32| alive;
         let can_pull = move |_: &TrackerBinding| can_pull;
-        refresh(config, "work", "claims", now(), spawner, &Probes { alive: &alive, can_pull: &can_pull })
+        let places = Places { config: &setup.config, config_dir: &setup.config_dir };
+        refresh(&places, "work", "claims", now(), spawner, &Probes { alive: &alive, can_pull: &can_pull })
     }
 
     #[test]
     fn a_pull_older_than_an_hour_starts_one_detached_pull_for_the_project() {
-        let (_dir, config, _) = setup(false, &[completed(61, "linear")]);
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(61));
         let fake = Fake::new();
-        assert_eq!(run(&config, &fake, false, true), Outcome::Started);
+        assert_eq!(run(&s, &fake, false, true), Outcome::Started);
         assert_eq!(*fake.started.borrow(), vec!["work/claims"]);
     }
 
     #[test]
-    fn a_mirror_never_pulled_is_due() {
-        let (_dir, config, _) = setup(false, &[]);
-        let fake = Fake::new();
-        assert_eq!(run(&config, &fake, false, true), Outcome::Started);
+    fn a_missing_or_unreadable_state_file_is_due() {
+        let s = setup(false);
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Started);
+        std::fs::create_dir_all(s.state.parent().unwrap()).unwrap();
+        std::fs::write(&s.state, "{torn").unwrap();
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Started);
+    }
+
+    #[test]
+    fn the_trigger_never_reads_the_vault() {
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(10));
+        let log = crate::tracker::log::path_for(&s.config.vault_path, "work", "claims");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "not a log at all").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::NotDue, "decided from the state file alone");
     }
 
     #[test]
     fn a_pull_within_the_hour_is_not_due() {
-        let (_dir, config, _) = setup(false, &[completed(59, "linear")]);
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(59));
         let fake = Fake::new();
-        assert_eq!(run(&config, &fake, false, true), Outcome::NotDue);
+        assert_eq!(run(&s, &fake, false, true), Outcome::NotDue);
         assert!(fake.started.borrow().is_empty());
     }
 
     #[test]
     fn any_due_binding_starts_one_pull_for_the_whole_project() {
-        let (_dir, config, _) = setup(true, &[completed(10, "linear"), completed(120, "github")]);
+        let s = setup(true);
+        record(&s, "linear", Record::Completed, ago(10));
+        record(&s, "github", Record::Completed, ago(120));
         let fake = Fake::new();
-        assert_eq!(run(&config, &fake, false, true), Outcome::Started);
+        assert_eq!(run(&s, &fake, false, true), Outcome::Started);
         assert_eq!(fake.started.borrow().len(), 1);
     }
 
     #[test]
     fn a_live_pull_of_any_binding_stops_a_second_start() {
-        let (_dir, config, _) = setup(true, &[completed(120, "linear"), started_row(now() - TimeDelta::minutes(3), 4242, "github")]);
+        let s = setup(true);
+        record(&s, "linear", Record::Completed, ago(120));
+        record(&s, "github", Record::Started(4242), ago(3));
         let fake = Fake::new();
-        assert_eq!(run(&config, &fake, true, true), Outcome::Running);
+        assert_eq!(run(&s, &fake, true, true), Outcome::Running);
         assert!(fake.started.borrow().is_empty());
     }
 
     #[test]
     fn the_cooldown_covers_failures_and_starts() {
-        let (_dir, config, _) = setup(false, &[completed(120, "linear"), failed(0)]);
-        assert_eq!(run(&config, &Fake::new(), false, true), Outcome::Cooldown);
-        let (_dir, config, _) = setup(false, &[completed(120, "linear"), started_row(now() - TimeDelta::seconds(30), 4242, "linear")]);
-        assert_eq!(run(&config, &Fake::new(), false, true), Outcome::Cooldown, "a start whose process is gone still cools down");
-        let (_dir, config, _) = setup(false, &[completed(120, "linear"), started_row(now() - TimeDelta::minutes(2), 4242, "linear")]);
-        assert_eq!(run(&config, &Fake::new(), false, true), Outcome::Started, "an unfinished pull is retried after the cooldown");
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(120));
+        record(&s, "linear", Record::Started(4242), now() - TimeDelta::seconds(30));
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Cooldown, "a start whose process is gone still cools down");
+        record(&s, "linear", Record::Started(4242), ago(2));
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Started, "an unfinished pull is retried after the cooldown");
     }
 
     #[test]
     fn a_binding_that_cannot_pull_is_not_started() {
-        let (_dir, config, _) = setup(false, &[completed(120, "linear")]);
+        let s = setup(false);
         let fake = Fake::new();
-        assert_eq!(run(&config, &fake, false, false), Outcome::Blocked);
+        assert_eq!(run(&s, &fake, false, false), Outcome::Blocked);
         assert!(fake.started.borrow().is_empty());
     }
 
     #[test]
     fn no_binding_starts_nothing() {
-        let (_dir, config, _) = setup(false, &[]);
+        let s = setup(false);
         let fake = Fake::new();
         let alive = |_: u32| false;
         let can_pull = |_: &TrackerBinding| true;
-        let outcome = refresh(&config, "work", "ops", now(), &fake, &Probes { alive: &alive, can_pull: &can_pull });
-        assert_eq!(outcome, Outcome::NoBinding);
+        let places = Places { config: &s.config, config_dir: &s.config_dir };
+        assert_eq!(refresh(&places, "work", "ops", now(), &fake, &Probes { alive: &alive, can_pull: &can_pull }), Outcome::NoBinding);
         assert!(fake.started.borrow().is_empty());
     }
 
     #[test]
-    fn a_spawn_error_is_a_spawn_marker_and_not_a_failure_of_the_caller() {
-        let (_dir, config, path) = setup(false, &[completed(120, "linear")]);
+    fn a_spawn_error_is_recorded_and_not_a_failure_of_the_caller() {
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(120));
         let fake = Fake { fail: true, ..Fake::new() };
-        assert_eq!(run(&config, &fake, false, true), Outcome::SpawnFailed);
-        let view = MirrorView::read_for(&path, "linear").unwrap();
-        assert_eq!(view.last_failure, Some((now(), FailureCode::Spawn)));
-        assert_eq!(run(&config, &Fake::new(), false, true), Outcome::Cooldown, "the marker cools the next start down");
+        assert_eq!(run(&s, &fake, false, true), Outcome::SpawnFailed);
+        assert_eq!(state::provider(&s.state, "linear").unwrap().open_failure(), Some((now(), FailureCode::Spawn)));
+        let log = crate::tracker::log::path_for(&s.config.vault_path, "work", "claims");
+        let view = crate::tracker::view::MirrorView::read_for(&log, "linear").unwrap();
+        assert_eq!(view.last_failure, Some((now(), FailureCode::Spawn)), "the marker is the trace");
+        assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Cooldown, "the failure cools the next start down");
     }
 
     #[test]
     fn a_second_call_after_the_start_does_not_start_again() {
-        let (_dir, config, path) = setup(false, &[completed(120, "linear")]);
-        let fake = Fake { writes_start: Some((path, 4242)), ..Fake::new() };
-        assert_eq!(run(&config, &fake, true, true), Outcome::Started);
-        assert_eq!(run(&config, &fake, true, true), Outcome::Running);
+        let s = setup(false);
+        record(&s, "linear", Record::Completed, ago(120));
+        let fake = Fake { records_start: Some((s.state.clone(), 4242)), ..Fake::new() };
+        assert_eq!(run(&s, &fake, true, true), Outcome::Started);
+        assert_eq!(run(&s, &fake, true, true), Outcome::Running);
         assert_eq!(fake.started.borrow().len(), 1);
-    }
-
-    #[test]
-    fn the_trigger_never_takes_the_project_lock() {
-        let (_dir, config, path) = setup(false, &[completed(120, "linear")]);
-        let held = crate::tracker::lock::acquire(&path, std::time::Duration::ZERO).unwrap();
-        let started = std::time::Instant::now();
-        assert_eq!(run(&config, &Fake::new(), false, true), Outcome::Started);
-        assert!(started.elapsed() < std::time::Duration::from_millis(500), "{:?}", started.elapsed());
-        drop(held);
     }
 
     #[test]
@@ -406,11 +444,10 @@ mod tests {
                 _ => Outcome::NotDue,
             }
         };
-        let lines = refresh_bound(&config, &refresh);
+        let mut lines = refresh_bound(&config, &refresh);
         let mut seen = asked.borrow().clone();
         seen.sort();
         assert_eq!(seen, vec!["home/notes", "work/claims", "work/ops"]);
-        let mut lines = lines;
         lines.sort();
         assert_eq!(lines, vec!["tracker refresh for work/ops could not start (spawn)", "tracker refresh started for work/claims"]);
     }
