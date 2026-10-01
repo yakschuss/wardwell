@@ -344,7 +344,13 @@ trackers:
 
 A binding's team key may not equal a native kanban prefix set under
 `kanban.prefixes`. `config.yml` is rejected at load when it does, and the
-error names the binding, the team key and the project.
+error names the binding, the team key and the project. A prefix the kanban
+derives for a project is only known to the kanban database, so it is checked
+where that database is open. When a binding's team key equals its project's
+native prefix, kanban reads leave that mirror out and add a `tracker_note`
+that names the collision and says to set a different native prefix in
+`kanban.prefixes`. `wardwell tracker doctor` prints a `kanban prefix` line per
+binding, and the `wardwell doctor` row fails with the same sentence.
 
 Store the token (a Linear personal API key) from standard input. It is written to
 `~/.wardwell/trackers/<name>.json` with owner-only permissions and is never
@@ -423,10 +429,11 @@ provider is known and the credential reads, and prints `cannot pull` with the
 code when either fails; it says `no errors` only when both pass and no pull
 failed. `pull` exits non-zero when any binding failed.
 
-`doctor` prints three lines per binding: whether the credential file exists
-with owner-only permissions, whether the provider accepts the token on one
-cheap request, and whether the team key resolves. A failure names one code:
-`credential`, `auth`, `provider` or `team_not_found`. `auth` means the
+`doctor` prints four lines per binding. They check whether the credential
+file exists with owner-only permissions, whether the provider accepts the token on one
+cheap request, whether the team key resolves, and whether the team key
+differs from the project's native kanban prefix. A failure names one code:
+`credential`, `auth`, `provider`, `team_not_found` or `prefix_collision`. `auth` means the
 provider refused the token; any other provider error, including a GraphQL
 error that is not about authentication, is `provider`. It never prints a
 token. `config.yml` is rejected at load when a binding names a provider

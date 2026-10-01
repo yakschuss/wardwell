@@ -461,7 +461,7 @@ mod tests {
             Err("never called without a credential".into())
         };
         let error = doctor(&config, dir.path(), &unreachable).unwrap_err();
-        assert_eq!(error.lines().count(), 3, "{error}");
+        assert_eq!(error.lines().count(), 4, "{error}");
         assert!(error.starts_with("work/claims: credential failed (credential)"), "{error}");
     }
 

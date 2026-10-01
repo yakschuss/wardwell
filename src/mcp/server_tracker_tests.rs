@@ -653,3 +653,26 @@ fn concurrent_misses_for_a_key_still_missing_make_one_pull() {
     assert_eq!(reasons.iter().filter(|r| **r == "still_missing").count(), 1, "{reasons:?}");
     assert_eq!(reasons.iter().filter(|r| **r == "cooldown").count(), 2, "{reasons:?}");
 }
+
+#[test]
+fn a_team_key_equal_to_the_derived_native_prefix_leaves_the_mirror_out_with_a_note() {
+    let now = chrono::Utc::now();
+    let mut f = fixture(&[], false);
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.get_mut("work/claims").unwrap().team = "CL".into();
+    write_mirror(&f.server.vault_root, &[snapshot("CL-5", "Mirrored five", "In Progress", StateCategory::Started, now), pulled(now)]);
+    let sentence = "Tracker team key CL of work/claims equals the native kanban prefix CL of project claims. Set a different native prefix for claims in kanban.prefixes.";
+    for args in [
+        json!({"action": "list", "project": "claims"}),
+        json!({"action": "search", "query": "Mirrored"}),
+        json!({"action": "query", "question": "recent"}),
+        json!({"action": "get", "ticket_id": "CL-5"}),
+    ] {
+        let response = kanban(&f.server, args.clone());
+        assert!(response["tracker_note"].as_str().unwrap_or_default().contains(sentence), "{args}: {response}");
+        assert!(!response.to_string().contains("Mirrored five"), "{args}: {response}");
+    }
+    let native = kanban(&f.server, json!({"action": "get", "ticket_id": "CL-1"}));
+    assert_eq!(native["item"]["origin"], "kanban");
+    let p: KanbanParams = serde_json::from_value(json!({"action": "move", "ticket_id": "CL-1", "status": "done"})).unwrap();
+    assert!(f.server.tracker_refusal(f.server.kanban.as_ref().unwrap(), &p).is_none(), "the native ticket stays writable");
+}

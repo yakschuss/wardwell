@@ -64,6 +64,19 @@ pub fn mirrored_key_refusal(key: &str, binding: &crate::config::loader::TrackerB
     )
 }
 
+/// The sentence for a binding whose team key equals the native kanban
+/// prefix of its project, or None when they differ. Ticket ids of the two
+/// would be indistinguishable, so the mirror is left out of kanban reads.
+pub fn prefix_collision(binding: &crate::config::loader::TrackerBinding, native_prefix: &str) -> Option<String> {
+    let normal = |prefix: &str| prefix.trim_end_matches('-').to_ascii_uppercase();
+    (normal(native_prefix) == normal(&binding.team)).then(|| {
+        format!(
+            "Tracker team key {} of {}/{} equals the native kanban prefix {native_prefix} of project {}. Set a different native prefix for {} in kanban.prefixes.",
+            binding.team, binding.domain, binding.project, binding.project, binding.project
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +99,12 @@ mod tests {
         assert!(message.contains("work/claims is a read-only mirror of Linear team COR"), "{message}");
         assert!(message.contains("Edit it in Linear"), "{message}");
         assert!(readonly_refusal(&binding(false)).is_none());
+    }
+
+    #[test]
+    fn prefix_collision_compares_without_case_or_hyphen() {
+        assert!(prefix_collision(&binding(true), "cor-").is_some());
+        assert!(prefix_collision(&binding(true), "CL").is_none());
     }
 
     #[test]

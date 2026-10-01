@@ -216,6 +216,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// file and provider; no network). Each row names `wardwell tracker doctor`
 /// for the live check. The bool is false when any binding failed.
 fn tracker_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
+    let native = crate::tracker::doctor::native_prefixes(config, &config_dir.join("kanban.db"));
+    tracker_rows_with(config, config_dir, &native)
+}
+
+/// `tracker_rows` with each binding's native kanban prefix given by key. A
+/// team key equal to it fails the row with the collision sentence.
+fn tracker_rows_with(
+    config: &crate::config::loader::WardwellConfig,
+    config_dir: &Path,
+    native: &std::collections::BTreeMap<String, String>,
+) -> (Vec<String>, bool) {
     const LIVE: &str = "live check: `wardwell tracker doctor`";
     let mut ok = true;
     let rows = config
@@ -223,7 +234,9 @@ fn tracker_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
         .iter()
         .map(|(key, binding)| {
             let label = format!("Tracker {key}");
-            match crate::tracker::doctor::check_offline(config_dir, binding) {
+            let collision = crate::tracker::doctor::prefix_failure(binding, native.get(key))
+                .map(|sentence| (crate::tracker::events::FailureCode::PrefixCollision, Some(sentence)));
+            match crate::tracker::doctor::check_offline(config_dir, binding).and(collision.map_or(Ok(()), Err)) {
                 Ok(()) => format!("  {label:<38} \u{2713} credential ok; {LIVE}"),
                 Err((code, detail)) => {
                     ok = false;
@@ -469,6 +482,21 @@ mod tests {
         let (rows, ok) = tracker_rows(&jira, dir.path());
         assert!(!ok);
         assert!(rows[0].contains("\u{2717} failed (unsupported_provider); live check"), "{}", rows[0]);
+    }
+
+    #[test]
+    fn a_team_key_equal_to_a_native_prefix_fails_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
+        crate::tracker::credential::save(&path, "t").unwrap();
+        let native = std::collections::BTreeMap::from([("work/claims".to_string(), "COR".to_string())]);
+        let (rows, ok) = tracker_rows_with(&config, dir.path(), &native);
+        assert!(!ok);
+        assert_eq!(
+            rows,
+            vec!["  Tracker work/claims                    \u{2717} failed (prefix_collision): Tracker team key COR of work/claims equals the native kanban prefix COR of project claims. Set a different native prefix for claims in kanban.prefixes.; live check: `wardwell tracker doctor`"]
+        );
     }
 
     #[test]

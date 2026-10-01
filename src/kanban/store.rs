@@ -224,6 +224,11 @@ impl KanbanStore {
         Ok(store)
     }
 
+    /// The ticket prefix `project` uses, or would use for its first ticket.
+    pub fn native_prefix(&self, project: &str, config_prefixes: &HashMap<String, String>) -> Option<String> {
+        native_prefix_in(&*self.conn().ok()?, project, config_prefixes)
+    }
+
     pub fn conn(&self) -> Result<MutexGuard<'_, Connection>, KanbanError> {
         self.conn.lock().map_err(|_| KanbanError::LockPoisoned)
     }
@@ -1393,6 +1398,21 @@ pub fn default_kanban_queries() -> HashMap<String, String> {
     m.insert("recent".into(), "updated_at > datetime('now', '-2 days')".into());
     m.insert("by_epic".into(), "epic IS NOT NULL AND status != 'done'".into());
     m
+}
+
+/// The prefix `project` is registered with in `conn`, else the one it would
+/// derive for its first ticket. None when the tables cannot be read.
+pub fn native_prefix_in(conn: &Connection, project: &str, config_prefixes: &HashMap<String, String>) -> Option<String> {
+    let registered: Option<String> = conn
+        .query_row("SELECT prefix FROM kanban_projects WHERE project=?1", rusqlite::params![project], |row| row.get(0))
+        .optional()
+        .ok()?;
+    if registered.is_some() {
+        return registered;
+    }
+    let mut stmt = conn.prepare("SELECT prefix FROM kanban_projects").ok()?;
+    let existing: Vec<String> = stmt.query_map([], |row| row.get(0)).ok()?.filter_map(Result::ok).collect();
+    crate::kanban::prefix::resolve_prefix(project, config_prefixes, &existing)
 }
 
 pub fn merge_kanban_queries(config_queries: &HashMap<String, String>) -> HashMap<String, String> {
