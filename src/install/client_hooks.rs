@@ -3,7 +3,7 @@
 //! executable is a Wardwell binary and its arguments equal a known shape.
 //! Does NOT read or write files; the installer owns I/O, backups and consent.
 
-use crate::companion::install::{owned_command, wardwell_args};
+use crate::companion::install::wardwell_args;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
@@ -208,11 +208,6 @@ pub fn companion_stop_present(root: &Value) -> bool {
     groups.iter().filter_map(|group| group.get("hooks").and_then(Value::as_array)).flatten().any(|handler| {
         handler["command"].as_str().and_then(wardwell_args) == Some("companion lifecycle stop --client claude")
     })
-}
-
-/// A Companion lifecycle handler (any action, any client), or `resolve`.
-pub fn is_companion_lifecycle(command: &str) -> bool {
-    owned_command(command)
 }
 
 /// True when the command runs the old Python Linear gate script: its last

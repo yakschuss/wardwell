@@ -192,7 +192,7 @@ Removes only Wardwell's entries.
 
 1. Remove Wardwell's entries from the Desktop, Code and Codex MCP configs (preserve others)
 2. Remove `<!-- wardwell:start -->` to `<!-- wardwell:end -->` from all CLAUDE.md files
-3. Remove Wardwell's hook handlers from `~/.claude/settings.json` by exact match: session start, Stop, the Linear gate, and the Companion lifecycle hooks. Back up the file first.
+3. Remove Wardwell's hook handlers from `~/.claude/settings.json` by exact match: session start, Stop, and the Linear gate. Back up the file first. The Companion install is not touched: its hooks in both clients, its skills, its command file and its instruction blocks stay. Uninstall prints one line saying so.
 4. Remove the deny entries the install record lists, and no others. Empty the record; do not delete it.
 5. Remove the tracker pull service.
 6. **Do NOT delete `~/.wardwell/`** — that's the user's data. Print: "Your vault and config are preserved at ~/.wardwell/. Delete manually if desired."

@@ -67,9 +67,9 @@ To remove Wardwell's wiring:
 wardwell uninstall
 ```
 
-It removes Wardwell's MCP entries, its hooks, the deny entries it added and no
-others, the pull service, and its CLAUDE.md markers. It never deletes the
-Wardwell folder.
+It removes Wardwell's connection entries, its hooks, the deny entries it
+added and no others, the pull service, and its CLAUDE.md markers. It never
+deletes the Wardwell folder. It leaves the Companion install whole and says so.
 
 ## How It Works
 

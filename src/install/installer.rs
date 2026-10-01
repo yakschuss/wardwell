@@ -323,6 +323,7 @@ fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
 
 /// Preview `uninstall`: Wardwell's hooks in Claude settings, the deny entries
 /// the install record lists and only those, and the pull service. The
+/// Companion install is left whole: its hooks, skills, command and blocks. The
 /// Wardwell folder is never removed; the install record is emptied, not deleted.
 pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Result<Plan, String> {
     let mut lines = Vec::new();
@@ -336,16 +337,17 @@ pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Result<Plan, String> {
             Ok(())
         })?;
     }
-    draft.step(&mut lines, "Companion lifecycle hooks".into(), |v| {
-        client_hooks::remove_where(v, client_hooks::is_companion_lifecycle);
-        Ok(())
-    })?;
     draft.step(&mut lines, format!("Deny entries Wardwell added ({})", denies.len()), |v| {
         client_hooks::remove_denies(v, &denies);
         Ok(())
     })?;
     changes.extend(draft.into_change()?);
     changes.extend(manifest_change(config_dir, recorded, &Manifest::default(), &mut lines)?);
+    lines.push(Line {
+        action: Action::Unchanged,
+        label: "The Companion install was not removed: its hooks, skills, command and instructions stay. Remove it separately if you want.".into(),
+        path: None,
+    });
     let plist = schedule::plist_path(home);
     let pull = match plist.exists() {
         true => {
@@ -711,11 +713,41 @@ mod tests {
         let s = settings(&h);
         assert_eq!(s["model"], "keep");
         assert_eq!(client_hooks::denied(&s), vec!["mcp__linear__save_project", "Bash(rm:*)"]);
-        assert_eq!(s["hooks"], json!({"Stop": [{"hooks": [{"type": "command", "command": "rtk check"}]}]}));
+        assert_eq!(s["hooks"], json!({"Stop": [{"hooks": [{"type": "command", "command": "rtk check"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle begin --client claude"}]}]}));
         assert!(h.cfg.is_dir());
         assert!(manifest::read(&h.cfg).unwrap().unwrap().1.claude_permissions_deny.is_empty());
         let again = uninstall_plan(&h.home, &h.cfg).unwrap();
         assert!(again.is_noop(), "{}", rendered(&again));
+    }
+
+    #[test]
+    fn uninstall_leaves_the_companion_install_alone() {
+        let h = home();
+        let companion = json!({"hooks": {
+            "SessionStart": [{"matcher": "resume", "hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle resume --client claude", "timeout": 6}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle begin --client claude", "timeout": 3}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle stop --client claude", "timeout": 3}]}]}});
+        put_settings(&h, companion.clone());
+        let others = [
+            (".codex/hooks.json", r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"'/w/wardwell' companion lifecycle stop --client codex"}]}]}}"#),
+            (".claude/skills/wardwell-companion/SKILL.md", "---\nname: wardwell-companion\n---\n"),
+            (".codex/skills/wardwell-companion/SKILL.md", "---\nname: wardwell-companion\n---\n"),
+            (".claude/commands/companion.md", "command"),
+            (".claude/CLAUDE.md", "<!-- wardwell-companion:start -->\nx\n<!-- wardwell-companion:end -->\n"),
+            (".codex/AGENTS.md", "<!-- wardwell-companion:start -->\nx\n<!-- wardwell-companion:end -->\n"),
+        ];
+        for (relative, text) in others {
+            fs::create_dir_all(h.home.join(relative).parent().unwrap()).unwrap();
+            fs::write(h.home.join(relative), text).unwrap();
+        }
+        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        assert!(rendered(&plan).contains("Companion install was not removed"), "{}", rendered(&plan));
+        apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
+        assert_eq!(settings(&h), companion);
+        for (relative, text) in others {
+            assert_eq!(fs::read_to_string(h.home.join(relative)).unwrap(), text, "{relative}");
+        }
     }
 
     #[test]
