@@ -471,8 +471,13 @@ at most 50 mirrored items and `search` at most 20. When more match, the
 result adds `tracker_truncated` with the count left out.
 
 `get` for a key the mirror does not hold runs one incremental pull for the
-binding that owns the key, then looks again. It never runs a full pull, and
-each binding refreshes at most once a minute. The result carries `refreshed`,
+binding that owns the key, then looks again. A binding owns a key when its
+team key is the key's prefix. A `project` or `domain` in the call narrows the
+bindings first, and every kanban read honours them. A refresh never runs a
+full pull. It waits at most 2 seconds for the project lock. The cooldown
+comes from the log: no refresh runs within a minute of the newest
+`pull_completed`, `full_resync` or `pull_failed` marker, so every server on
+the vault shares it. The result carries `refreshed`,
 true when a pull completed, and `refresh_reason`: `found_after_pull`,
 `still_missing`, `cooldown`, `pull_failed:<code>`, `no_binding` or
 `never_pulled`. A mirror with no pull marker is not refreshed, because an

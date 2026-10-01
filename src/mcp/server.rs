@@ -36,8 +36,6 @@ pub struct WardwellServer {
     tracker_config_dir: PathBuf,
     /// Builds the adapter for an on-miss refresh. Replaced in tests.
     tracker_connect: Arc<TrackerConnect>,
-    /// When each binding last ran an on-miss refresh.
-    refresh_cooldown: Arc<Mutex<crate::tracker::refresh::Cooldown>>,
 }
 
 /// `pull::Connect`, shareable across the server's clones.
@@ -364,7 +362,6 @@ impl WardwellServer {
             kanban_queries,
             tracker_config_dir: crate::config::loader::config_dir(),
             tracker_connect: Arc::new(crate::tracker::pull::connect_provider),
-            refresh_cooldown: Arc::new(Mutex::new(crate::tracker::refresh::Cooldown::default())),
         }
     }
 
@@ -2198,7 +2195,7 @@ impl WardwellServer {
         match kanban.get_item(ticket_id) {
             Ok(item) => serde_json::to_string(&serde_json::json!({"item": crate::tracker::items::native(&item)})).unwrap_or_default(),
             Err(crate::kanban::store::KanbanError::NotFound(missing)) => {
-                let (found, reason) = self.mirror_lookup(ticket_id, p.project.as_deref());
+                let (found, reason) = self.mirror_lookup(ticket_id, p);
                 let mut response = match found {
                     Some(item) => serde_json::json!({"item": item}),
                     None => serde_json::json!({"error": crate::kanban::store::KanbanError::NotFound(missing).to_string()}),
@@ -2221,7 +2218,7 @@ impl WardwellServer {
         match kanban.search(query, p.project.as_deref(), domains) {
             Ok(items) => {
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let (mirrored, truncated) = self.mirror_items(p.project.as_deref(), crate::tracker::items::SEARCH_CAP, &|issue| crate::tracker::items::search_keeps(issue, query));
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::SEARCH_CAP, &|issue| crate::tracker::items::search_keeps(issue, query));
                 items.extend(mirrored);
                 let total = items.len();
                 let mut response = serde_json::json!({"items": items, "total": total});
@@ -2260,7 +2257,7 @@ impl WardwellServer {
                     include_done: p.include_done.unwrap_or(false),
                 };
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let (mirrored, truncated) = self.mirror_items(p.project.as_deref(), crate::tracker::items::LIST_CAP, &|issue| filter.keeps(issue));
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, &|issue| filter.keeps(issue));
                 items.extend(mirrored);
                 let total = items.len();
                 let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
@@ -2419,7 +2416,7 @@ impl WardwellServer {
             Ok(items) => {
                 let now = chrono::Utc::now();
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let (mirrored, truncated) = self.mirror_items(p.project.as_deref(), crate::tracker::items::LIST_CAP, &|issue| {
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, &|issue| {
                     crate::tracker::items::query_keeps(issue, question, now).unwrap_or(false)
                 });
                 items.extend(mirrored);
@@ -2428,7 +2425,7 @@ impl WardwellServer {
                 if truncated > 0 {
                     response["tracker_truncated"] = serde_json::json!(truncated);
                 }
-                if !crate::tracker::items::MIRROR_QUERIES.contains(&question.as_str()) && !self.read_bindings(p.project.as_deref()).is_empty() {
+                if !crate::tracker::items::MIRROR_QUERIES.contains(&question.as_str()) && !self.read_bindings(p).is_empty() {
                     response["tracker_note"] = serde_json::json!(crate::tracker::items::QUERY_NOT_MIRRORED);
                 }
                 serde_json::to_string(&response).unwrap_or_default()
@@ -3653,12 +3650,13 @@ impl WardwellServer {
     }
 
     /// Bindings a kanban read covers: the named project's, else every one,
-    /// within the session's domains.
-    fn read_bindings(&self, project: Option<&str>) -> Vec<&crate::config::loader::TrackerBinding> {
+    /// in the named domain when one is given, within the session's domains.
+    fn read_bindings(&self, p: &KanbanParams) -> Vec<&crate::config::loader::TrackerBinding> {
         self.config
             .trackers
             .values()
-            .filter(|b| project.is_none_or(|name| b.project == name))
+            .filter(|b| p.project.as_deref().is_none_or(|name| b.project == name))
+            .filter(|b| p.domain.as_deref().is_none_or(|domain| b.domain == domain))
             .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
             .collect()
     }
@@ -3666,10 +3664,10 @@ impl WardwellServer {
     /// Mirrored issues of the covered bindings that `keep` accepts, as
     /// summaries in key order, at most `cap`, with how many were left out.
     /// A log that cannot be read contributes nothing.
-    fn mirror_items(&self, project: Option<&str>, cap: usize, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> (Vec<serde_json::Value>, usize) {
+    fn mirror_items(&self, p: &KanbanParams, cap: usize, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> (Vec<serde_json::Value>, usize) {
         let now = chrono::Utc::now();
         let mut items: Vec<(String, serde_json::Value)> = self
-            .read_bindings(project)
+            .read_bindings(p)
             .into_iter()
             .filter_map(|binding| self.mirror_view(binding).map(|view| (binding, view)))
             .flat_map(|(binding, view)| {
@@ -3687,9 +3685,9 @@ impl WardwellServer {
 
     /// The mirrored issue under `key` in any covered binding, removed and
     /// archived included.
-    fn mirror_get(&self, key: &str, project: Option<&str>) -> Option<serde_json::Value> {
+    fn mirror_get(&self, key: &str, p: &KanbanParams) -> Option<serde_json::Value> {
         let now = chrono::Utc::now();
-        self.read_bindings(project).into_iter().find_map(|binding| {
+        self.read_bindings(p).into_iter().find_map(|binding| {
             let view = self.mirror_view(binding)?;
             view.get(key).map(|issue| crate::tracker::items::mirrored(binding, &view, issue, now))
         })
@@ -3697,48 +3695,42 @@ impl WardwellServer {
 
     /// The mirrored issue under `key`. On a miss, one labeled refresh and a
     /// second look; the reason is None when the first look found it.
-    fn mirror_lookup(&self, key: &str, project: Option<&str>) -> (Option<serde_json::Value>, Option<crate::tracker::refresh::Reason>) {
+    fn mirror_lookup(&self, key: &str, p: &KanbanParams) -> (Option<serde_json::Value>, Option<crate::tracker::refresh::Reason>) {
         use crate::tracker::refresh::Reason;
-        if let Some(item) = self.mirror_get(key, project) {
+        if let Some(item) = self.mirror_get(key, p) {
             return (Some(item), None);
         }
-        if let Err(reason) = self.refresh_on_miss(key, project) {
+        if let Err(reason) = self.refresh_on_miss(key, p) {
             return (None, Some(reason));
         }
-        match self.mirror_get(key, project) {
+        match self.mirror_get(key, p) {
             Some(item) => (Some(item), Some(Reason::FoundAfterPull)),
             None => (None, Some(Reason::StillMissing)),
         }
     }
 
-    /// One incremental pull for the binding that would hold `key`, unless
-    /// none does, its log has no pull marker, or it pulled within the
-    /// cooldown. Never a full pull.
-    fn refresh_on_miss(&self, key: &str, project: Option<&str>) -> Result<(), crate::tracker::refresh::Reason> {
+    /// One incremental pull for the binding whose team key prefixes `key`,
+    /// unless none does, its log has no pull marker, or its log shows a
+    /// pull within the cooldown. Never a full pull. The cooldown lives in
+    /// the log, so every server on the vault shares it.
+    fn refresh_on_miss(&self, key: &str, p: &KanbanParams) -> Result<(), crate::tracker::refresh::Reason> {
         use crate::tracker::refresh::Reason;
-        let bindings = self.read_bindings(project);
-        let Some(binding) = crate::tracker::refresh::target(&bindings, key, project) else {
+        let bindings = self.read_bindings(p);
+        let Some(binding) = crate::tracker::refresh::target(&bindings, key) else {
             return Err(Reason::NoBinding);
         };
-        if self.mirror_view(binding).is_none_or(|view| view.last_pull_at.is_none()) {
-            return Err(Reason::NeverPulled);
-        }
-        let binding_key = format!("{}/{}", binding.domain, binding.project);
-        let started = self
-            .refresh_cooldown
-            .lock()
-            .is_ok_and(|mut cooldown| cooldown.try_start(&binding_key, std::time::Instant::now()));
-        if !started {
-            return Err(Reason::Cooldown);
-        }
+        let view = self.mirror_view(binding).unwrap_or_default();
+        let now = chrono::Utc::now();
+        crate::tracker::refresh::check(&view, now)?;
         let connect = |b: &crate::config::loader::TrackerBinding, c: &crate::tracker::credential::Credential| (self.tracker_connect)(b, c);
-        match crate::tracker::pull::pull_binding(
+        match crate::tracker::pull::pull_binding_waiting(
             &self.vault_root,
             &self.tracker_config_dir,
             binding,
             crate::tracker::pull::Mode::IncrementalOnly,
-            chrono::Utc::now(),
+            now,
             &connect,
+            crate::tracker::refresh::LOCK_WAIT,
         ) {
             Ok(_) => Ok(()),
             Err(error) => Err(Reason::PullFailed(error.code)),

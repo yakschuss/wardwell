@@ -145,6 +145,19 @@ pub fn pull_binding(
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<PullOutcome, PullError> {
+    pull_binding_waiting(vault_root, config_dir, binding, mode, now, connect, lock::DEFAULT_WAIT)
+}
+
+/// `pull_binding`, waiting at most `wait` for the project lock.
+pub fn pull_binding_waiting(
+    vault_root: &Path,
+    config_dir: &Path,
+    binding: &TrackerBinding,
+    mode: Mode,
+    now: DateTime<Utc>,
+    connect: &Connect<'_>,
+    wait: Duration,
+) -> Result<PullOutcome, PullError> {
     let credential = credential::path_in(config_dir, &binding.credential)
         .and_then(|path| credential::load(&path))
         .map_err(|message| PullError::new(FailureCode::Credential, message))?;
@@ -154,9 +167,9 @@ pub fn pull_binding(
         _ => None,
     };
     let Some(due) = resync_due else {
-        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, wait);
     };
-    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, wait);
     match pull(Mode::AutomaticFull) {
         Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), ..outcome }),
         // A failed automatic full must not stop the mirror moving.

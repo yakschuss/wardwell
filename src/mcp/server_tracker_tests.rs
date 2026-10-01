@@ -383,3 +383,84 @@ fn a_miss_on_a_mirror_never_pulled_does_not_pull_the_whole_team() {
     assert_eq!(response["refresh_reason"], "never_pulled");
     assert!(calls.lock().unwrap().is_empty());
 }
+
+#[test]
+fn a_named_project_refreshes_only_for_its_own_team_key() {
+    let (f, calls) = refresh_fixture(vec![], None);
+    let foreign = kanban(&f.server, json!({"action": "get", "ticket_id": "CL-999", "project": "claims"}));
+    assert_eq!(foreign["refresh_reason"], "no_binding", "{foreign}");
+    let bare = kanban(&f.server, json!({"action": "get", "ticket_id": "nohyphen", "project": "claims"}));
+    assert_eq!(bare["refresh_reason"], "no_binding");
+    assert!(calls.lock().unwrap().is_empty());
+    let own = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-999", "project": "claims"}));
+    assert_eq!(own["refresh_reason"], "still_missing");
+}
+
+#[test]
+fn domain_picks_between_two_projects_of_the_same_name() {
+    let now = chrono::Utc::now();
+    let (mut f, calls) = refresh_fixture(vec![snapshot("COR-99", "New", "Todo", StateCategory::Unstarted, now)], None);
+    let vault = f.server.vault_root.clone();
+    let personal = crate::tracker::log::path_for(&vault, "personal", "claims");
+    let mut summary = crate::tracker::log::read(&personal).unwrap();
+    crate::tracker::log::append_new(&personal, &[snapshot("COR-50", "Personal only", "Todo", StateCategory::Unstarted, now), pulled(now - chrono::TimeDelta::hours(1))], &mut summary).unwrap();
+    let mut other = binding(true);
+    other.domain = "personal".into();
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.insert("personal/claims".into(), other);
+
+    let work_only = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-50", "project": "claims", "domain": "work"}));
+    assert_eq!(work_only["refresh_reason"], "still_missing", "{work_only}");
+    let listed = kanban(&f.server, json!({"action": "list", "project": "claims", "domain": "personal"}));
+    assert_eq!(keys(&listed).iter().filter(|k| k.starts_with("COR")).collect::<Vec<_>>(), vec!["COR-50"]);
+
+    let refreshed = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-99", "project": "claims", "domain": "personal"}));
+    assert_eq!(refreshed["refresh_reason"], "found_after_pull", "{refreshed}");
+    assert_eq!(refreshed["item"]["domain"], "personal");
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert!(crate::tracker::view::MirrorView::read(&personal).unwrap().get("COR-99").is_some());
+}
+
+#[test]
+fn two_servers_on_one_vault_share_the_cooldown_through_the_log() {
+    let (first, calls) = refresh_fixture(vec![], None);
+    let mut trackers = std::collections::BTreeMap::new();
+    trackers.insert("work/claims".to_string(), binding(true));
+    let config = crate::config::loader::WardwellConfig {
+        vault_path: first.server.vault_root.clone(),
+        registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
+        session_sources: vec![],
+        exclude: vec![],
+        ai: Default::default(),
+        stop_hook: true,
+        kanban_enabled: true,
+        kanban_queries: std::collections::HashMap::new(),
+        kanban_prefixes: std::collections::HashMap::new(),
+        features: Default::default(),
+        trackers,
+    };
+    let mut second = WardwellServer::new(
+        config,
+        Arc::new(crate::index::store::IndexStore::open(&first._dir.path().join("index2.db")).unwrap()),
+        Arc::new(Mutex::new(None)),
+        None,
+        Some(crate::kanban::store::KanbanStore::open(&first._dir.path().join("kanban2.db"), first.server.vault_root.clone()).unwrap()),
+    );
+    second.tracker_config_dir = first.server.tracker_config_dir.clone();
+    second.tracker_connect = first.server.tracker_connect.clone();
+    let a = kanban(&first.server, json!({"action": "get", "ticket_id": "COR-404"}));
+    assert_eq!(a["refresh_reason"], "still_missing", "{a}");
+    let b = kanban(&second, json!({"action": "get", "ticket_id": "COR-404"}));
+    assert_eq!(b["refresh_reason"], "cooldown", "{b}");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_recent_failed_pull_also_cools_the_binding_down() {
+    let now = chrono::Utc::now();
+    let mut mirror = standard_mirror();
+    mirror.push(Event::PullFailed { common: common("wardwell:pull_failed:COR:x", "COR", now - chrono::TimeDelta::seconds(10)), code: crate::tracker::events::FailureCode::Provider, automatic_full: false });
+    let (f, calls) = refresh_fixture_over(&mirror, vec![], None);
+    let response = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-404"}));
+    assert_eq!(response["refresh_reason"], "cooldown", "{response}");
+    assert!(calls.lock().unwrap().is_empty());
+}

@@ -1,14 +1,15 @@
 //! The labeled on-miss refresh behind kanban `get`: which binding a missing
-//! key belongs to, the per-binding cooldown, and the closed reason the
-//! result carries.
+//! key belongs to, the per-binding cooldown read from the log, and the
+//! closed reason the result carries.
 //!
 //! Does NOT pull (the caller runs `pull_binding` in `IncrementalOnly` mode)
 //! and never applies to list, query, or search.
 
 use crate::config::loader::TrackerBinding;
 use crate::tracker::events::FailureCode;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use crate::tracker::view::MirrorView;
+use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 /// At most one on-miss pull per binding in this window.
 pub const COOLDOWN: Duration = Duration::from_secs(60);
@@ -46,31 +47,30 @@ impl Reason {
     }
 }
 
-/// The binding a missing `key` would come from: the named project's when a
-/// project is given, else the one whose team key prefixes `key`.
-pub fn target<'a>(bindings: &[&'a TrackerBinding], key: &str, project: Option<&str>) -> Option<&'a TrackerBinding> {
+/// How long an on-miss pull waits for the project lock before it fails
+/// with `lock_busy`. Shorter than a scheduled pull's wait, since a person
+/// is waiting on the lookup.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// The binding a missing `key` would come from: the one whose team key
+/// equals the key's prefix, ignoring case. The caller narrows `bindings`
+/// by project and domain first.
+pub fn target<'a>(bindings: &[&'a TrackerBinding], key: &str) -> Option<&'a TrackerBinding> {
     let prefix = key.rsplit_once('-').map(|(team, _)| team)?;
-    bindings
-        .iter()
-        .copied()
-        .find(|b| project.map_or_else(|| b.team.eq_ignore_ascii_case(prefix), |name| b.project == name))
+    bindings.iter().copied().find(|b| b.team.eq_ignore_ascii_case(prefix))
 }
 
-/// When each binding last started an on-miss pull, held in server memory.
-#[derive(Debug, Default)]
-pub struct Cooldown {
-    started: HashMap<String, Instant>,
-}
-
-impl Cooldown {
-    /// Record a pull for `binding_key` at `now` and return true, or return
-    /// false when one started within `COOLDOWN`.
-    pub fn try_start(&mut self, binding_key: &str, now: Instant) -> bool {
-        let cooling = self.started.get(binding_key).is_some_and(|at| now.saturating_duration_since(*at) < COOLDOWN);
-        if !cooling {
-            self.started.insert(binding_key.to_string(), now);
-        }
-        !cooling
+/// Whether a mirror may be refreshed at `now`: it needs a pull marker,
+/// and its newest pull_completed, full_resync or pull_failed marker must be
+/// older than `COOLDOWN`.
+pub fn check(view: &MirrorView, now: DateTime<Utc>) -> Result<(), Reason> {
+    let Some(pulled) = view.last_pull_at else {
+        return Err(Reason::NeverPulled);
+    };
+    let newest = view.last_failure.map_or(pulled, |(failed, _)| failed.max(pulled));
+    match (now - newest).to_std().is_ok_and(|age| age >= COOLDOWN) {
+        true => Ok(()),
+        false => Err(Reason::Cooldown),
     }
 }
 
@@ -105,26 +105,30 @@ mod tests {
     }
 
     #[test]
-    fn target_is_the_named_project_or_the_team_that_prefixes_the_key() {
+    fn target_is_the_binding_whose_team_prefixes_the_key() {
         let claims = binding("claims", "COR");
         let ops = binding("ops", "OPS");
         let bindings = [&claims, &ops];
-        assert_eq!(target(&bindings, "cor-99", None), Some(&claims));
-        assert_eq!(target(&bindings, "OPS-1", None), Some(&ops));
-        assert_eq!(target(&bindings, "COR-99", Some("ops")), Some(&ops));
-        assert_eq!(target(&bindings, "XYZ-1", None), None);
-        assert_eq!(target(&bindings, "COR-1", Some("billing")), None);
-        assert_eq!(target(&bindings, "nohyphen", None), None);
+        assert_eq!(target(&bindings, "cor-99"), Some(&claims));
+        assert_eq!(target(&bindings, "OPS-1"), Some(&ops));
+        assert_eq!(target(&[&ops], "COR-99"), None, "a named project's binding must own the prefix");
+        assert_eq!(target(&bindings, "XYZ-1"), None);
+        assert_eq!(target(&bindings, "nohyphen"), None);
     }
 
     #[test]
-    fn cooldown_allows_one_pull_per_binding_per_minute() {
-        let mut cooldown = Cooldown::default();
-        let start = Instant::now();
-        assert!(cooldown.try_start("work/claims", start));
-        assert!(!cooldown.try_start("work/claims", start + Duration::from_secs(59)));
-        assert!(cooldown.try_start("work/ops", start + Duration::from_secs(1)), "per binding");
-        assert!(cooldown.try_start("work/claims", start + Duration::from_secs(60)));
-        assert!(!cooldown.try_start("work/claims", start + Duration::from_secs(61)), "the window restarts");
+    fn cooldown_reads_the_newest_pull_marker() {
+        use chrono::TimeZone;
+        let at = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap();
+        let secs = chrono::TimeDelta::seconds;
+        assert_eq!(check(&MirrorView::default(), at), Err(Reason::NeverPulled));
+        let pulled = MirrorView { last_pull_at: Some(at), ..Default::default() };
+        assert_eq!(check(&pulled, at + secs(59)), Err(Reason::Cooldown));
+        assert_eq!(check(&pulled, at + secs(60)), Ok(()));
+        let failed = MirrorView { last_failure: Some((at + secs(30), FailureCode::Provider)), ..pulled };
+        assert_eq!(check(&failed, at + secs(80)), Err(Reason::Cooldown), "a failure marker cools down too");
+        assert_eq!(check(&failed, at + secs(90)), Ok(()));
+        let only_failed = MirrorView { last_failure: Some((at, FailureCode::Auth)), ..Default::default() };
+        assert_eq!(check(&only_failed, at + secs(600)), Err(Reason::NeverPulled));
     }
 }
