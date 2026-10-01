@@ -45,6 +45,8 @@ pub struct WardwellConfig {
     pub features: FeatureFlags,
     /// Tracker mirrors keyed by `<domain>/<project>`.
     pub trackers: BTreeMap<String, TrackerBinding>,
+    /// Working directories mapped to vault projects, keyed by `<domain>/<project>`.
+    pub projects: BTreeMap<String, ProjectMapping>,
 }
 
 impl WardwellConfig {
@@ -67,6 +69,16 @@ pub struct TrackerBinding {
     pub credential: String,
     /// When true, kanban write actions on this project are refused.
     pub readonly: bool,
+}
+
+/// Maps working directories to one vault project, so a session started in
+/// any of `paths` reads and writes that project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMapping {
+    pub domain: String,
+    pub project: String,
+    /// Absolute directories, tilde expanded, without a trailing slash.
+    pub paths: Vec<PathBuf>,
 }
 
 /// AI configuration for session summarization.
@@ -116,6 +128,14 @@ struct RawConfig {
     features: Option<RawFeatureFlags>,
     #[serde(default)]
     trackers: HashMap<String, RawTrackerBinding>,
+    #[serde(default)]
+    projects: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProjectEntry {
+    paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +266,7 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
 
     let trackers = tracker_bindings(raw.trackers)?;
     reject_prefix_collisions(&trackers, &kanban_prefixes)?;
+    let projects = project_mappings(raw.projects)?;
 
     Ok(WardwellConfig {
         vault_path,
@@ -259,7 +280,38 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
         kanban_prefixes,
         features,
         trackers,
+        projects,
     })
+}
+
+fn project_mappings(
+    raw: BTreeMap<String, serde_yaml::Value>,
+) -> Result<BTreeMap<String, ProjectMapping>, ConfigError> {
+    let invalid = |key: &str, reason: String| ConfigError::InvalidProjectMapping { key: key.to_string(), reason };
+    let mut mappings = BTreeMap::new();
+    for (key, value) in raw {
+        let (domain, project) = split_project_key(&key).map_err(|_| invalid(&key, "key must be <domain>/<project>".into()))?;
+        let entry: RawProjectEntry = serde_yaml::from_value(value)
+            .map_err(|e| invalid(&key, format!("{e}; a project takes only `paths`")))?;
+        if entry.paths.is_empty() {
+            return Err(invalid(&key, "`paths` needs at least one path".into()));
+        }
+        let paths = entry.paths.iter().map(|p| project_path(&key, p)).collect::<Result<_, _>>()?;
+        mappings.insert(key, ProjectMapping { domain, project, paths });
+    }
+    Ok(mappings)
+}
+
+/// One mapped directory: tilde expanded, absolute, no trailing slash.
+fn project_path(key: &str, raw: &str) -> Result<PathBuf, ConfigError> {
+    let path = expand_tilde(raw.trim());
+    if !path.is_absolute() {
+        return Err(ConfigError::InvalidProjectMapping {
+            key: key.to_string(),
+            reason: format!("path '{raw}' must be absolute or start with ~/"),
+        });
+    }
+    Ok(path.components().collect())
 }
 
 fn tracker_bindings(
@@ -576,5 +628,46 @@ trackers:
         let other = "vault_path: /tmp/v\nsession_sources: []\nkanban:\n  enabled: true\n  prefixes:\n    billing: BIL\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n";
         let f = write_config(other).unwrap();
         assert!(load(Some(f.path())).is_ok());
+    }
+
+    #[test]
+    fn projects_absent_defaults_to_empty() {
+        let f = write_config("vault_path: /tmp/v\nsession_sources: []\n").unwrap();
+        assert!(load(Some(f.path())).unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn projects_map_directories_to_a_vault_project_with_tilde_expansion() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\nprojects:\n  personal/corr-platform:\n    paths:\n      - ~/Code/Corr/corrtex\n      - /srv/corrtex/\n";
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        let mapping = config.projects.get("personal/corr-platform").unwrap();
+        assert_eq!(mapping.domain, "personal");
+        assert_eq!(mapping.project, "corr-platform");
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(mapping.paths, vec![home.join("Code/Corr/corrtex"), PathBuf::from("/srv/corrtex")]);
+    }
+
+    #[test]
+    fn projects_reject_an_unknown_key_by_name() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/claims:\n    path: /srv/claims\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("unknown key").to_string();
+        assert!(error.contains("work/claims"), "{error}");
+        assert!(error.contains("unknown field `path`"), "{error}");
+        assert!(error.contains("only `paths`"), "{error}");
+    }
+
+    #[test]
+    fn projects_reject_a_malformed_key_empty_paths_and_relative_paths() {
+        for (yaml, needle) in [
+            ("projects:\n  claims:\n    paths: [/srv/claims]\n", "key must be <domain>/<project>"),
+            ("projects:\n  work/claims:\n    paths: []\n", "at least one path"),
+            ("projects:\n  work/claims:\n    paths: [code/claims]\n", "absolute"),
+        ] {
+            let f = write_config(&format!("vault_path: /tmp/v\nsession_sources: []\n{yaml}")).unwrap();
+            let error = load(Some(f.path())).err().expect("rejected").to_string();
+            assert!(error.contains(needle), "{error}");
+        }
     }
 }

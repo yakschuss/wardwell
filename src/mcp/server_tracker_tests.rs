@@ -51,6 +51,7 @@ pub(super) fn fixture(events: &[Event], readonly: bool) -> Fixture {
         kanban_prefixes: std::collections::HashMap::new(),
         features: Default::default(),
         trackers,
+        projects: Default::default(),
     };
     let server = WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None, Some(kanban));
     Fixture { _dir: dir, server }
@@ -462,6 +463,7 @@ fn two_servers_on_one_vault_share_the_cooldown_through_the_log() {
         kanban_prefixes: std::collections::HashMap::new(),
         features: Default::default(),
         trackers,
+        projects: Default::default(),
     };
     let mut second = WardwellServer::new(
         config,
