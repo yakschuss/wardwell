@@ -36,12 +36,54 @@ const GH_TIMEOUT: Duration = Duration::from_secs(120);
 /// What one `gh` run gave back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GhOutcome {
-    /// `gh` is not on PATH or could not start.
+    /// No `gh` was found, or it could not start.
     Missing,
-    /// `gh` ran and failed, or ran past its time limit.
-    Failed,
+    /// `gh` exited 4, its code for a missing or refused sign-in.
+    SignedOut,
+    /// `gh` exited non-zero with this status, or None when a signal stopped it.
+    Exited(Option<i32>),
+    /// `gh` ran past this limit and was stopped.
+    TimedOut(Duration),
+    /// `gh` wrote more than this many bytes.
+    Oversize(usize),
     /// `gh` exited zero with this standard output.
     Output(Vec<u8>),
+}
+
+/// The sentence for `gh` output that does not parse as a list.
+const UNPARSEABLE: &str = "gh returned output that is not a list of pull requests";
+
+/// The exit status `gh` uses when it is not signed in.
+const GH_SIGNED_OUT: i32 = 4;
+
+/// Why `gh` gave no list of pull requests.
+enum GhFailure {
+    /// No `gh` can read: none was found, or it is not signed in (the reason).
+    Absent(Option<&'static str>),
+    /// `gh` ran and failed, with the sentence that says how.
+    Failed(String),
+}
+
+impl GhFailure {
+    fn from(outcome: GhOutcome) -> Self {
+        match outcome {
+            GhOutcome::Missing => Self::Absent(None),
+            GhOutcome::SignedOut => Self::Absent(Some("gh is not signed in")),
+            GhOutcome::Exited(Some(status)) => Self::Failed(format!("gh exited with status {status}")),
+            GhOutcome::Exited(None) => Self::Failed("gh was stopped by a signal".to_string()),
+            GhOutcome::TimedOut(limit) => Self::Failed(format!("gh did not finish within {} seconds", limit.as_secs())),
+            GhOutcome::Oversize(limit) => Self::Failed(format!("gh output exceeded {limit} bytes")),
+            GhOutcome::Output(_) => Self::Failed(UNPARSEABLE.to_string()),
+        }
+    }
+
+    /// The sentence to put before a token read's error, if any.
+    fn sentence(&self) -> Option<String> {
+        match self {
+            Self::Absent(why) => why.map(str::to_string),
+            Self::Failed(sentence) => Some(sentence.clone()),
+        }
+    }
 }
 
 /// Runs `gh` with arguments. Injected so no test ever starts `gh`.
@@ -92,19 +134,51 @@ impl GitHub {
     }
 
     /// Doctor check: one cheap read of the repository. Tries `gh`, then the
-    /// token. Unreachable when neither can read; `team_not_found` when the
-    /// repository does not exist or is hidden from the reader.
-    pub fn check(&self) -> Result<Route, FailureCode> {
+    /// token. `credential` when neither can read; `provider` with the
+    /// sentence when `gh` failed and no token is stored; `team_not_found`
+    /// when the repository does not exist or is hidden from the reader.
+    pub fn check(&self) -> Result<Route, (FailureCode, Option<String>)> {
         let args = strings(&["repo", "view", &self.repository, "--json", "nameWithOwner"]);
-        if let GhOutcome::Output(_) = self.gh.run(&args) {
-            return Ok(Route::Gh);
-        }
-        let rest = self.rest.as_ref().ok_or(FailureCode::Credential)?;
+        let failure = match self.gh.run(&args) {
+            GhOutcome::Output(_) => return Ok(Route::Gh),
+            outcome => GhFailure::from(outcome),
+        };
+        let Some(rest) = self.rest.as_ref() else {
+            return Err(match failure {
+                GhFailure::Failed(sentence) => (FailureCode::Provider, Some(sentence)),
+                GhFailure::Absent(_) => (FailureCode::Credential, Some(self.no_reader(&failure))),
+            });
+        };
         match rest.get(&format!("/repos/{}", self.repository)) {
             Ok(_) => Ok(Route::Token),
-            Err(error) if error.contains(AUTH_REFUSED) => Err(FailureCode::Auth),
-            Err(error) if error.contains(NOT_FOUND) => Err(FailureCode::TeamNotFound),
-            Err(_) => Err(FailureCode::Provider),
+            Err(error) if error.contains(AUTH_REFUSED) => Err((FailureCode::Auth, None)),
+            Err(error) if error.contains(NOT_FOUND) => Err((FailureCode::TeamNotFound, None)),
+            Err(_) => Err((FailureCode::Provider, None)),
+        }
+    }
+
+    /// The unreachable line, after the reason `gh` cannot read when there is one.
+    fn no_reader(&self, failure: &GhFailure) -> String {
+        match failure.sentence() {
+            Some(why) => format!("{why}; {}", self.unreachable_message()),
+            None => self.unreachable_message(),
+        }
+    }
+
+    /// Merged pull requests and the reader that gave them: `gh` first, the
+    /// token when `gh` cannot read or fails.
+    fn read(&self, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Result<(Vec<Value>, Source), String> {
+        let failure = match self.read_gh(since, limit) {
+            Ok(nodes) => return Ok((nodes, Source::Gh)),
+            Err(failure) => failure,
+        };
+        match (&self.rest, &failure) {
+            (Some(rest), _) => self.read_rest(rest.as_ref(), since, limit).map(|nodes| (nodes, Source::Rest)).map_err(|error| match failure.sentence() {
+                Some(sentence) => format!("{sentence}; the API token read failed: {error}"),
+                None => error,
+            }),
+            (None, GhFailure::Absent(_)) => Err(self.no_reader(&failure)),
+            (None, GhFailure::Failed(sentence)) => Err(sentence.clone()),
         }
     }
 
@@ -113,17 +187,12 @@ impl GitHub {
         unreachable_line(&self.credential)
     }
 
-    /// Merged pull requests through `gh`, or None when `gh` did not answer.
-    fn read_gh(&self, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Option<Result<Vec<Value>, String>> {
+    /// Merged pull requests through `gh`, or why `gh` gave none.
+    fn read_gh(&self, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Result<Vec<Value>, GhFailure> {
         let args = gh_list_args(&self.repository, since, limit);
         match self.gh.run(&args) {
-            GhOutcome::Output(bytes) => Some(
-                serde_json::from_slice::<Value>(&bytes)
-                    .ok()
-                    .and_then(|v| v.as_array().cloned())
-                    .ok_or_else(|| "gh returned output that is not a list of pull requests".to_string()),
-            ),
-            GhOutcome::Missing | GhOutcome::Failed => None,
+            GhOutcome::Output(bytes) => parse_list(&bytes).ok_or_else(|| GhFailure::Failed(UNPARSEABLE.to_string())),
+            outcome => Err(GhFailure::from(outcome)),
         }
     }
 
@@ -154,11 +223,7 @@ impl Adapter for GitHub {
     fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
         let since = since.filter(|_| !full);
         let limit = (!full && since.is_none()).then_some(FIRST_PULL_LIMIT);
-        let (nodes, source) = match (self.read_gh(since, limit), &self.rest) {
-            (Some(read), _) => (read?, Source::Gh),
-            (None, Some(rest)) => (self.read_rest(rest.as_ref(), since, limit)?, Source::Rest),
-            (None, None) => return Err(self.unreachable_message()),
-        };
+        let (nodes, source) = self.read(since, limit)?;
         let mut events = Vec::new();
         for node in &nodes {
             let event = translate(&self.repository, node, source)?;
@@ -206,6 +271,10 @@ fn is_executable(file: &std::path::Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(file: &std::path::Path) -> bool {
     file.is_file()
+}
+
+fn parse_list(bytes: &[u8]) -> Option<Vec<Value>> {
+    serde_json::from_slice::<Value>(bytes).ok().and_then(|v| v.as_array().cloned())
 }
 
 /// The line doctor and a failed pull print when no reader is available.
@@ -329,7 +398,7 @@ impl GhRunner for SystemGh {
         };
         let Some(stdout) = child.stdout.take() else {
             let _ = child.kill();
-            return GhOutcome::Failed;
+            return GhOutcome::Missing;
         };
         // Read on a thread so a full pipe never blocks the wait below.
         let reader = std::thread::spawn(move || {
@@ -349,8 +418,12 @@ impl GhRunner for SystemGh {
             }
         };
         match (status, reader.join()) {
-            (Some(status), Ok(Ok(bytes))) if status.success() && bytes.len() <= RESPONSE_LIMIT => GhOutcome::Output(bytes),
-            _ => GhOutcome::Failed,
+            (None, _) => GhOutcome::TimedOut(GH_TIMEOUT),
+            (Some(_), Ok(Ok(bytes))) if bytes.len() > RESPONSE_LIMIT => GhOutcome::Oversize(RESPONSE_LIMIT),
+            (Some(status), _) if status.code() == Some(GH_SIGNED_OUT) => GhOutcome::SignedOut,
+            (Some(status), _) if !status.success() => GhOutcome::Exited(status.code()),
+            (Some(_), Ok(Ok(bytes))) => GhOutcome::Output(bytes),
+            (Some(_), _) => GhOutcome::Exited(None),
         }
     }
 }
@@ -576,13 +649,13 @@ pub(crate) mod tests {
     fn the_rest_first_pull_stops_at_the_limit_and_full_reads_every_page() {
         let full_page = |base: u64| -> Value { json!((0..PER_PAGE as u64).map(|n| rest_node(base - n, 10, true)).collect::<Vec<_>>()) };
         let pages = || vec![Ok(full_page(1000)), Ok(full_page(900)), Ok(full_page(800)), Ok(json!([rest_node(1, 1, true)]))];
-        let (gh, _) = gh_with(GhOutcome::Failed);
+        let (gh, _) = gh_with(GhOutcome::Exited(Some(1)));
         let (rest, calls) = rest_with(pages());
         let first = collect(&GitHub::new("acme/app", "github", gh, Some(rest)), None, false).unwrap();
         assert_eq!(first.len(), FIRST_PULL_LIMIT);
         assert_eq!(calls.borrow().len(), 2);
 
-        let (gh, _) = gh_with(GhOutcome::Failed);
+        let (gh, _) = gh_with(GhOutcome::Exited(Some(1)));
         let (rest, calls) = rest_with(pages());
         let all = collect(&GitHub::new("acme/app", "github", gh, Some(rest)), Some(at(9)), true).unwrap();
         assert_eq!(all.len(), 301);
@@ -599,15 +672,55 @@ pub(crate) mod tests {
 
     #[test]
     fn neither_gh_nor_a_token_is_unreachable_and_names_the_connect_command() {
-        for outcome in [GhOutcome::Missing, GhOutcome::Failed] {
+        let cases = [
+            (GhOutcome::Missing, "github: unreachable, run `wardwell tracker connect github`"),
+            (GhOutcome::SignedOut, "gh is not signed in; github: unreachable, run `wardwell tracker connect github`"),
+        ];
+        for (outcome, expected) in cases {
             let (gh, _) = gh_with(outcome);
             let error = collect(&GitHub::new("acme/app", "github", gh, None), None, false).unwrap_err();
-            assert_eq!(error, "github: unreachable, run `wardwell tracker connect github`");
+            assert_eq!(error, expected);
             assert!(error.contains(UNREACHABLE), "{error}");
-            let (gh, _) = gh_with(GhOutcome::Missing);
-            let named = GitHub::new("acme/app", "gh-work", gh, None).unreachable_message();
-            assert_eq!(named, "github: unreachable, run `wardwell tracker connect gh-work`");
         }
+        let (gh, _) = gh_with(GhOutcome::Missing);
+        let named = GitHub::new("acme/app", "gh-work", gh, None).unreachable_message();
+        assert_eq!(named, "github: unreachable, run `wardwell tracker connect gh-work`");
+    }
+
+    /// Each way `gh` can fail, with the sentence a pull reports for it.
+    fn gh_failures() -> Vec<(GhOutcome, &'static str)> {
+        vec![
+            (GhOutcome::Exited(Some(1)), "gh exited with status 1"),
+            (GhOutcome::Exited(None), "gh was stopped by a signal"),
+            (GhOutcome::TimedOut(Duration::from_secs(120)), "gh did not finish within 120 seconds"),
+            (GhOutcome::Oversize(RESPONSE_LIMIT), "gh output exceeded 16777216 bytes"),
+            (GhOutcome::Output(b"not json".to_vec()), "gh returned output that is not a list of pull requests"),
+        ]
+    }
+
+    #[test]
+    fn each_gh_failure_has_its_own_sentence_and_is_never_unreachable() {
+        for (outcome, sentence) in gh_failures() {
+            let (gh, _) = gh_with(outcome);
+            let error = collect(&GitHub::new("acme/app", "github", gh, None), None, false).unwrap_err();
+            assert_eq!(error, sentence);
+            assert!(!error.contains(UNREACHABLE) && !error.contains(AUTH_REFUSED), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_failing_gh_falls_through_to_the_token() {
+        for (outcome, sentence) in gh_failures().into_iter().chain([(GhOutcome::SignedOut, "gh is not signed in")]) {
+            let (gh, _) = gh_with(outcome);
+            let (rest, calls) = rest_with(vec![Ok(json!([rest_node(5, 10, true)]))]);
+            let events = collect(&GitHub::new("acme/app", "github", gh, Some(rest)), None, false).unwrap();
+            assert_eq!(events.len(), 1, "{sentence}");
+            assert_eq!(calls.borrow().len(), 1, "{sentence}");
+        }
+        let (gh, _) = gh_with(GhOutcome::Exited(Some(1)));
+        let (rest, _) = rest_with(vec![Err("GitHub returned HTTP 500".to_string())]);
+        let error = collect(&GitHub::new("acme/app", "github", gh, Some(rest)), None, false).unwrap_err();
+        assert_eq!(error, "gh exited with status 1; the API token read failed: GitHub returned HTTP 500");
     }
 
     #[test]
@@ -616,15 +729,6 @@ pub(crate) mod tests {
         assert_eq!(reply(404, None).unwrap_err(), NOT_FOUND);
         assert_eq!(reply(500, Some(json!({"message": "ghp_secret"}))).unwrap_err(), "GitHub returned HTTP 500");
         assert_eq!(reply(200, Some(json!([]))).unwrap(), json!([]));
-    }
-
-    #[test]
-    fn unparsable_gh_output_is_a_provider_error_not_a_fallback() {
-        let (gh, _) = gh_with(GhOutcome::Output(b"not json".to_vec()));
-        let (rest, calls) = rest_with(vec![]);
-        let error = collect(&GitHub::new("acme/app", "github", gh, Some(rest)), None, false).unwrap_err();
-        assert!(error.contains("not a list"), "{error}");
-        assert!(calls.borrow().is_empty());
     }
 
     /// An executable `gh` script in `dir` with `body` after the shebang.
@@ -680,7 +784,7 @@ pub(crate) mod tests {
             let rest = answer.map(|a| rest_with(vec![a]));
             let paths = rest.as_ref().map(|(_, calls)| calls.clone());
             let adapter = GitHub::new("acme/app", "github", gh, rest.map(|(r, _)| r));
-            assert_eq!(adapter.check(), expected);
+            assert_eq!(adapter.check().map_err(|(code, _)| code), expected);
             if let Some(paths) = paths {
                 assert_eq!(*paths.borrow(), vec!["/repos/acme/app"]);
             }

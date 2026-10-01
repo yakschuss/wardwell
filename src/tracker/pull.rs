@@ -856,6 +856,26 @@ mod tests {
     }
 
     #[test]
+    fn a_failing_gh_without_a_token_is_a_provider_failure_with_its_sentence() {
+        use crate::tracker::github::GhOutcome;
+        let cases = [
+            (GhOutcome::Exited(Some(1)), "gh exited with status 1", FailureCode::Provider),
+            (GhOutcome::TimedOut(Duration::from_secs(120)), "gh did not finish within 120 seconds", FailureCode::Provider),
+            (GhOutcome::Oversize(16), "gh output exceeded 16 bytes", FailureCode::Provider),
+            (GhOutcome::Output(b"{}".to_vec()), "gh returned output that is not a list of pull requests", FailureCode::Provider),
+            (GhOutcome::SignedOut, "gh is not signed in; github: unreachable, run `wardwell tracker connect github`", FailureCode::Credential),
+        ];
+        for (outcome, sentence, code) in cases {
+            let vault = tempfile::tempdir().unwrap();
+            let error = pull_project(vault.path(), &github(), &github_adapter(outcome), false, at(12)).unwrap_err();
+            assert_eq!((error.message.as_str(), error.code), (sentence, code));
+            let summary = log::read_for(&log::path_for(vault.path(), "work", "claims"), "github").unwrap();
+            assert_eq!(summary.last_failure, Some((at(12), code)));
+            assert_eq!(summary.last_pull_at, None, "no pull_completed");
+        }
+    }
+
+    #[test]
     fn neither_gh_nor_a_token_appends_a_credential_marker_without_secrets() {
         let vault = tempfile::tempdir().unwrap();
         let error = pull_project(vault.path(), &github(), &github_adapter(crate::tracker::github::GhOutcome::Missing), false, at(12)).unwrap_err();

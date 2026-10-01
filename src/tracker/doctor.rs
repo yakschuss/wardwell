@@ -157,8 +157,7 @@ fn check_github(config_dir: &Path, binding: &TrackerBinding, github: &GithubProb
     let reader = github(binding, credential.as_ref());
     let reached = match reader.check() {
         Ok(route) => Outcome::Found(format!("ok {}", route.describe())),
-        Err(FailureCode::Credential) => Outcome::Failed(FailureCode::Credential, Some(reader.unreachable_message())),
-        Err(code) => Outcome::Failed(code, None),
+        Err((code, sentence)) => Outcome::Failed(code, sentence),
     };
     vec![("github token".to_string(), token), (repository, reached)]
 }
@@ -405,6 +404,11 @@ mod tests {
         assert_eq!(lines[5], "work/claims: github repository acme/app failed (credential): github: unreachable, run `wardwell tracker connect github`");
         assert!(!healthy);
 
+        let (lines, _) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::TimedOut(std::time::Duration::from_secs(120)), None), &native);
+        assert_eq!(lines[5], "work/claims: github repository acme/app failed (provider): gh did not finish within 120 seconds");
+        let (lines, _) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::SignedOut, None), &native);
+        assert_eq!(lines[5], "work/claims: github repository acme/app failed (credential): gh is not signed in; github: unreachable, run `wardwell tracker connect github`");
+
         credential::save(&credential::path_in(dir.path(), "github").unwrap(), "ghp_secret").unwrap();
         let cases = [
             (Ok(json!({"full_name": "acme/app"})), "ok through the API token"),
@@ -412,7 +416,7 @@ mod tests {
             (Err("GitHub returned HTTP 404".to_string()), "failed (team_not_found)"),
         ];
         for (answer, expected) in cases {
-            let (lines, _) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::Failed, Some(answer)), &native);
+            let (lines, _) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::Exited(Some(1)), Some(answer)), &native);
             assert_eq!(lines[4], "work/claims: github token ok");
             assert_eq!(lines[5], format!("work/claims: github repository acme/app {expected}"));
             assert!(!lines.join("\n").contains("ghp_secret"));
