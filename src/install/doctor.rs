@@ -911,7 +911,7 @@ mod tests {
         put_agent(home, &binary);
         let (rows, ok) = policy_rows(&policy_config(home, true), home, &home.join("cfg"), &binary, true);
         assert!(ok, "{rows:?}");
-        assert_eq!(rows[0], format!("  {:<38} \u{2713} linear-updates v1", "Gate ruleset"));
+        assert_eq!(rows[0], format!("  {:<38} \u{2713} linear-updates v2", "Gate ruleset"));
         assert!(rows[1].contains("\u{2713} installed; runs"), "{}", rows[1]);
         assert!(rows[2].contains("7 of 7 destructive tools denied"), "{}", rows[2]);
         assert!(rows[3].contains("\u{2713} plist present, every 3600s, as `wardwell tracker schedule` wrote it; whether launchd loaded it is not checked offline"), "{}", rows[3]);

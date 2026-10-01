@@ -262,7 +262,7 @@ entries Wardwell added.
 
 The gate reads the PreToolUse payload on standard input. It prints a deny
 decision with the reason, or nothing to allow. It always exits 0. A payload it
-cannot read is allowed. The rules are the ruleset `linear-updates`, version 1,
+cannot read is allowed. The rules are the ruleset `linear-updates`, version 2,
 held as data in the binary:
 
 - A comment's first line starts with `Shipped:`, `Needs info:`, `Blocked:` or
@@ -278,7 +278,7 @@ held as data in the binary:
   words PR, merge, deploy, migration, webhook, adapter.
 - Each `COR-` key is `COR-` and digits. Each date is valid.
 - A session sets no priority. It sets no state, except `state: "Triage"` when
-  it creates an issue.
+  it creates an issue and `state: "Done"` on an existing issue.
 
 A per-project override, such as a `.wardwell/tracker-updates.md` file, is a
 follow-up. This version does not read one.
@@ -407,7 +407,7 @@ Checks that everything is wired correctly:
 - Local context and hosted-app connection entries configured in Claude Code and Codex
 - Local context configured in Claude Desktop; hosted access remains an account connector
 - SessionStart hook registered
-- Gate ruleset: its name and version, `linear-updates v1`
+- Gate ruleset: its name and version, `linear-updates v2`
 - Linear gate: installed when a linear binding has `gate: true`, and running this binary
 - Linear deny list: every destructive Linear tool denied
 - Tracker pull service: a row only when a launchd agent exists. It fails when the vault is under a folder macOS protects, and when the program it runs is gone. Whether launchd loaded it is not checked.
