@@ -36,7 +36,9 @@ fn env() -> Env {
         }
     });
     std::fs::write(home.join(".claude/settings.json"), serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
-    std::fs::write(home.join("Library/LaunchAgents/com.wardwell.tracker-pull.plist"), "plist").unwrap();
+    // The agent an earlier `setup` wrote, so uninstall's exact match removes it.
+    let agent = wardwell::tracker::schedule::launch_agent_plist(Path::new("/w/wardwell"), 3600, &wardwell::tracker::schedule::log_path(&cfg));
+    std::fs::write(home.join("Library/LaunchAgents/com.wardwell.tracker-pull.plist"), agent).unwrap();
     Env { _tmp: tmp, home, cfg, stub }
 }
 

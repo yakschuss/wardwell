@@ -134,7 +134,7 @@ enum TrackerCommand {
         #[arg(long)]
         force: bool,
     },
-    /// Run `tracker pull` on a launchd interval (macOS), replacing any existing agent
+    /// Run `tracker pull` on a launchd interval (macOS), replacing any existing agent; not needed for a vault in a folder macOS protects
     Schedule {
         /// Seconds between pulls
         #[arg(long, default_value_t = 3600)]
@@ -299,7 +299,8 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         }
         TrackerCommand::Schedule { interval_seconds } => {
             let exe = std::env::current_exe()?;
-            vec![cli::schedule(&home()?, &config_dir, interval_seconds, &SystemRunner, &exe, current_uid()?)?]
+            let vault = wardwell::config::loader::load(None).ok().map(|config| config.vault_path);
+            cli::schedule(&home()?, &config_dir, vault.as_deref(), interval_seconds, &SystemRunner, &exe, current_uid()?)?
         }
         TrackerCommand::Unschedule => vec![cli::unschedule(&home()?, &SystemRunner, current_uid()?)?],
     };

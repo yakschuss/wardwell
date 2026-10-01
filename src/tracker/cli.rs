@@ -144,20 +144,25 @@ fn status_with(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, s
 fn schedule_line(scheduled: Option<u32>) -> String {
     match scheduled {
         Some(seconds) => format!("pull schedule: every {seconds} s (plist on disk)"),
-        None => "pull schedule: not scheduled".to_string(),
+        None => "pull schedule: no launchd agent; session start and the running server refresh a mirror over an hour old".to_string(),
     }
 }
 
 /// Install the launchd agent that runs `tracker pull` every `interval_seconds`.
+/// For a vault under a folder macOS protects, the first line is the
+/// sentence that says why the session refresh is the better choice.
 pub fn schedule(
     home: &Path,
     config_dir: &Path,
+    vault: Option<&Path>,
     interval_seconds: u32,
     runner: &dyn LaunchctlRunner,
     current_exe: &Path,
     uid: u32,
-) -> Result<String, String> {
-    schedule::schedule(home, config_dir, interval_seconds, runner, current_exe, uid)
+) -> Result<Vec<String>, String> {
+    let installed = schedule::schedule(home, config_dir, interval_seconds, runner, current_exe, uid)?;
+    let warning = vault.filter(|vault| schedule::is_protected(vault, home)).map(|_| schedule::PROTECTED_SENTENCE.to_string());
+    Ok(warning.into_iter().chain([installed]).collect())
 }
 
 /// Remove the launchd agent.
@@ -618,10 +623,27 @@ mod tests {
         assert!(line.ends_with(". Stale. Reason: A pull started at 2026-09-01T11:30:00Z and did not finish."), "{line}");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_on_a_protected_vault_prints_the_one_sentence_and_still_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let fake = crate::tracker::schedule::fake::Fake::new(&[]);
+        let icloud = home.join("Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes");
+        let lines = schedule(&home, &home.join(".wardwell"), Some(&icloud), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        assert_eq!(lines[0], "macOS asks for consent after every upgrade, and the session refresh needs none.");
+        assert!(lines[1].starts_with("Scheduled tracker pull every 3600s"), "{lines:?}");
+        let elsewhere = schedule(&home, &home.join(".wardwell"), Some(&home.join("notes")), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
+        assert_eq!(elsewhere.len(), 1, "{elsewhere:?}");
+    }
+
     #[test]
     fn status_ends_with_the_schedule_line() {
         let (dir, config) = setup(false);
-        assert_eq!(status(&config, dir.path(), now(), None).last().unwrap(), "pull schedule: not scheduled");
+        assert_eq!(
+            status(&config, dir.path(), now(), None).last().unwrap(),
+            "pull schedule: no launchd agent; session start and the running server refresh a mirror over an hour old"
+        );
         assert_eq!(status(&config, dir.path(), now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
     }
 }
