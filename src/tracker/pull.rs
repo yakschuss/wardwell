@@ -216,7 +216,7 @@ mod tests {
                 title: format!("{key} Title: Todo"),
                 raw: serde_json::Value::Null,
             },
-            issue: IssueSnapshot {
+            issue: Box::new(IssueSnapshot {
                 issue_title: format!("{key} work"),
                 description: None,
                 state: "Todo".into(),
@@ -230,7 +230,8 @@ mod tests {
                 url: None,
                 created_at: None,
                 archived_at: None,
-            },
+                ..Default::default()
+            }),
         }
     }
 

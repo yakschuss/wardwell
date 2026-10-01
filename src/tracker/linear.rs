@@ -5,7 +5,7 @@
 //! Does NOT write to Linear, decide the cursor, or touch the vault.
 
 use crate::tracker::adapter::{Adapter, Sink};
-use crate::tracker::events::{Common, Event, IssueSnapshot, Priority, StateCategory};
+use crate::tracker::events::{Common, Event, IssueSnapshot, Priority, Relation, RelationKind, StateCategory};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,7 +27,10 @@ const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($first: Int!, $after: St
   issues(first: $first, after: $after, includeArchived: true, orderBy: updatedAt, filter: $filter) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id identifier title description url priority createdAt updatedAt archivedAt
+      id identifier title description url priority createdAt updatedAt archivedAt branchName
+      parent { identifier }
+      relations(first: 50) { nodes { type relatedIssue { identifier } } }
+      inverseRelations(first: 50) { nodes { type issue { identifier } } }
       state { name type }
       team { key }
       project { name }
@@ -210,9 +213,31 @@ fn translate_issue(node: &Value) -> Result<Vec<Event>, String> {
 fn snapshot_event(issue: &IssueRef, node: &Value, issue_title: String) -> Result<Event, String> {
     let state = name_of(node, "state").unwrap_or_default();
     let archived_at = time(node, "archivedAt")?;
+    let snapshot = IssueSnapshot {
+        issue_title,
+        description: text(node, "description"),
+        state_category: StateCategory::from_type(node["state"]["type"].as_str().unwrap_or_default()),
+        state: state.clone(),
+        priority: Priority::from_level(node["priority"].as_i64().unwrap_or(0)),
+        team: node.get("team").and_then(|t| text(t, "key")),
+        project: name_of(node, "project"),
+        assignee: name_of(node, "assignee"),
+        creator: name_of(node, "creator"),
+        labels: nodes(node, "labels").iter().filter_map(|l| text(l, "name")).collect(),
+        url: text(node, "url"),
+        created_at: time(node, "createdAt")?,
+        archived_at,
+        parent_key: node.get("parent").and_then(|p| text(p, "identifier")),
+        relations: relations(node),
+        branch_name: text(node, "branchName"),
+    };
+    let heading = match &snapshot.parent_key {
+        Some(parent) => format!("{} (sub-issue of {parent})", issue.heading),
+        None => issue.heading.clone(),
+    };
     let title = match archived_at {
-        Some(_) => format!("{}: archived ({state})", issue.heading),
-        None => format!("{}: {state}", issue.heading),
+        Some(_) => format!("{heading}: archived ({state})"),
+        None => format!("{heading}: {state}"),
     };
     let mut raw = node.clone();
     if let Some(object) = raw.as_object_mut() {
@@ -221,30 +246,44 @@ fn snapshot_event(issue: &IssueRef, node: &Value, issue_title: String) -> Result
         }
     }
     let mut common = issue.common("issue", node, required_time(node, "updatedAt")?, None, title)?;
-    // Linear does not bump updatedAt on archive, so the archive time joins the
-    // id; unarchived ids stay as they were so earlier logs still dedup.
+    // Linear does not bump updatedAt on archive or on a new relation, so the
+    // archive time and a digest of the structure join the id. A snapshot with
+    // neither keeps the id earlier logs hold, so they still dedup.
     if let Some(raw_archived) = text(node, "archivedAt") {
         common.id = format!("{}:{raw_archived}", common.id);
     }
+    if let Some(digest) = snapshot.structure_digest() {
+        common.id = format!("{}:{digest}", common.id);
+    }
     common.raw = raw;
-    Ok(Event::IssueUpserted {
-        common,
-        issue: IssueSnapshot {
-            issue_title,
-            description: text(node, "description"),
-            state_category: StateCategory::from_type(node["state"]["type"].as_str().unwrap_or_default()),
-            state,
-            priority: Priority::from_level(node["priority"].as_i64().unwrap_or(0)),
-            team: node.get("team").and_then(|t| text(t, "key")),
-            project: name_of(node, "project"),
-            assignee: name_of(node, "assignee"),
-            creator: name_of(node, "creator"),
-            labels: nodes(node, "labels").iter().filter_map(|l| text(l, "name")).collect(),
-            url: text(node, "url"),
-            created_at: time(node, "createdAt")?,
-            archived_at,
-        },
-    })
+    Ok(Event::IssueUpserted { common, issue: Box::new(snapshot) })
+}
+
+/// Linear relations in Wardwell's kinds, sorted and deduplicated. `relations`
+/// reads from this issue's side, `inverseRelations` from the other issue's.
+/// Types with no Wardwell kind (similar, the duplicated-by side) stay in raw.
+fn relations(node: &Value) -> Vec<Relation> {
+    let outward = nodes(node, "relations").iter().filter_map(|r| {
+        let kind = match r["type"].as_str()? {
+            "related" => RelationKind::Related,
+            "blocks" => RelationKind::Blocks,
+            "duplicate" => RelationKind::DuplicateOf,
+            _ => return None,
+        };
+        Some(Relation { kind, key: text(&r["relatedIssue"], "identifier")? })
+    });
+    let inward = nodes(node, "inverseRelations").iter().filter_map(|r| {
+        let kind = match r["type"].as_str()? {
+            "related" => RelationKind::Related,
+            "blocks" => RelationKind::BlockedBy,
+            _ => return None,
+        };
+        Some(Relation { kind, key: text(&r["issue"], "identifier")? })
+    });
+    let mut all: Vec<Relation> = outward.chain(inward).collect();
+    all.sort();
+    all.dedup();
+    all
 }
 
 fn comment_event(issue: &IssueRef, comment: &Value) -> Result<Event, String> {
@@ -362,7 +401,7 @@ async fn send(token: &str, body: Vec<u8>) -> Result<Value, String> {
 mod tests {
     use super::*;
     use crate::tracker::adapter::Adapter;
-    use crate::tracker::events::{Event, Priority, StateCategory};
+    use crate::tracker::events::{Event, Priority, RelationKind, StateCategory};
     use chrono::TimeZone;
     use serde_json::json;
     use std::cell::RefCell;
@@ -420,6 +459,26 @@ mod tests {
                 "creator": {"name": "John Roe"}
             }]}
         })
+    }
+
+    /// `issue` plus a parent, a branch, and relations in both directions,
+    /// including link types Wardwell has no kind for.
+    fn structured_issue(id: &str, key: &str, updated: &str) -> Value {
+        let mut node = issue(id, key, "Claims inbox shows wrong payer", updated, None);
+        node["parent"] = json!({"identifier": "COR-5"});
+        node["branchName"] = json!("jane/cor-12-claims-inbox");
+        node["relations"] = json!({"nodes": [
+            {"type": "blocks", "relatedIssue": {"identifier": "COR-14"}},
+            {"type": "duplicate", "relatedIssue": {"identifier": "COR-3"}},
+            {"type": "related", "relatedIssue": {"identifier": "COR-20"}},
+            {"type": "similar", "relatedIssue": {"identifier": "COR-21"}}
+        ]});
+        node["inverseRelations"] = json!({"nodes": [
+            {"type": "blocks", "issue": {"identifier": "COR-9"}},
+            {"type": "related", "issue": {"identifier": "COR-22"}},
+            {"type": "duplicate", "issue": {"identifier": "COR-23"}}
+        ]});
+        node
     }
 
     fn page(nodes: Vec<Value>, next: Option<&str>) -> Value {
@@ -509,6 +568,93 @@ mod tests {
         }).unwrap();
         assert_eq!(comment.1, "Seen on the March batch too.");
         assert_eq!(comment.0.raw["id"], "i1-c1");
+    }
+
+    #[test]
+    fn query_requests_parent_branch_and_both_relation_directions() {
+        for field in ["parent { identifier }", "branchName", "relations(", "relatedIssue { identifier }", "inverseRelations(", "issue { identifier }"] {
+            assert!(ISSUES_QUERY.contains(field), "{field}");
+        }
+    }
+
+    #[test]
+    fn snapshot_carries_parent_branch_and_known_relations() {
+        let transport = FakeTransport::new(vec![page(vec![structured_issue("i1", "COR-12", "2026-09-01T14:00:00.000Z")], None)]);
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
+        let Event::IssueUpserted { common, issue } = &events[0] else { panic!("snapshot first") };
+        assert_eq!(issue.parent_key.as_deref(), Some("COR-5"));
+        assert_eq!(issue.branch_name.as_deref(), Some("jane/cor-12-claims-inbox"));
+        let relations: Vec<(RelationKind, &str)> = issue.relations.iter().map(|r| (r.kind, r.key.as_str())).collect();
+        assert_eq!(relations, vec![
+            (RelationKind::Related, "COR-20"),
+            (RelationKind::Related, "COR-22"),
+            (RelationKind::Blocks, "COR-14"),
+            (RelationKind::BlockedBy, "COR-9"),
+            (RelationKind::DuplicateOf, "COR-3"),
+        ]);
+        assert_eq!(issue.labels, vec!["billing".to_string()]);
+        assert_eq!(issue.project.as_deref(), Some("Claims"));
+        assert_eq!(issue.assignee.as_deref(), Some("Jane Doe"));
+        assert_eq!(issue.priority, Priority::High);
+        assert_eq!(issue.url.as_deref(), Some("https://linear.app/corr/issue/COR-12"));
+        assert_eq!(common.title, "COR-12 Claims inbox shows wrong payer (sub-issue of COR-5): In Progress");
+        let digest = issue.structure_digest().unwrap();
+        assert_eq!(common.id, format!("linear:issue:i1:2026-09-01T14:00:00.000Z:{digest}"));
+        let raw = common.raw.to_string();
+        assert!(raw.contains("similar") && raw.contains("COR-21") && raw.contains("COR-23"), "unknown types stay in raw");
+    }
+
+    #[test]
+    fn archived_sub_issue_title_names_the_parent() {
+        let mut node = structured_issue("i1", "COR-12", "2026-09-01T14:00:00.000Z");
+        node["archivedAt"] = json!("2026-09-02T09:00:00.000Z");
+        let transport = FakeTransport::new(vec![page(vec![node], None)]);
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
+        let Event::IssueUpserted { common, issue } = &events[0] else { panic!("snapshot first") };
+        assert_eq!(common.title, "COR-12 Claims inbox shows wrong payer (sub-issue of COR-5): archived (In Progress)");
+        let digest = issue.structure_digest().unwrap();
+        assert_eq!(common.id, format!("linear:issue:i1:2026-09-01T14:00:00.000Z:2026-09-02T09:00:00.000Z:{digest}"));
+    }
+
+    #[test]
+    fn structure_change_without_an_updated_at_bump_appends_a_new_snapshot() {
+        use crate::config::TrackerBinding;
+        use crate::tracker::pull::pull_project;
+        let updated = "2026-09-01T14:00:00.000Z";
+        let first = structured_issue("i1", "COR-12", updated);
+        let mut reparented = first.clone();
+        reparented["parent"] = json!({"identifier": "COR-6"});
+        let mut related = reparented.clone();
+        related["relations"]["nodes"].as_array_mut().unwrap().push(json!({"type": "blocks", "relatedIssue": {"identifier": "COR-30"}}));
+        let transport = FakeTransport::new(vec![
+            page(vec![first], None),
+            page(vec![reparented.clone()], None),
+            page(vec![related], None),
+            page(vec![reparented], None),
+        ]);
+        let adapter = Linear::new(&transport, "COR");
+        let binding = TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "linear".into(),
+            team: "COR".into(),
+            credential: "corr-linear".into(),
+            readonly: true,
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 4);
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 1, "re-parent");
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 1, "new relation");
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 0, "a structure already seen dedups");
+    }
+
+    #[test]
+    fn issue_without_parent_relations_or_branch_keeps_its_legacy_id() {
+        let transport = FakeTransport::new(vec![page(vec![issue("i1", "COR-12", "T", "2026-09-01T14:00:00.000Z", None)], None)]);
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
+        assert_eq!(events[0].common().id, "linear:issue:i1:2026-09-01T14:00:00.000Z");
+        assert_eq!(events[0].common().title, "COR-12 T: In Progress");
     }
 
     #[test]

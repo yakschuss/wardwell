@@ -136,7 +136,7 @@ mod tests {
     fn upsert(id: &str, key: &str, hour: u32) -> Event {
         Event::IssueUpserted {
             common: common(id, key, hour),
-            issue: IssueSnapshot {
+            issue: Box::new(IssueSnapshot {
                 issue_title: "Title".into(),
                 description: None,
                 state: "Todo".into(),
@@ -150,7 +150,8 @@ mod tests {
                 url: None,
                 created_at: None,
                 archived_at: None,
-            },
+                ..Default::default()
+            }),
         }
     }
 
