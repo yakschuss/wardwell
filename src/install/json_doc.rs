@@ -195,26 +195,67 @@ pub fn reconcile(original: &Node, edited: &Value) -> Node {
             }
             Node::Object(out)
         }
-        (Node::Array(items), Value::Array(values)) => {
-            let mut used = vec![false; items.len()];
-            let mut out = Vec::new();
-            for (index, value) in values.iter().enumerate() {
-                let exact = items.iter().enumerate().position(|(j, item)| !used[j] && to_value(item) == *value);
-                let same_place = (index < items.len() && !used[index] && matches!(items[index], Node::Object(_)) && value.is_object())
-                    .then_some(index);
-                match exact.or(same_place) {
-                    Some(j) => {
-                        used[j] = true;
-                        out.push(reconcile(&items[j], value));
-                    }
-                    None => out.push(from_value(value)),
-                }
-            }
-            Node::Array(out)
-        }
+        (Node::Array(items), Value::Array(values)) => reconcile_list(items, values),
         (Node::Scalar(_), value) if to_value(original) == *value => original.clone(),
         (_, value) => from_value(value),
     }
+}
+
+/// Lay `values` over `items`. An equal original element is reused whole. An
+/// edited object takes the original at its position only when no element was
+/// added or removed; otherwise it takes the unused original object that shares
+/// the most equal entries with it, and none when no entry is shared. So a
+/// changed element never takes the text of a removed one.
+fn reconcile_list(items: &[Node], values: &[Value]) -> Node {
+    let originals: Vec<Value> = items.iter().map(to_value).collect();
+    let mut used = vec![false; items.len()];
+    let mut slots: Vec<Option<usize>> = values
+        .iter()
+        .map(|value| {
+            let j = (0..items.len()).find(|&j| !used[j] && originals[j] == *value)?;
+            used[j] = true;
+            Some(j)
+        })
+        .collect();
+    let same_length = items.len() == values.len();
+    for (index, value) in values.iter().enumerate() {
+        if slots[index].is_some() || !value.is_object() {
+            continue;
+        }
+        let pick = match same_length {
+            true => (!used[index] && originals[index].is_object()).then_some(index),
+            false => most_similar(&originals, &used, value),
+        };
+        if let Some(j) = pick {
+            used[j] = true;
+            slots[index] = Some(j);
+        }
+    }
+    Node::Array(
+        values
+            .iter()
+            .zip(slots)
+            .map(|(value, slot)| match slot {
+                Some(j) if originals[j] == *value => items[j].clone(),
+                Some(j) => reconcile(&items[j], value),
+                None => from_value(value),
+            })
+            .collect(),
+    )
+}
+
+/// The unused original object sharing the most equal entries with `value`.
+fn most_similar(originals: &[Value], used: &[bool], value: &Value) -> Option<usize> {
+    let map = value.as_object()?;
+    let shared = |j: usize| originals[j].as_object().map_or(0, |o| o.iter().filter(|(k, v)| map.get(*k) == Some(*v)).count());
+    let mut best: Option<(usize, usize)> = None;
+    for j in (0..originals.len()).filter(|&j| !used[j]) {
+        let score = shared(j);
+        if score > 0 && best.is_none_or(|(_, top)| score > top) {
+            best = Some((j, score));
+        }
+    }
+    best.map(|(j, _)| j)
 }
 
 /// Two-space pretty text with a final newline, as serde_json writes it.

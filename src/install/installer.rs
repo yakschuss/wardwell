@@ -942,6 +942,20 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_group_never_takes_a_removed_groups_text() {
+        let h = home();
+        let text = "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"mcp__linear__save_comment|mcp__linear__save_issue\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"python3 ~/.claude/hooks/linear-gate/linear-gate.py\"\n          }\n        ]\n      },\n      {\n        \"matcher\": \"mcp__linear__.*\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"audit\",\n            \"timeout\": 2e0\n          },\n          {\n            \"type\": \"command\",\n            \"command\": \"/old/wardwell gate linear\"\n          }\n        ]\n      }\n    ]\n  }\n}\n";
+        let path = settings_path(&h.home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, text).unwrap();
+        run(&h, &binding("linear", true));
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.contains("\"timeout\": 2e0"), "{after}");
+        assert!(!after.contains("linear-gate.py"), "{after}");
+        assert!(after.contains("\"matcher\": \"mcp__linear__.*\""), "{after}");
+    }
+
+    #[test]
     fn an_empty_settings_file_is_an_empty_object() {
         let h = home();
         let path = settings_path(&h.home);
