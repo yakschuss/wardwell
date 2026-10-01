@@ -819,7 +819,7 @@ mod tests {
         let h = home();
         put_settings(&h, json!({"permissions": {"deny": ["Bash(rm:*)", "mcp__linear__save_project"]}}));
         let plan = run(&h, &binding("linear", true));
-        assert!(rendered(&plan).contains("Tracker policy, optional: Linear gate, ruleset linear-updates v1"));
+        assert!(rendered(&plan).contains("Tracker policy, optional: Linear gate, ruleset linear-updates v2"));
         let s = settings(&h);
         assert_eq!(client_hooks::commands(&s, &GATE), vec![format!("'{BIN}' gate linear")]);
         assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "mcp__linear__save_comment|mcp__linear__save_issue");

@@ -37,20 +37,20 @@ pub struct Ruleset {
     pub banned_words: &'static [&'static str],
     /// The tracker key prefix, e.g. `COR` for `COR-12`.
     pub key_prefix: &'static str,
-    /// Issue fields a session must never set.
-    pub locked_fields: &'static [&'static str],
     /// The only `state` values a session may set, and only on create.
     pub create_states: &'static [&'static str],
+    /// The only `state` values a session may set on an existing issue (the owner's rule of 2026-10-01).
+    pub update_states: &'static [&'static str],
     /// Destructive tools the client deny list blocks outright.
     pub denied_tools: &'static [&'static str],
 }
 
 const FILE_EXTENSIONS: &str = r"\b\w+\.(?:rb|py|ts|tsx|js|jsx|md|yml|yaml|json|erb|css|scss|html|sql|csv|pdf|txt|lock|sh|toml|rake)\b";
 
-/// The rules in corrtex `docs/operations/LINEAR_UPDATES.md`, version 1.
+/// The rules in corrtex `docs/operations/LINEAR_UPDATES.md`, version 2.
 pub const LINEAR_UPDATES: Ruleset = Ruleset {
     name: "linear-updates",
-    version: 1,
+    version: 2,
     team_heading: "for the team",
     divider: "---",
     comment_shapes: &[
@@ -79,8 +79,8 @@ pub const LINEAR_UPDATES: Ruleset = Ruleset {
     ],
     banned_words: &["PR", "merge", "deploy", "migration", "webhook", "adapter"],
     key_prefix: "COR",
-    locked_fields: &["state", "priority"],
     create_states: &["Triage"],
+    update_states: &["Done"],
     denied_tools: &[
         "mcp__linear__delete_comment",
         "mcp__linear__delete_attachment",

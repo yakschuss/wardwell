@@ -108,12 +108,14 @@ fn check_comment(rules: &Ruleset, body: &str) -> Verdict {
 fn check_issue(rules: &Ruleset, input: &Map<String, Value>) -> Verdict {
     let fields = rules.issue_fields.join(", ");
     let creating = !input.contains_key("id");
-    for key in rules.locked_fields {
-        let Some(value) = input.get(*key) else { continue };
-        if *key == "state" && creating && value.as_str().is_some_and(|state| rules.create_states.contains(&state)) {
-            continue;
+    if input.contains_key("priority") {
+        return Ok(Some(locked_reason(rules, "priority")));
+    }
+    if let Some(value) = input.get("state") {
+        let allowed = if creating { rules.create_states } else { rules.update_states };
+        if !value.as_str().is_some_and(|state| allowed.contains(&state)) {
+            return Ok(Some(locked_reason(rules, "state")));
         }
-        return Ok(Some(locked_reason(rules, key)));
     }
     if !creating {
         return Ok(None);
@@ -142,10 +144,10 @@ fn check_issue(rules: &Ruleset, input: &Map<String, Value>) -> Verdict {
     Ok(None)
 }
 
-fn locked_reason(rules: &Ruleset, key: &str) -> String {
+fn locked_reason(_rules: &Ruleset, key: &str) -> String {
     let base = format!("save_issue must not set '{key}' from a session; the PR and weekly triage set it");
     match key {
-        "state" => format!("{base}. A new issue may set state only to: {}", rules.create_states.join(", ")),
+        "state" => format!("{base}. A new issue may be created in Triage. An existing issue may be set to Done."),
         _ => base,
     }
 }
@@ -515,8 +517,25 @@ Display only.";
     }
 
     #[test]
-    fn update_with_state() {
-        denied(ISSUE_TOOL, json!({"id": "COR-5", "state": "Done"}), "state");
+    fn update_with_state_done_is_allowed() {
+        // The owner changed the rule on 2026-10-01: an existing issue may be set to Done.
+        allowed(ISSUE_TOOL, json!({"id": "COR-5", "state": "Done"}));
+    }
+
+    #[test]
+    fn update_with_any_other_state_is_denied_and_names_done() {
+        for state in [
+            json!("In Progress"), json!("In Testing"), json!("Canceled"), json!("Triage"),
+            json!("done"), json!("completed"), json!(null), json!(1),
+        ] {
+            let reason = denied(ISSUE_TOOL, json!({"id": "COR-5", "state": state}), "'state'");
+            assert!(reason.contains("Done"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn update_with_done_still_may_not_set_priority() {
+        denied(ISSUE_TOOL, json!({"id": "COR-5", "state": "Done", "priority": 1}), "priority");
     }
 
     #[test]
@@ -622,6 +641,6 @@ Display only.";
 
     #[test]
     fn ruleset_is_named_and_versioned() {
-        assert_eq!((LINEAR_UPDATES.name, LINEAR_UPDATES.version), ("linear-updates", 1));
+        assert_eq!((LINEAR_UPDATES.name, LINEAR_UPDATES.version), ("linear-updates", 2));
     }
 }

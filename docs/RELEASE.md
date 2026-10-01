@@ -3,6 +3,13 @@
 The owner runs these steps. An agent prepares the release commit but never
 tags or pushes a tag.
 
+## 0.13.2
+
+The steps are the ones for 0.13.0 below, with `0.13.2` in place of `0.13.0`.
+
+0.13.2 changes the Linear gate to ruleset `linear-updates` version 2. A
+session may now set an existing issue to `Done`, and only `Done`.
+
 ## 0.13.1
 
 The steps are the ones for 0.13.0 below, with `0.13.1` in place of `0.13.0`.

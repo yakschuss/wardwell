@@ -143,7 +143,7 @@ Planned only when a tracker binding has `provider: linear` and `gate: true`. Eac
 
 - A hook entry that runs `linear-gate.py` (directly or through a Python interpreter) is removed, with its own plan line. The script file is not deleted. With the policy off, the entry is kept and the plan says how to replace it.
 - With the policy off, a gate and recorded deny entries left by an earlier run are removed.
-- The rules are the ruleset `linear-updates`, version 1, held as data in the binary. A per-project override file is a follow-up.
+- The rules are the ruleset `linear-updates`, version 2, held as data in the binary. A per-project override file is a follow-up.
 
 ### Install record
 
