@@ -214,7 +214,7 @@ fn index_jsonl_incremental(
     embedder: &mut Option<&mut Embedder>,
     error_details: &mut Vec<String>,
 ) -> Result<usize, IndexError> {
-    let watermark = store.get_watermark(rel_path)?;
+    let mut watermark = store.get_watermark(rel_path)?;
 
     // Count content lines (skip schema headers and empty lines, matching chunk_jsonl behavior)
     let content_lines: Vec<&str> = vf.body.lines()
@@ -223,6 +223,14 @@ fn index_jsonl_incremental(
             !trimmed.is_empty() && !trimmed.starts_with("{\"_schema\"")
         })
         .collect();
+
+    // A rewritten file (e.g. `wardwell tracker compact`) no longer matches
+    // the lines already indexed: drop its chunks and index it from the start.
+    if watermark > 0 && was_rewritten(store, rel_path, &content_lines, watermark)? {
+        store.remove_chunks(rel_path)?;
+        store.remove_watermark(rel_path)?;
+        watermark = 0;
+    }
 
     let total_lines = content_lines.len();
     if total_lines <= watermark {
@@ -291,6 +299,33 @@ fn index_jsonl_incremental(
 
     store.set_watermark(rel_path, total_lines)?;
     Ok(if new_embedded > 0 { new_embedded } else { offset_chunks.len() })
+}
+
+/// True when the file is shorter than the watermark, or its first or last
+/// indexed line differs from the chunk stored for it.
+fn was_rewritten(store: &IndexStore, rel_path: &str, lines: &[&str], watermark: usize) -> Result<bool, IndexError> {
+    if lines.len() < watermark {
+        return Ok(true);
+    }
+    for index in [0, watermark - 1] {
+        let stored = stored_chunk_hash(store, rel_path, index)?;
+        if stored.as_deref() != Some(compute_hash(lines[index].trim()).as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn stored_chunk_hash(store: &IndexStore, rel_path: &str, index: usize) -> Result<Option<String>, IndexError> {
+    let conn = store.lock()?;
+    let hash = conn
+        .query_row(
+            "SELECT body_hash FROM vault_chunks WHERE chunk_id = ?1",
+            rusqlite::params![format!("{rel_path}::{index}")],
+            |row| row.get::<_, String>(0),
+        )
+        .ok();
+    Ok(hash)
 }
 
 #[cfg(test)]
@@ -585,6 +620,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(chunk_count, 3);
+    }
+
+    #[test]
+    fn rewritten_jsonl_is_reindexed_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("work").join("claims");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("tracker.jsonl");
+        let header = "{\"_schema\":\"tracker\",\"_version\":\"1.0\"}";
+        let heavy = |id: &str| format!("{{\"id\":\"{id}\",\"title\":\"COR-1 Row {id}\",\"raw\":{{\"note\":\"zebrapayload\"}}}}");
+        let light = |id: &str| format!("{{\"id\":\"{id}\",\"title\":\"COR-1 Row {id}\"}}");
+        let count_chunks = |store: &IndexStore| -> i64 {
+            store.lock().unwrap()
+                .query_row("SELECT COUNT(*) FROM vault_chunks WHERE path = 'work/claims/tracker.jsonl'", [], |row| row.get(0))
+                .unwrap()
+        };
+        let zebra = |store: &IndexStore| store.chunk_fts_search("zebrapayload", 10, None).unwrap().len()
+            + store.search(&crate::index::fts::SearchQuery { query: "zebrapayload".into(), limit: 5, ..Default::default() }).unwrap().total;
+
+        let store = IndexStore::in_memory().unwrap();
+        std::fs::write(&path, format!("{header}\n{}\n{}\n{}\n", heavy("a"), heavy("a"), heavy("b"))).unwrap();
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(count_chunks(&store), 3);
+        assert!(zebra(&store) > 0);
+
+        // Same line count, every line rewritten.
+        std::fs::write(&path, format!("{header}\n{}\n{}\n{}\n", light("a"), light("c"), light("b"))).unwrap();
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(count_chunks(&store), 3);
+        assert_eq!(zebra(&store), 0, "old raw text is gone from both tables");
+
+        // Fewer lines than the watermark: a compacted log.
+        std::fs::write(&path, format!("{header}\n{}\n{}\n", light("a"), light("b"))).unwrap();
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(count_chunks(&store), 2);
+        assert_eq!(store.get_watermark("work/claims/tracker.jsonl").unwrap(), 2);
+        assert_eq!(store.chunk_fts_search("c", 10, None).unwrap().len(), 0);
     }
 
     #[test]
