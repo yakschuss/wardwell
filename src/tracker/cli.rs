@@ -65,11 +65,14 @@ fn pull_summary(outcome: &crate::tracker::pull::PullOutcome) -> String {
 const SEARCH_BY_MEANING_RETURNS: &str = "Search by meaning returns for this log after you run `wardwell reindex`.";
 
 /// Compact every bound project's log, or only `only`. One line per
-/// project; fails with every project's error if any project failed.
+/// project, however many bindings share its log; fails with every
+/// project's error if any project failed.
 pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     let mut failures = Vec::new();
-    for (key, binding) in selected(config, only)? {
+    let mut projects = selected(config, only)?;
+    projects.dedup_by(|a, b| a.0 == b.0);
+    for (key, binding) in projects {
         let path = log::path_for(&config.vault_path, &binding.domain, &binding.project);
         match compact::compact(&path, force, lock::DEFAULT_WAIT) {
             Ok(outcome) if !outcome.changed => lines.push(format!("{key}: already compact, {} events", outcome.events)),
@@ -115,17 +118,23 @@ fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(S
     }
 }
 
-/// One line per bound project: provider, last pull and its age, last full
-/// resync, event count, readonly flag, and the closed code when the binding
-/// cannot pull or its last pull failed; then one line on the pull schedule
-/// (`scheduled` is the interval from the installed plist, if any).
+/// One line per binding: provider, team or repository, last pull and its
+/// age, last full resync, event count, readonly flag for an issue tracker,
+/// and the closed code when the binding cannot pull or its last pull
+/// failed, each read from that provider's own events; then one line on the
+/// pull schedule (`scheduled` is the interval from the installed plist, if any).
 pub fn status(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
+    status_with(config, config_dir, now, scheduled, crate::tracker::github::gh_on_path())
+}
+
+/// `status`, told whether `gh` is on PATH.
+fn status_with(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>, gh_on_path: bool) -> Vec<String> {
     let mut lines = match config.trackers.is_empty() {
         true => vec!["No trackers bound. Add a trackers section to config.yml.".to_string()],
         false => config
             .trackers
             .iter()
-            .map(|binding| status_line(&config.vault_path, config_dir, &binding.key(), binding, now))
+            .map(|binding| status_line(&config.vault_path, config_dir, &binding.key(), binding, now, gh_on_path))
             .collect(),
     };
     lines.push(schedule_line(scheduled));
@@ -157,26 +166,28 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
 }
 
 /// Read-only check that a pull could start: a known provider and a
-/// readable credential. Never opens the network.
-fn cannot_pull(config_dir: &Path, binding: &TrackerBinding) -> Option<FailureCode> {
+/// readable credential, or for github `gh` on PATH. Never opens the network
+/// and never runs `gh`.
+fn cannot_pull(config_dir: &Path, binding: &TrackerBinding, gh_on_path: bool) -> Option<FailureCode> {
     if !crate::tracker::SUPPORTED_PROVIDERS.contains(&binding.provider.as_str()) {
         return Some(FailureCode::UnsupportedProvider);
     }
-    credential::path_in(config_dir, &binding.credential)
-        .and_then(|path| credential::load(&path))
-        .err()
-        .map(|_| FailureCode::Credential)
+    crate::tracker::doctor::check_offline_with(config_dir, binding, gh_on_path).err().map(|(code, _)| code)
 }
 
-fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>) -> String {
-    let mode = if binding.readonly { "readonly" } else { "writable" };
-    let head = format!("{key}: {} {} ({mode})", binding.provider, binding.team);
+fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>, gh_on_path: bool) -> String {
+    let mode = match (crate::tracker::mirrors_issues(&binding.provider), binding.readonly) {
+        (false, _) => String::new(),
+        (true, true) => " (readonly)".to_string(),
+        (true, false) => " (writable)".to_string(),
+    };
+    let head = format!("{key}: {} {}{mode}", binding.provider, binding.scope());
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let summary = match log::read(&path) {
+    let summary = match log::read_for(&path, &binding.provider) {
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
-    let blocked = cannot_pull(config_dir, binding).map(|code| format!(", cannot pull ({})", code.as_str()));
+    let blocked = cannot_pull(config_dir, binding, gh_on_path).map(|code| format!(", cannot pull ({})", code.as_str()));
     let last = summary.last_failure.map(|(at, code)| format!(", last error {} at {}", code.as_str(), stamp(at)));
     let failure = match (blocked, last) {
         (None, None) => ", no errors".to_string(),
@@ -448,6 +459,38 @@ mod tests {
             assert_eq!(log::read_for(&path, healthy).unwrap().last_failure, None);
             assert_eq!(log::read_for(&path, broken).unwrap().last_failure.map(|(_, c)| c), Some(FailureCode::Provider));
         }
+    }
+
+    #[test]
+    fn compact_runs_once_for_a_project_with_two_bindings() {
+        let (dir, config) = linear_and_github();
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
+        let lines = compact(&config, None, false).unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("work/claims: already compact"), "{lines:?}");
+        assert_eq!(compact(&config, Some("work/claims"), false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_lists_each_binding_of_a_project_from_its_own_events() {
+        let (dir, config) = linear_and_github();
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
+        let later = now() + chrono::TimeDelta::minutes(10);
+        let github_breaks = |binding: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>| -> Result<Box<dyn Adapter>, String> {
+            match binding.provider.as_str() {
+                "github" => Ok(Box::new(Broken)),
+                _ => Ok(Box::new(Empty)),
+            }
+        };
+        pull(&config, dir.path(), None, Mode::Incremental, later, &github_breaks).unwrap_err();
+        let lines = status_with(&config, dir.path(), later, None, false);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].starts_with("work/claims: linear COR (writable), last pull 2026-09-01T12:10:00Z"), "{}", lines[0]);
+        assert!(lines[0].ends_with("no errors"), "{}", lines[0]);
+        assert!(lines[1].starts_with("work/claims: github acme/app, last pull 2026-09-01T12:00:00Z (10m ago), last full resync never, 2 events"), "{}", lines[1]);
+        assert!(lines[1].ends_with(", cannot pull (credential), last error provider at 2026-09-01T12:10:00Z"), "{}", lines[1]);
+        let reachable = status_with(&config, dir.path(), later, None, true);
+        assert!(reachable[1].ends_with("10m ago), last full resync never, 2 events, last error provider at 2026-09-01T12:10:00Z"), "{}", reachable[1]);
     }
 
     #[test]

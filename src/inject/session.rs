@@ -27,7 +27,7 @@ pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain:
     let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let binding = config.tracker_for(domain, project)?;
     let blocked = crate::tracker::doctor::check_offline(config_dir, binding).err().map(|(code, _)| code);
-    let view = MirrorView::read(&project_dir.join(crate::tracker::events::FILE_NAME)).unwrap_or_default();
+    let view = MirrorView::read_for(&project_dir.join(crate::tracker::events::FILE_NAME), &binding.provider).unwrap_or_default();
     Some(tracker_section(&view, now, blocked))
 }
 
@@ -251,6 +251,23 @@ mod tests {
         let ready = project_tracker_lines(&config, dir.path(), "work", &project, now()).unwrap();
         assert_eq!(ready, vec!["Tracker mirror. Never pulled. Not authoritative."]);
         assert!(project_tracker_lines(&config, dir.path(), "work", &vault.join("work/ops"), now()).is_none());
+    }
+
+    #[test]
+    fn the_section_reads_the_issue_binding_and_ignores_merged_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        let project = vault.join("work/claims");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("tracker.jsonl"), crate::tracker::view::two_provider_log()).unwrap();
+        let yaml = |trackers: &str| format!("vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n{trackers}", vault.display());
+        let both = crate::config::loader::parse(&yaml("    - provider: github\n      repository: acme/app\n    - provider: linear\n      team: COR\n      credential: c\n")).unwrap();
+        crate::tracker::credential::save(&crate::tracker::credential::path_in(dir.path(), "c").unwrap(), "t").unwrap();
+        let lines = project_tracker_lines(&both, dir.path(), "work", &project, now()).unwrap();
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 1 hour ago. Not authoritative.", "- COR-1 Claims inbox (In Progress)"]);
+
+        let github_only = crate::config::loader::parse(&yaml("    provider: github\n    repository: acme/app\n")).unwrap();
+        assert!(project_tracker_lines(&github_only, dir.path(), "work", &project, now()).is_none(), "no issue binding, no section");
     }
 
     #[test]

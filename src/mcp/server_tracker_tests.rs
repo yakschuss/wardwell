@@ -701,3 +701,43 @@ fn a_team_key_equal_to_the_derived_native_prefix_leaves_the_mirror_out_with_a_no
     let p: KanbanParams = serde_json::from_value(json!({"action": "move", "ticket_id": "CL-1", "status": "done"})).unwrap();
     assert!(f.server.tracker_refusal(f.server.kanban.as_ref().unwrap(), &p).is_none(), "the native ticket stays writable");
 }
+
+/// A change the GitHub mirror of `acme/app` saw merged at `at`, naming COR-12.
+fn merged_change(at: chrono::DateTime<chrono::Utc>) -> Event {
+    let mut common = common("github:acme/app#42", "acme/app#42", at);
+    common.provider = "github".into();
+    common.title = "acme/app#42 merged into main: COR-12 Fix the claims inbox".into();
+    Event::ChangeMerged {
+        common,
+        change: Box::new(crate::tracker::events::MergedChange { number: 42, title: "COR-12 Fix the claims inbox".into(), merged_at: at, keys: vec!["COR-12".into()], ..Default::default() }),
+    }
+}
+
+#[test]
+fn the_kanban_read_path_ignores_merged_changes_and_github_markers() {
+    let now = chrono::Utc::now();
+    let (mut f, calls) = refresh_fixture(vec![], None);
+    let mut github = binding(false);
+    github.provider = "github".into();
+    github.team = String::new();
+    github.repository = Some("acme/app".into());
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.push(github);
+    let mut github_pull = pulled(now);
+    if let Event::PullCompleted { common, .. } = &mut github_pull {
+        common.provider = "github".into();
+        common.id = format!("wardwell:pull_completed:acme/app:{now}");
+    }
+    write_mirror(&f.server.vault_root, &[merged_change(now), github_pull]);
+
+    let listed = kanban(&f.server, json!({"action": "list", "project": "claims"}));
+    assert_eq!(keys(&listed), vec!["CL-1", "COR-12", "COR-14"], "{listed}");
+    assert_eq!(listed["items"][1]["last_pulled_age"], "1 hour ago", "the github marker is not the issue mirror's pull: {listed}");
+    let searched = kanban(&f.server, json!({"action": "search", "query": "claims inbox"}));
+    assert!(!searched.to_string().contains("acme/app#42"), "{searched}");
+    let queried = kanban(&f.server, json!({"action": "query", "question": "in_progress", "project": "claims"}));
+    assert!(!queried.to_string().contains("acme/app#42"), "{queried}");
+
+    let got = kanban(&f.server, json!({"action": "get", "ticket_id": "acme/app#42"}));
+    assert!(got["item"].is_null(), "{got}");
+    assert!(calls.lock().unwrap().is_empty(), "no refresh for a merged change: {got}");
+}

@@ -393,10 +393,10 @@ fn path_status(path: &Path, git: &impl Fn(&Path) -> Option<crate::inject::git::G
 
 /// ` Last pull 2 hours ago.` for a bound project, empty otherwise.
 fn last_pull(config: &crate::config::loader::WardwellConfig, mapping: &crate::config::loader::ProjectMapping, folder: &Path, now: chrono::DateTime<chrono::Utc>) -> String {
-    if config.tracker_for(&mapping.domain, &mapping.project).is_none() {
+    let Some(binding) = config.tracker_for(&mapping.domain, &mapping.project) else {
         return String::new();
-    }
-    let view = crate::tracker::view::MirrorView::read(&folder.join(crate::tracker::events::FILE_NAME)).unwrap_or_default();
+    };
+    let view = crate::tracker::view::MirrorView::read_for(&folder.join(crate::tracker::events::FILE_NAME), &binding.provider).unwrap_or_default();
     view.last_pull_at.map_or(" Never pulled.".to_string(), |at| format!(" Last pull {} ago.", crate::tracker::view::age_words(now - at)))
 }
 

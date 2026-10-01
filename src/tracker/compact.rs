@@ -307,6 +307,38 @@ mod tests {
     }
 
     #[test]
+    fn two_providers_in_one_log_compact_and_verify_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work/claims/tracker.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut lines: Vec<String> = crate::tracker::view::two_provider_log().lines().map(str::to_string).collect();
+        for (index, raw) in [(1, json!({"identifier": "COR-1"})), (3, json!({"number": 42, "title": "COR-1 Fix the claims inbox"}))] {
+            let mut row: Value = serde_json::from_str(&lines[index]).unwrap();
+            row["raw"] = raw;
+            lines[index] = row.to_string();
+        }
+        lines.push(lines[3].clone());
+        lines.push(lines[2].clone());
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let linear_before = log::read_for(&path, "linear").unwrap();
+        let github_before = log::read_for(&path, "github").unwrap();
+
+        let outcome = compact(&path, false, lock::TEST_FREE_WAIT).unwrap();
+        assert_eq!((outcome.events, outcome.moved_raw, outcome.duplicates_removed), (4, 2, 2));
+        let raws = log::read_raw(&log::raw_path_for(&path)).unwrap();
+        assert_eq!(raws["github:acme/app#42"]["number"], 42);
+        assert_eq!(raws["linear:issue:i1:1"]["identifier"], "COR-1");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(!after.contains("\"raw\""), "{after}");
+        assert_eq!(after.matches("\"kind\":\"change_merged\"").count(), 1, "{after}");
+        for (provider, before) in [("linear", linear_before), ("github", github_before)] {
+            let now = log::read_for(&path, provider).unwrap();
+            assert_eq!((now.cursor, now.last_pull_at, now.last_failure), (before.cursor, before.last_pull_at, before.last_failure), "{provider}");
+        }
+        assert!(!compact(&path, false, lock::TEST_FREE_WAIT).unwrap().changed);
+    }
+
+    #[test]
     fn second_run_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let path = old_log(dir.path());

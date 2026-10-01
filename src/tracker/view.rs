@@ -54,9 +54,19 @@ pub struct MirrorView {
 }
 
 impl MirrorView {
+    /// Fold `provider`'s events in the log at `path`. Another provider's
+    /// rows, merged changes and markers alike, never reach the view.
+    pub fn read_for(path: &Path, provider: &str) -> Result<Self, String> {
+        Self::read_filtered(path, Some(provider))
+    }
+
     /// Fold the log at `path`. A missing file is an empty mirror; unreadable
     /// lines are skipped.
     pub fn read(path: &Path) -> Result<Self, String> {
+        Self::read_filtered(path, None)
+    }
+
+    fn read_filtered(path: &Path, provider: Option<&str>) -> Result<Self, String> {
         let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
@@ -68,6 +78,7 @@ impl MirrorView {
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with("{\"_schema\""))
             .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .filter(|event| provider.is_none_or(|p| event.common().provider == p))
             .for_each(|event| view.observe(event));
         Ok(view)
     }
@@ -121,6 +132,22 @@ impl MirrorView {
             _ => {}
         }
     }
+}
+
+/// A log body that interleaves both providers on 2026-09-30: a started
+/// Linear issue COR-1 and Linear's completed pull at 11:00, then a GitHub
+/// merged change at 11:30 and a failed GitHub pull at 11:45.
+#[cfg(test)]
+pub(crate) fn two_provider_log() -> String {
+    [
+        crate::tracker::events::SCHEMA_HEADER,
+        r#"{"kind":"issue_upserted","id":"linear:issue:i1:1","provider":"linear","external_key":"COR-1","external_id":"i1","occurred_at":"2026-09-30T10:00:00Z","title":"COR-1 Claims inbox: In Progress","issue":{"issue_title":"Claims inbox","state":"In Progress","state_category":"started","priority":"none"}}"#,
+        r#"{"kind":"pull_completed","id":"wardwell:pull_completed:COR:1","provider":"linear","external_key":"COR","external_id":"COR","actor":"wardwell","occurred_at":"2026-09-30T11:00:00Z","title":"COR pull from Linear completed","through":"2026-09-30T10:00:00Z"}"#,
+        r#"{"kind":"change_merged","id":"github:acme/app#42","provider":"github","external_key":"acme/app#42","external_id":"PR_42","actor":"jdoe","occurred_at":"2026-09-30T11:30:00Z","title":"acme/app#42 merged into main: COR-1 Fix the claims inbox","change":{"number":42,"title":"COR-1 Fix the claims inbox","merged_at":"2026-09-30T11:30:00Z","base_branch":"main","keys":["COR-1"]}}"#,
+        r#"{"kind":"pull_failed","id":"wardwell:pull_failed:acme/app:1","provider":"github","external_key":"acme/app","external_id":"acme/app","actor":"wardwell","occurred_at":"2026-09-30T11:45:00Z","title":"acme/app pull from GitHub failed: provider","code":"provider"}"#,
+    ]
+    .map(|line| format!("{line}\n"))
+    .concat()
 }
 
 /// An age in plain words, such as `5 minutes` or `12 days`.
@@ -281,6 +308,20 @@ mod tests {
             Event::PullCompleted { common: common("p1", "COR", 10), through: None },
         ]);
         assert_eq!(MirrorView::read(&path).unwrap().failed_since_last_pull(), None);
+    }
+
+    #[test]
+    fn a_provider_view_ignores_the_other_providers_changes_and_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        std::fs::write(&path, two_provider_log()).unwrap();
+        let linear = MirrorView::read_for(&path, "linear").unwrap();
+        assert_eq!(linear.issues.keys().collect::<Vec<_>>(), vec!["COR-1"]);
+        assert_eq!(linear.last_pull_at, Some(Utc.with_ymd_and_hms(2026, 9, 30, 11, 0, 0).unwrap()));
+        assert_eq!(linear.failed_since_last_pull(), None, "the github failure is not linear's");
+        let github = MirrorView::read_for(&path, "github").unwrap();
+        assert!(github.issues.is_empty(), "a merged change is not an issue");
+        assert_eq!(github.failed_since_last_pull(), Some(FailureCode::Provider));
     }
 
     #[test]

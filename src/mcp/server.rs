@@ -3776,7 +3776,7 @@ impl WardwellServer {
 
     fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {
         let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
-        crate::tracker::view::MirrorView::read(&path).ok()
+        crate::tracker::view::MirrorView::read_for(&path, &binding.provider).ok()
     }
 
     /// Refusal when a ticket the action names is not a native ticket but an
