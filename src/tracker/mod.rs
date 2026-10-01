@@ -15,6 +15,7 @@ pub mod lock;
 pub mod log;
 pub mod pull;
 pub mod schedule;
+pub mod view;
 
 /// Provider ids Wardwell has an adapter for.
 pub const SUPPORTED_PROVIDERS: &[&str] = &["linear"];
