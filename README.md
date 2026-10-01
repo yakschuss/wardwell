@@ -445,7 +445,7 @@ fails, the log and the previous backup are left as they were. The
 backup stays until the next compact, which refuses to run while it exists
 unless given `--force`. A log that is already compact is left alone. A
 compacted log is searchable by text at once; search by meaning returns for it
-after the next `wardwell reindex` or the next server start.
+after you run `wardwell reindex`.
 
 With `readonly: true`, every kanban MCP action that appends to a file in that
 project's folder or its ticket audit log (create, update, move, note, attach,

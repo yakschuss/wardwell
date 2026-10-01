@@ -60,9 +60,9 @@ fn pull_summary(outcome: &crate::tracker::pull::PullOutcome) -> String {
 }
 
 /// Compaction drops the rewritten log's vectors; the watcher re-adds its
-/// text without them.
-const SEARCH_BY_MEANING_RETURNS: &str =
-    "Search by meaning returns for this log after the next `wardwell reindex` or the next server start.";
+/// text without them, and a server start does not re-embed an unchanged
+/// file. Only a reindex restores them.
+const SEARCH_BY_MEANING_RETURNS: &str = "Search by meaning returns for this log after you run `wardwell reindex`.";
 
 /// Compact every bound project's log, or only `only`. One line per
 /// project; fails with every project's error if any project failed.
@@ -350,7 +350,7 @@ mod tests {
         assert!(lines[0].starts_with("work/claims: compacted to 1 events"), "{}", lines[0]);
         assert!(lines[0].contains("removed 1 duplicates"), "{}", lines[0]);
         assert!(
-            lines[0].ends_with(". Search by meaning returns for this log after the next `wardwell reindex` or the next server start."),
+            lines[0].ends_with(". Search by meaning returns for this log after you run `wardwell reindex`."),
             "{}",
             lines[0]
         );
