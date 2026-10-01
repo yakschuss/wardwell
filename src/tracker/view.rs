@@ -106,7 +106,10 @@ impl MirrorView {
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with("{\"_schema\""))
             .filter_map(|line| serde_json::from_str::<Event>(line).ok())
-            .for_each(|event| views.entry(event.common().provider.clone()).or_default().observe(event));
+            .for_each(|event| match views.get_mut(&event.common().provider) {
+                Some(view) => view.observe(event),
+                None => views.entry(event.common().provider.clone()).or_default().observe(event),
+            });
         Ok(views)
     }
 

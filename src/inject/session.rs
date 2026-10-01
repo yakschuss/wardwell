@@ -33,8 +33,12 @@ pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain:
     if bindings.is_empty() {
         return None;
     }
-    let read = MirrorView::read_by_provider(&project_dir.join(crate::tracker::events::FILE_NAME));
-    let view_of = |provider: &str| read.as_ref().map(|views| views.get(provider).cloned().unwrap_or_default()).map_err(Clone::clone);
+    let mut read = MirrorView::read_by_provider(&project_dir.join(crate::tracker::events::FILE_NAME));
+    // Each binding takes its own provider's view out of the one parse; no copy.
+    let mut view_of = |provider: &str| match &mut read {
+        Ok(views) => Ok(views.remove(provider).unwrap_or_default()),
+        Err(error) => Err(error.clone()),
+    };
     let mut lines = Vec::new();
     for binding in &bindings {
         let view = view_of(&binding.provider);
