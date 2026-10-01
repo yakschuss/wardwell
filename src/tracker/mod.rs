@@ -53,6 +53,17 @@ pub fn readonly_refusal(binding: &crate::config::loader::TrackerBinding) -> Opti
     })
 }
 
+/// Refusal for a kanban write addressed to `key`, an issue the mirror of
+/// `binding` holds. Applies whether or not the binding is read-only, since
+/// the issue lives in the tracker, not in the kanban.
+pub fn mirrored_key_refusal(key: &str, binding: &crate::config::loader::TrackerBinding) -> String {
+    let label = provider_label(&binding.provider);
+    format!(
+        "{key} is mirrored from {label} team {} into {}/{}; it is not a kanban ticket. Edit it in {label}; `wardwell tracker pull` brings the change into the vault.",
+        binding.team, binding.domain, binding.project
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +86,12 @@ mod tests {
         assert!(message.contains("work/claims is a read-only mirror of Linear team COR"), "{message}");
         assert!(message.contains("Edit it in Linear"), "{message}");
         assert!(readonly_refusal(&binding(false)).is_none());
+    }
+
+    #[test]
+    fn mirrored_key_refusal_names_the_key_provider_and_where_to_edit() {
+        let message = mirrored_key_refusal("COR-12", &binding(false));
+        assert!(message.starts_with("COR-12 is mirrored from Linear team COR into work/claims"), "{message}");
+        assert!(message.contains("Edit it in Linear"), "{message}");
     }
 }

@@ -3643,6 +3643,9 @@ impl WardwellServer {
         if self.config.trackers.is_empty() {
             return None;
         }
+        if let Some(refusal) = self.mirrored_key_refusal(kanban, p) {
+            return Some(refusal);
+        }
         self.write_targets(kanban, p)
             .iter()
             .filter_map(|(domain, project)| self.config.tracker_for(domain, project))
@@ -3740,6 +3743,22 @@ impl WardwellServer {
     fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {
         let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
         crate::tracker::view::MirrorView::read(&path).ok()
+    }
+
+    /// Refusal when a ticket the action names is not a native ticket but an
+    /// issue some mirror holds, on read-only and writable bindings alike.
+    fn mirrored_key_refusal(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Option<String> {
+        [&p.ticket_id, &p.from_ticket_id, &p.to_ticket_id]
+            .into_iter()
+            .flatten()
+            .filter(|key| self.lookup_item_domain(kanban, key).is_none())
+            .find_map(|key| {
+                self.config
+                    .trackers
+                    .values()
+                    .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
+                    .find_map(|b| self.mirror_view(b)?.get(key).map(|issue| crate::tracker::mirrored_key_refusal(&issue.key, b)))
+            })
     }
 
     fn write_targets(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Vec<(String, String)> {

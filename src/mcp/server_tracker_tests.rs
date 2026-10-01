@@ -464,3 +464,54 @@ fn a_recent_failed_pull_also_cools_the_binding_down() {
     assert_eq!(response["refresh_reason"], "cooldown", "{response}");
     assert!(calls.lock().unwrap().is_empty());
 }
+
+/// Every file under `dir` with its bytes.
+fn files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            match path.is_dir() {
+                true => pending.push(path),
+                false => {
+                    found.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+    }
+    found
+}
+
+fn dispatch(server: &WardwellServer, args: Value) -> Value {
+    let params: KanbanParams = serde_json::from_value(args).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let raw = runtime.block_on(server.wardwell_kanban(Parameters(params)));
+    serde_json::from_str(&raw).unwrap()
+}
+
+#[test]
+fn a_write_to_a_mirrored_key_is_refused_and_writes_nothing() {
+    for readonly in [true, false] {
+        let f = fixture(&standard_mirror(), readonly);
+        let before = files(&f._dir.path().join("vault"));
+        for args in [
+            json!({"action": "move", "ticket_id": "COR-12", "status": "done"}),
+            json!({"action": "note", "ticket_id": "cor-12", "text": "hi"}),
+            json!({"action": "update", "ticket_id": "COR-12", "title": "x"}),
+            json!({"action": "groom", "ticket_id": "COR-12"}),
+            json!({"action": "relationship_create", "from_ticket_id": "CL-1", "to_ticket_id": "COR-12", "relationship_type": "blocks"}),
+        ] {
+            let response = dispatch(&f.server, args.clone());
+            let error = response["error"].as_str().unwrap_or_default();
+            assert!(error.contains("COR-12 is mirrored from Linear team COR"), "readonly={readonly} {args}: {response}");
+            assert!(error.contains("Edit it in Linear"), "{error}");
+        }
+        assert_eq!(files(&f._dir.path().join("vault")), before, "readonly={readonly}");
+        let native = dispatch(&f.server, json!({"action": "note", "ticket_id": "CL-1", "text": "still writable"}));
+        match readonly {
+            true => assert!(native["error"].as_str().unwrap().contains("read-only mirror"), "{native}"),
+            false => assert!(native.get("error").is_none(), "{native}"),
+        }
+    }
+}

@@ -457,7 +457,10 @@ detach, sequence, groom, relationship_create, relationship_delete,
 question_create, question_update, question_answer, question_invalidate,
 proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
 status, and export_roadmap, which saves a PDF into the project folder) refuses
-and says to edit in the tracker. Reads are unaffected.
+and says to edit in the tracker. Reads are unaffected. A write action that
+names a key held in a mirror, such as a `move` of COR-12, is refused on
+read-only and writable bindings alike. The refusal names the provider and
+says to edit the issue there. It writes nothing.
 
 The kanban read actions `get`, `list`, `query` and `search` include the
 mirrored issues of a bound project. A mirrored item has `origin: "tracker"`
