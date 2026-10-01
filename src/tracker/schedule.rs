@@ -189,6 +189,14 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
     }
 }
 
+/// The program the plist on disk runs, or None when it is not installed.
+pub fn scheduled_program(home: &Path) -> Option<PathBuf> {
+    let body = std::fs::read_to_string(plist_path(home)).ok()?;
+    let after = body.split("<key>ProgramArguments</key>").nth(1)?;
+    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+    Some(PathBuf::from(value.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")))
+}
+
 /// The interval in the plist on disk, or None when it is not installed.
 pub fn schedule_status(home: &Path) -> Option<u32> {
     let body = std::fs::read_to_string(plist_path(home)).ok()?;
@@ -385,6 +393,16 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(fake.verbs(), vec!["bootout"]);
         assert!(unschedule(home.path(), &Fake::new(&["bootout"]), 501).is_ok());
+    }
+
+    #[test]
+    fn scheduled_program_reads_the_unescaped_binary_path() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(scheduled_program(home.path()), None);
+        let path = plist_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, launch_agent_plist(Path::new("/a&b/wardwell"), 60, Path::new("/l"))).unwrap();
+        assert_eq!(scheduled_program(home.path()), Some(PathBuf::from("/a&b/wardwell")));
     }
 
     #[test]

@@ -114,6 +114,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mcp_paths = McpConfigPaths::detect();
                 let binary_path = detect::find_binary_path();
 
+                // Tracker policy and pull service: offline reads only
+                let home = dirs::home_dir().unwrap_or_default();
+                let (rows, policy_ok) = policy_rows(&config, &home, &binary_path, cfg!(target_os = "macos"));
+                for row in rows {
+                    println!("{row}");
+                }
+                all_ok &= policy_ok;
+
                 if detect::command_available("claude") || mcp_paths.claude_code.exists() {
                     print_client_status(
                         "Claude Code",
@@ -217,6 +225,66 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Rows for the Linear gate, its ruleset, the deny list, and the tracker
+/// pull service, read offline from Claude settings and the plist. Whether
+/// launchd has the agent loaded is not checked. The bool is false when a row
+/// failed.
+fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, binary: &Path, launchd: bool) -> (Vec<String>, bool) {
+    use crate::gate::ruleset::LINEAR_UPDATES;
+    use crate::install::client_hooks::{self, GATE};
+    const FIX: &str = "run `wardwell setup`";
+    let policy = crate::install::installer::policy_enabled(&config.trackers);
+    let settings_path = crate::install::installer::settings_path(home);
+    let settings: Option<serde_json::Value> = std::fs::read(&settings_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    let settings = settings.unwrap_or_default();
+    let gate = client_hooks::commands(&settings, &GATE);
+    let mut rows = vec![format!("  {:<38} \u{2713} {} v{}", "Gate ruleset", LINEAR_UPDATES.name, LINEAR_UPDATES.version)];
+    let mut ok = true;
+    // `None` is a row with no mark: a fact, not a check.
+    let mut row = |label: &str, pass: Option<bool>, text: String| {
+        ok &= pass != Some(false);
+        match pass {
+            Some(pass) => rows.push(format!("  {label:<38} {} {text}", if pass { '\u{2713}' } else { '\u{2717}' })),
+            None => rows.push(format!("  {label:<38} {text}")),
+        }
+    };
+    match (policy, gate.first().and_then(|c| client_hooks::executable(c))) {
+        (true, Some(exe)) if same_file(Path::new(exe), binary) => row("Linear gate", Some(true), format!("installed; runs {exe}")),
+        (true, Some(exe)) => row("Linear gate", Some(false), format!("runs {exe}, not this binary {}; {FIX}", binary.display())),
+        (true, None) => row("Linear gate", Some(false), format!("not installed; {FIX}")),
+        (false, Some(_)) => row("Linear gate", Some(false), format!("installed, but no linear binding has gate: true; {FIX} to remove it")),
+        (false, None) => row("Linear gate", None, "off; no linear binding has gate: true".to_string()),
+    }
+    if policy {
+        let denied = client_hooks::denied(&settings);
+        let missing: Vec<&str> = LINEAR_UPDATES.denied_tools.iter().copied().filter(|t| !denied.iter().any(|d| d == t)).collect();
+        let total = LINEAR_UPDATES.denied_tools.len();
+        match missing.is_empty() {
+            true => row("Linear deny list", Some(true), format!("{total} of {total} destructive tools denied")),
+            false => row("Linear deny list", Some(false), format!("missing {}; {FIX}", missing.join(", "))),
+        }
+    }
+    if !config.trackers.is_empty() {
+        let program = crate::tracker::schedule::scheduled_program(home);
+        let interval = crate::tracker::schedule::schedule_status(home);
+        match (launchd, program, interval) {
+            (false, _, _) => row("Tracker pull service", None, "not checked; launchd is macOS only, use cron".to_string()),
+            (true, None, _) => row("Tracker pull service", Some(false), format!("plist not installed; {FIX}")),
+            (true, Some(program), _) if !program.exists() => row("Tracker pull service", Some(false), format!("plist runs {}, which does not exist; {FIX}", program.display())),
+            (true, Some(_), interval) => row("Tracker pull service", Some(true), format!(
+                "plist present, every {}s; whether launchd loaded it is not checked offline",
+                interval.map_or("?".to_string(), |i| i.to_string())
+            )),
+        }
+    }
+    (rows, ok)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    real(a) == real(b)
 }
 
 /// One row per tracker binding from the offline doctor checks (credential
@@ -663,5 +731,62 @@ mod tests {
         let config = project_config(&root, &[&main], false);
         let (rows, ok) = project_rows(&config, &root, noon(), crate::inject::git::dirs);
         assert!(ok, "{}", rows[0]);
+    }
+
+    fn policy_config(dir: &Path, gate: bool) -> crate::config::loader::WardwellConfig {
+        let mut config = tracker_config(dir, "linear");
+        config.trackers.get_mut("work/claims").unwrap().gate = gate;
+        config
+    }
+
+    fn put(home: &Path, relative: &str, text: &str) {
+        let path = home.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn policy_rows_pass_when_the_gate_runs_this_binary_and_every_tool_is_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let binary = home.join("bin/wardwell");
+        put(home, "bin/wardwell", "");
+        let deny: Vec<&str> = crate::gate::ruleset::LINEAR_UPDATES.denied_tools.to_vec();
+        let settings = serde_json::json!({"permissions": {"deny": deny}, "hooks": {"PreToolUse": [{"matcher": "x",
+            "hooks": [{"type": "command", "command": format!("'{}' gate linear", binary.display())}]}]}});
+        put(home, ".claude/settings.json", &settings.to_string());
+        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist",
+            &crate::tracker::schedule::launch_agent_plist(&binary, 3600, Path::new("/l")));
+        let (rows, ok) = policy_rows(&policy_config(home, true), home, &binary, true);
+        assert!(ok, "{rows:?}");
+        assert_eq!(rows[0], format!("  {:<38} \u{2713} linear-updates v1", "Gate ruleset"));
+        assert!(rows[1].contains("\u{2713} installed; runs"), "{}", rows[1]);
+        assert!(rows[2].contains("7 of 7 destructive tools denied"), "{}", rows[2]);
+        assert!(rows[3].contains("plist present, every 3600s; whether launchd loaded it is not checked offline"), "{}", rows[3]);
+    }
+
+    #[test]
+    fn policy_rows_fail_on_a_stale_gate_path_missing_denies_and_no_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "/old/wardwell gate linear"}]}]}}"#);
+        let (rows, ok) = policy_rows(&policy_config(home, true), home, Path::new("/new/wardwell"), true);
+        assert!(!ok);
+        assert!(rows[1].contains("\u{2717} runs /old/wardwell, not this binary /new/wardwell; run `wardwell setup`"), "{}", rows[1]);
+        assert!(rows[2].contains("\u{2717} missing mcp__linear__delete_comment"), "{}", rows[2]);
+        assert!(rows[3].contains("\u{2717} plist not installed"), "{}", rows[3]);
+    }
+
+    #[test]
+    fn policy_rows_say_off_without_gate_true_and_skip_the_pull_without_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let (rows, ok) = policy_rows(&policy_config(home, false), home, Path::new("/w"), false);
+        assert!(ok);
+        assert!(rows[1].ends_with("off; no linear binding has gate: true"), "{}", rows[1]);
+        assert!(rows[2].contains("not checked; launchd is macOS only"), "{}", rows[2]);
+        let mut config = policy_config(home, false);
+        config.trackers.clear();
+        assert_eq!(policy_rows(&config, home, Path::new("/w"), true).0.len(), 2);
     }
 }

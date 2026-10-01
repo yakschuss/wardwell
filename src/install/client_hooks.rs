@@ -192,6 +192,15 @@ pub fn commands(root: &Value, spec: &Handler) -> Vec<String> {
         .collect()
 }
 
+/// The executable path of a hook command, quoted or not.
+pub fn executable(command: &str) -> Option<&str> {
+    let command = command.trim();
+    match command.strip_prefix('\'') {
+        Some(rest) => rest.split_once('\'').map(|(exe, _)| exe),
+        None => command.split_once(' ').map(|(exe, _)| exe),
+    }
+}
+
 /// True when a Companion lifecycle Stop hook for Claude is installed. It
 /// already runs the history check, so a second Stop hook would repeat it.
 pub fn companion_stop_present(root: &Value) -> bool {
