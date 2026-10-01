@@ -350,7 +350,7 @@ mod tests {
         assert!(line.contains("readonly"), "{line}");
         assert!(line.contains("last pull 2026-09-01T12:00:00Z (1h 30m ago)"), "{line}");
         assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "{line}");
-        assert!(line.contains("1 events"), "{line}");
+        assert!(line.contains("2 events"), "the pull_started and full_resync markers: {line}");
         assert!(!line.contains("lin_api_secret"));
     }
 
@@ -487,10 +487,10 @@ mod tests {
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("work/claims: linear COR (writable), last pull 2026-09-01T12:10:00Z"), "{}", lines[0]);
         assert!(lines[0].ends_with("no errors"), "{}", lines[0]);
-        assert!(lines[1].starts_with("work/claims: github acme/app, last pull 2026-09-01T12:00:00Z (10m ago), last full resync never, 2 events"), "{}", lines[1]);
+        assert!(lines[1].starts_with("work/claims: github acme/app, last pull 2026-09-01T12:00:00Z (10m ago), last full resync never, 4 events"), "two starts, a completion, a failure: {}", lines[1]);
         assert!(lines[1].ends_with(", cannot pull (credential), last error provider at 2026-09-01T12:10:00Z"), "{}", lines[1]);
         let reachable = status_with(&config, dir.path(), later, None, true);
-        assert!(reachable[1].ends_with("10m ago), last full resync never, 2 events, last error provider at 2026-09-01T12:10:00Z"), "{}", reachable[1]);
+        assert!(reachable[1].ends_with("10m ago), last full resync never, 4 events, last error provider at 2026-09-01T12:10:00Z"), "{}", reachable[1]);
     }
 
     #[test]

@@ -274,6 +274,8 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         }
         TrackerCommand::Pull { project, full, allow_empty } => {
             use wardwell::tracker::pull::Mode;
+            let only = project.clone();
+            let _watchdog = wardwell::tracker::deadline::arm(wardwell::tracker::deadline::PULL_DEADLINE, move || expire_pull(only));
             let config = wardwell::config::loader::load(None)?;
             let now = chrono::Utc::now();
             let mode = match (full, allow_empty) {
@@ -305,6 +307,28 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         println!("{line}");
     }
     Ok(())
+}
+
+/// The pull ran past its deadline: record `timeout` for each binding whose
+/// pull this process started and did not end, waiting a bounded time for
+/// the write, then stop the process.
+fn expire_pull(only: Option<String>) {
+    use wardwell::tracker::deadline::{MARKER_WAIT, PULL_DEADLINE, record_timeouts};
+    let pid = std::process::id();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let marked = wardwell::config::loader::load(None).map(|config| {
+            let bindings: Vec<_> = config.trackers.iter().filter(|b| only.as_deref().is_none_or(|key| b.key() == key)).cloned().collect();
+            record_timeouts(&config.vault_path, &bindings, pid, chrono::Utc::now())
+        });
+        let _ = done.send(marked);
+    });
+    let marked = match finished.recv_timeout(MARKER_WAIT) {
+        Ok(Ok(marked)) if !marked.is_empty() => format!("recorded timeout for {}", marked.join(", ")),
+        _ => "no timeout marker was written".to_string(),
+    };
+    eprintln!("wardwell: tracker pull stopped after {} minutes; {marked}", PULL_DEADLINE.as_secs() / 60);
+    std::process::exit(1);
 }
 
 async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::error::Error>> {

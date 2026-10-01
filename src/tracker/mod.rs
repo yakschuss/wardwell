@@ -8,6 +8,7 @@ pub mod adapter;
 pub mod cli;
 pub mod compact;
 pub mod credential;
+pub mod deadline;
 pub mod doctor;
 pub mod events;
 pub mod github;

@@ -51,6 +51,20 @@ pub struct MirrorView {
     pub last_full_resync_at: Option<DateTime<Utc>>,
     /// The latest pull_failed marker, its time and code.
     pub last_failure: Option<(DateTime<Utc>, FailureCode)>,
+    /// The latest pull_started marker, its time and process id.
+    pub last_started: Option<(DateTime<Utc>, u32)>,
+    /// The newest start or failure after the latest completed pull, in file
+    /// order; None when a completed pull is the newest marker or none exists.
+    pub last_attempt: Option<Attempt>,
+}
+
+/// A pull marker that a completed pull has not yet followed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attempt {
+    /// A pull started at this time in this process.
+    Started { at: DateTime<Utc>, pid: u32 },
+    /// A pull failed at this time with this code.
+    Failed { at: DateTime<Utc>, code: FailureCode },
 }
 
 impl MirrorView {
@@ -126,9 +140,20 @@ impl MirrorView {
             Event::FullResync { common, .. } => {
                 self.last_full_resync_at = later(self.last_full_resync_at, common.occurred_at);
                 self.last_pull_at = Some(common.occurred_at);
+                self.last_attempt = None;
             }
-            Event::PullCompleted { common, .. } => self.last_pull_at = Some(common.occurred_at),
-            Event::PullFailed { common, code, .. } => self.last_failure = Some((common.occurred_at, code)),
+            Event::PullCompleted { common, .. } => {
+                self.last_pull_at = Some(common.occurred_at);
+                self.last_attempt = None;
+            }
+            Event::PullStarted { common, pid } => {
+                self.last_started = Some((common.occurred_at, pid));
+                self.last_attempt = Some(Attempt::Started { at: common.occurred_at, pid });
+            }
+            Event::PullFailed { common, code, .. } => {
+                self.last_failure = Some((common.occurred_at, code));
+                self.last_attempt = Some(Attempt::Failed { at: common.occurred_at, code });
+            }
             _ => {}
         }
     }
@@ -299,6 +324,27 @@ mod tests {
         assert_eq!(view.last_full_resync_at, Some(at(8)));
         assert_eq!(view.last_failure, Some((at(11), FailureCode::Auth)));
         assert_eq!(view.failed_since_last_pull(), Some(FailureCode::Auth));
+    }
+
+    #[test]
+    fn the_last_attempt_is_the_newest_start_or_failure_after_the_last_completed_pull() {
+        let started = |id: &str, hour, pid| Event::PullStarted { common: common(id, "COR", hour), pid };
+        let (_dir, path) = write_log(&[started("s1", 9, 11), Event::PullCompleted { common: common("p1", "COR", 9), through: None }]);
+        let view = MirrorView::read(&path).unwrap();
+        assert_eq!(view.last_attempt, None);
+        assert_eq!(view.last_started, Some((at(9), 11)));
+
+        let (_dir, path) = write_log(&[
+            Event::PullCompleted { common: common("p1", "COR", 9), through: None },
+            started("s2", 10, 22),
+        ]);
+        assert_eq!(MirrorView::read(&path).unwrap().last_attempt, Some(Attempt::Started { at: at(10), pid: 22 }));
+
+        let (_dir, path) = write_log(&[
+            started("s3", 10, 33),
+            Event::PullFailed { common: common("x1", "COR", 10), code: FailureCode::Timeout, automatic_full: false },
+        ]);
+        assert_eq!(MirrorView::read(&path).unwrap().last_attempt, Some(Attempt::Failed { at: at(10), code: FailureCode::Timeout }));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Runs one tracker pull for a bound project: resolve the credential,
-//! derive the cursor from the log, call the adapter, append new events,
-//! and once every page arrived record a cursor marker (pull_completed, or
-//! on a full resync the removals and a full_resync marker).
+//! derive the cursor from the log, record a pull_started marker, call the
+//! adapter, append new events, and once every page arrived record a cursor
+//! marker (pull_completed, or on a full resync the removals and a
+//! full_resync marker).
 //!
-//! Does NOT schedule pulls (launchd does) or write to the provider.
+//! Does NOT decide when a pull runs (trigger.rs does) or write to the provider.
 
 use crate::config::loader::TrackerBinding;
 use crate::tracker::adapter::Adapter;
@@ -258,8 +259,9 @@ pub fn pull_binding_held(
     pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock)
 }
 
-/// The pull itself, under `_lock`. A failure appends a pull_failed marker
-/// (best effort) before it returns.
+/// The pull itself, under `_lock`: a pull_started marker with this
+/// process's id before the first provider call, then the pull. A failure
+/// appends a pull_failed marker (best effort) before it returns.
 fn pull_held(
     path: &Path,
     binding: &TrackerBinding,
@@ -269,7 +271,10 @@ fn pull_held(
     _lock: &lock::ProjectLock,
 ) -> Result<PullOutcome, PullError> {
     let mut summary = log::read_for(path, &binding.provider).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
-    let result = pull_locked(path, binding, adapter, mode, now, &mut summary);
+    let started = pull_started(binding, now, std::process::id(), mode == Mode::AutomaticFull);
+    let result = log::append_new(path, &[started], &mut summary)
+        .map_err(|message| PullError::new(FailureCode::LogWrite, message))
+        .and_then(|_| pull_locked(path, binding, adapter, mode, now, &mut summary));
     if let Err(error) = &result {
         let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
     }
@@ -334,8 +339,29 @@ fn pull_locked(
     Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None })
 }
 
+/// Marker for a pull about to call the provider, in process `pid`. An
+/// automatic full pull and the incremental pull after it get distinct ids.
+fn pull_started(binding: &TrackerBinding, now: DateTime<Utc>, pid: u32, automatic_full: bool) -> Event {
+    let label = provider_label(&binding.provider);
+    let kind = match automatic_full {
+        true => ":automatic_full",
+        false => "",
+    };
+    Event::PullStarted {
+        common: local_common(
+            binding,
+            format!("wardwell:pull_started:{}:{}:{pid}{kind}", binding.scope(), now.to_rfc3339()),
+            binding.scope(),
+            binding.scope(),
+            now,
+            format!("{} pull from {label} started in process {pid}", binding.scope()),
+        ),
+        pid,
+    }
+}
+
 /// Marker for a pull that stopped early. The title names only the code.
-fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode, automatic_full: bool) -> Event {
+pub(crate) fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode, automatic_full: bool) -> Event {
     let label = provider_label(&binding.provider);
     Event::PullFailed {
         common: local_common(
@@ -591,6 +617,62 @@ mod tests {
         assert_eq!(error.code, FailureCode::LogWrite, "{error}");
     }
 
+    /// Records, at the moment the provider is called, the log's last attempt.
+    struct SeesTheLog {
+        path: std::path::PathBuf,
+        seen: RefCell<Option<crate::tracker::view::Attempt>>,
+    }
+
+    impl Adapter for SeesTheLog {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            *self.seen.borrow_mut() = crate::tracker::view::MirrorView::read_for(&self.path, "linear").unwrap().last_attempt;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pull_started_with_this_process_id_is_on_disk_before_the_provider_call() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let adapter = SeesTheLog { path: path.clone(), seen: RefCell::new(None) };
+        pull_project(vault.path(), &binding(), &adapter, false, at(12)).unwrap();
+        let pid = std::process::id();
+        assert_eq!(*adapter.seen.borrow(), Some(crate::tracker::view::Attempt::Started { at: at(12), pid }));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&format!("\"kind\":\"pull_started\",\"id\":\"wardwell:pull_started:COR:{}:{pid}\"", at(12).to_rfc3339())), "{content}");
+        assert_eq!(crate::tracker::view::MirrorView::read_for(&path, "linear").unwrap().last_attempt, None, "the completed pull ends it");
+    }
+
+    /// Fails a full pull, delivers nothing on an incremental one.
+    struct FullThenFine;
+
+    impl Adapter for FullThenFine {
+        fn pull(&self, _: Option<DateTime<Utc>>, full: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            match full {
+                true => Err("Linear request failed".to_string()),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn an_automatic_full_and_the_incremental_after_it_each_record_a_start() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        crate::tracker::credential::save(&crate::tracker::credential::path_in(config.path(), "corr-linear").unwrap(), "t").unwrap();
+        let connect = |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullThenFine)) };
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, at(12), &connect).unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let kinds: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kinds, vec!["pull_started", "pull_failed", "pull_started", "pull_completed"]);
+        assert_eq!(crate::tracker::view::MirrorView::read_for(&path, "linear").unwrap().last_attempt, None);
+    }
+
     #[test]
     fn first_pull_starts_from_the_beginning_and_appends() {
         let vault = tempfile::tempdir().unwrap();
@@ -599,7 +681,7 @@ mod tests {
         assert_eq!(outcome.appended, 2);
         assert_eq!(adapter.calls.borrow()[0], (None, false));
         let path = log::path_for(vault.path(), "work", "claims");
-        assert_eq!(log::read(&path).unwrap().event_count, 3, "two snapshots and the pull_completed marker");
+        assert_eq!(log::read(&path).unwrap().event_count, 4, "pull_started, two snapshots and the pull_completed marker");
     }
 
     #[test]
@@ -684,7 +766,7 @@ mod tests {
         let path = log::path_for(vault.path(), "work", "claims");
         let content = std::fs::read_to_string(&path).unwrap();
         let events: Vec<Event> = content.lines().skip(1).map(|l| serde_json::from_str(l).unwrap()).collect();
-        let Some(Event::IssueRemoved { common }) = events.get(3) else { panic!("{content}") };
+        let Some(Event::IssueRemoved { common }) = events.iter().find(|e| matches!(e, Event::IssueRemoved { .. })) else { panic!("{content}") };
         assert_eq!(common.external_key, "COR-1");
         assert_eq!(common.title, "COR-1 COR-1 work: removed from Linear");
         let Some(Event::FullResync { common, issues, removed, through }) = events.last() else { panic!("{content}") };
