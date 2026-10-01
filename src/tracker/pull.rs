@@ -10,10 +10,11 @@ use crate::tracker::adapter::Adapter;
 use crate::tracker::credential::{self, Credential};
 use crate::tracker::events::{Common, Event};
 use crate::tracker::linear::{HttpTransport, Linear};
-use crate::tracker::{log, provider_label};
+use crate::tracker::{lock, log, provider_label};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 /// How far before the last completed pull's `through` an incremental pull starts.
 /// Covers clock skew and updates that land while a pull is paging.
@@ -64,7 +65,21 @@ pub fn pull_project(
     full: bool,
     now: DateTime<Utc>,
 ) -> Result<PullOutcome, String> {
+    pull_project_waiting(vault_root, binding, adapter, full, now, lock::DEFAULT_WAIT)
+}
+
+/// `pull_project`, waiting up to `wait` for a compaction holding the
+/// project lock.
+pub fn pull_project_waiting(
+    vault_root: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    full: bool,
+    now: DateTime<Utc>,
+    wait: Duration,
+) -> Result<PullOutcome, String> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
+    let _lock = lock::acquire(&path, wait)?;
     let mut summary = log::read(&path)?;
     let since = match full {
         true => None,
@@ -383,6 +398,22 @@ mod tests {
         let next = fake(vec![]);
         pull_project(vault.path(), &binding(), &next, false, at(15)).unwrap();
         assert_eq!(next.calls.borrow()[0], (Some(at(10) - CURSOR_OVERLAP), false));
+    }
+
+    #[test]
+    fn pull_during_a_held_lock_fails_with_the_closed_code_after_the_wait() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let held = lock::acquire(&path, Duration::ZERO).unwrap();
+        let adapter = fake(vec![snapshot("COR-1", 9)]);
+        let started = std::time::Instant::now();
+        let error = pull_project_waiting(vault.path(), &binding(), &adapter, false, at(12), Duration::from_millis(150)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(error.contains(lock::LOCK_BUSY), "{error}");
+        assert!(adapter.calls.borrow().is_empty(), "no provider call while locked");
+        assert!(!path.exists());
+        drop(held);
+        pull_project_waiting(vault.path(), &binding(), &adapter, false, at(12), Duration::ZERO).unwrap();
     }
 
     #[test]

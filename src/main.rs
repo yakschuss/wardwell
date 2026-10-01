@@ -85,6 +85,15 @@ enum TrackerCommand {
     },
     /// Show last pull, last full resync, event count and readonly flag per project
     Status,
+    /// Move inline raw payloads to tracker.raw.jsonl and drop exact duplicate events
+    Compact {
+        /// Only this <domain>/<project>
+        #[arg(long)]
+        project: Option<String>,
+        /// Replace the backup an earlier compact left
+        #[arg(long)]
+        force: bool,
+    },
     /// Run `tracker pull` on a launchd interval (macOS), replacing any existing agent
     Schedule {
         /// Seconds between pulls
@@ -202,6 +211,10 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;
             cli::status(&config, chrono::Utc::now(), schedule_status(&home()?))
+        }
+        TrackerCommand::Compact { project, force } => {
+            let config = wardwell::config::loader::load(None)?;
+            cli::compact(&config, project.as_deref(), force)?
         }
         TrackerCommand::Schedule { interval_seconds } => {
             let exe = std::env::current_exe()?;

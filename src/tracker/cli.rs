@@ -5,7 +5,7 @@
 use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::pull::{Connect, pull_binding};
 use crate::tracker::schedule::{self, LaunchctlRunner};
-use crate::tracker::{credential, log};
+use crate::tracker::{compact, credential, lock, log};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
 
@@ -36,6 +36,32 @@ pub fn pull(
                 if outcome.full { "full" } else { "incremental" },
                 outcome.appended,
                 outcome.removed,
+            )),
+            Err(error) => failures.push(format!("{key}: {error}")),
+        }
+    }
+    match failures.is_empty() {
+        true => Ok(lines),
+        false => Err(lines.into_iter().chain(failures).collect::<Vec<_>>().join("\n")),
+    }
+}
+
+/// Compact every bound project's log, or only `only`. One line per
+/// project; fails with every project's error if any project failed.
+pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let mut failures = Vec::new();
+    for (key, binding) in selected(config, only)? {
+        let path = log::path_for(&config.vault_path, &binding.domain, &binding.project);
+        match compact::compact(&path, force, lock::DEFAULT_WAIT) {
+            Ok(outcome) if !outcome.changed => lines.push(format!("{key}: already compact, {} events", outcome.events)),
+            Ok(outcome) => lines.push(format!(
+                "{key}: compacted to {} events, moved {} raw payloads to {}, removed {} duplicates, backup at {}",
+                outcome.events,
+                outcome.moved_raw,
+                crate::tracker::events::RAW_FILE_NAME,
+                outcome.duplicates_removed,
+                outcome.backup.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
             )),
             Err(error) => failures.push(format!("{key}: {error}")),
         }
@@ -225,6 +251,22 @@ mod tests {
         assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "{line}");
         assert!(line.contains("1 events"), "{line}");
         assert!(!line.contains("lin_api_secret"));
+    }
+
+    #[test]
+    fn compact_reports_each_project_and_is_idempotent() {
+        let (dir, config) = setup(false);
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let row = r#"{"kind":"pull_completed","id":"p1","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T12:00:00Z","title":"COR pull","raw":null}"#;
+        std::fs::write(&path, format!("{}\n{row}\n{row}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+
+        let lines = compact(&config, None, false).unwrap();
+        assert!(lines[0].starts_with("work/claims: compacted to 1 events"), "{}", lines[0]);
+        assert!(lines[0].contains("removed 1 duplicates"), "{}", lines[0]);
+        assert_eq!(compact(&config, Some("work/claims"), false).unwrap(), vec!["work/claims: already compact, 1 events"]);
+        assert!(compact(&config, Some("work/nope"), false).unwrap_err().contains("work/nope"));
+        drop(dir);
     }
 
     #[test]
