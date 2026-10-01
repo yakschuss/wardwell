@@ -321,8 +321,13 @@ exclude:
 Wardwell can mirror an external issue tracker into the vault as a read-only,
 append-only event log. Each bound project gets `<domain>/<project>/tracker.jsonl`
 (header `{"_schema":"tracker","_version":"1.0"}`), indexed like any other JSONL,
-so `wardwell_search` finds tracker history. Linear is the first provider.
-Wardwell never writes back to the tracker.
+so `wardwell_search` finds tracker history. A ticket key in a query, such as
+`COR-12` or `COR-12 OR COR-13`, is matched as a key. Linear is the first
+provider. Wardwell never writes back to the tracker.
+
+One tracker per project: a binding maps one project folder to one team. A
+second tracker, or a second team, is a second project folder with its own
+binding and credential.
 
 Bind projects in `~/.wardwell/config.yml`:
 
@@ -349,13 +354,30 @@ Then:
 wardwell tracker pull                          # every bound project
 wardwell tracker pull --project work/claims    # one project
 wardwell tracker pull --full                   # re-pull everything, record removals
-wardwell tracker status
+wardwell tracker status                        # every binding: last pull, last error
+wardwell tracker doctor                        # credential, auth, team per binding
+wardwell tracker compact [--project work/claims] [--force]
 ```
 
 Each event carries `kind` (`issue_upserted`, `comment_upserted`, `state_changed`,
-`link_added`, `issue_removed`, `full_resync`, `pull_completed`), `provider`,
-`external_key` (e.g. `COR-12`), `external_id`, `actor`, `occurred_at`, a readable
-`title`, and the provider's payload under `raw`. There is no cursor file: each
+`link_added`, `issue_removed`, `full_resync`, `pull_completed`, `pull_failed`),
+`provider`, `external_key` (e.g. `COR-12`), `external_id`, `actor`,
+`occurred_at`, and a readable `title`. An `issue_upserted` snapshot holds the
+issue's fields in provider-neutral names: `issue_title`, `description`,
+`state`, `state_category`, `priority`, `team`, `project`, `assignee`,
+`creator`, `labels`, `url`, `created_at`, `archived_at`, `parent_key`,
+`branch_name`, and `relations`, a list of `{kind, key}` with kind `related`,
+`blocks`, `blocked_by` or `duplicate_of`. A provider link type outside those
+four stays only in the raw payload. The title of a sub-issue's snapshot names
+its parent. A snapshot's id includes a short digest of its structure, so a
+re-parent or a new relation records a new snapshot even when the provider did
+not bump the issue's update time.
+
+The log rows are light. The provider's raw payload for each event goes to
+`tracker.raw.jsonl` beside the log, one line per event id, written before the
+log row. The indexer and the watcher skip every `*.raw.jsonl` file. Logs
+written by earlier versions carry `raw` inline and still read; `wardwell
+tracker compact` migrates them. There is no cursor file: each
 pull that delivers every page ends with a `pull_completed` marker whose `through`
 is the newest provider time seen, and the next incremental pull starts one hour
 before the latest marker's `through`. Pages are appended as they arrive and
@@ -367,6 +389,30 @@ appends `issue_removed` for issues the tracker no longer returns, and ends with
 a `full_resync` marker that also sets the cursor. `status` reads the last pull
 time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
+
+One binding that fails does not stop the others. A failure after the log is
+open appends a `pull_failed` marker with a closed `code` (`provider`,
+`log_read`, `log_write`) and no provider text. A missing credential
+(`credential`), an unknown provider (`unsupported_provider`) or a held lock
+(`lock_busy`) fails without writing to the log. `status` lists every binding with its
+last error, and `pull` exits non-zero when any binding failed.
+
+`doctor` prints three lines per binding: whether the credential file exists
+with owner-only permissions, whether the provider accepts the token on one
+cheap request, and whether the team key resolves. A failure names a code
+(`credential`, `auth`, `provider`, `team_not_found`). It never prints a token.
+
+`compact` is the only command that rewrites a tracker log, and only
+`tracker.jsonl`; it may because the log is a re-pullable mirror, not a system
+of record. It moves inline `raw` into the sidecar and removes exact duplicate
+events. It takes a per-project lock (`tracker.lock`) that `pull` also takes; a
+pull that finds the lock held waits up to 30 seconds, then fails with
+`lock_busy`. It writes the sidecar first, verifies that one event remains per
+id and that every moved payload reads back from the sidecar, writes the new
+log beside the old one, keeps the old one as `tracker.jsonl.bak`, and renames
+the new one into place. If verification fails, the log is left as it was. The
+backup stays until the next compact, which refuses to run while it exists
+unless given `--force`. A log that is already compact is left alone.
 
 With `readonly: true`, every kanban MCP action that appends to a file in that
 project's folder or its ticket audit log (create, update, move, note, attach,
