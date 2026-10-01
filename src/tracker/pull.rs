@@ -423,15 +423,21 @@ fn pull_locked(
     Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None, skipped: false })
 }
 
-/// True when a pull of `provider` completed after this one began, by the
+/// True when a pull of `provider` completed after this one began and not
+/// later than this pull's clock now, by the
 /// refresh state or by the log re-read under the lock. A full pull a person
 /// asked for is never overtaken.
 fn overtaken(recording: &Recording<'_>, provider: &str, summary: &log::LogSummary, mode: Mode) -> bool {
     if matches!(mode, Mode::Full | Mode::FullAllowEmpty) {
         return false;
     }
-    let in_state = state::provider(recording.state, provider).and_then(|s| s.completed_at).is_some_and(|at| at > recording.began);
-    in_state || summary.last_pull_at.is_some_and(|at| at > recording.began)
+    let clock = recording.clock();
+    // Only a completion between this pull's start and its clock now counts.
+    // One stamped later than the clock is from a skewed or future clock and
+    // never stops a pull.
+    let after_start = |at: DateTime<Utc>| at > recording.began && at <= clock;
+    let in_state = state::provider(recording.state, provider).and_then(|s| s.completed_at).is_some_and(after_start);
+    in_state || summary.last_pull_at.is_some_and(after_start)
 }
 
 /// Marker for a pull about to call the provider, in process `pid`. An
@@ -790,7 +796,7 @@ mod tests {
         let (vault_dir, config_dir, counter) = (vault.path().to_path_buf(), config.path().to_path_buf(), std::sync::Arc::clone(&reads));
         let waiting = std::thread::spawn(move || {
             let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(CountsReads(std::sync::Arc::clone(&counter)))) };
-            pull_binding(&vault_dir, &config_dir, &binding(), Mode::IncrementalOnly, at(12), &connect)
+            pull_binding(&vault_dir, &config_dir, &binding(), Mode::IncrementalOnly, Utc::now(), &connect)
         });
         std::thread::sleep(Duration::from_millis(300));
         state::record(&state_path, "linear", state::Record::Completed, Utc::now()).unwrap();

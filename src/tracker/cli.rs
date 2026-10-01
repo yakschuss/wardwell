@@ -341,6 +341,50 @@ mod tests {
         assert_eq!(manual.len(), 2, "a manual pull ignores the hold: {manual:?}");
     }
 
+    /// Counts provider reads.
+    struct CountsReads(std::rc::Rc<std::cell::Cell<usize>>);
+    impl Adapter for CountsReads {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_log_completion_stamped_in_the_future_never_skips_a_pull() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let wall = Utc::now();
+        seed(&config, wall + chrono::TimeDelta::hours(3), &[]);
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = std::rc::Rc::clone(&reads);
+        let connect_counting = move |_: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>| -> Result<Box<dyn Adapter>, String> {
+            Ok(Box::new(CountsReads(std::rc::Rc::clone(&counter))))
+        };
+        let manual = pull(&config, dir.path(), None, Mode::IncrementalOnly, wall, &connect_counting).unwrap();
+        assert!(manual[0].contains("incremental pull"), "{manual:?}");
+        assert_eq!(reads.get(), 1, "the manual pull read the provider");
+        let triggered = pull_providers(&config, dir.path(), Some("work/claims"), &["linear".to_string()], Mode::IncrementalOnly, Utc::now(), &connect_counting).unwrap();
+        assert!(triggered[0].contains("incremental pull"), "{triggered:?}");
+        assert_eq!(reads.get(), 2, "the triggered pull read the provider");
+        let state_path = crate::tracker::state::path(dir.path(), "work", "claims");
+        let local = crate::tracker::state::provider(&state_path, "linear").unwrap();
+        assert!(local.completed_at.is_some_and(|at| at <= Utc::now()), "{local:?}");
+        let spawned = std::cell::Cell::new(false);
+        struct Never<'a>(&'a std::cell::Cell<bool>);
+        impl crate::tracker::trigger::Spawner for Never<'_> {
+            fn spawn(&self, _: &str, _: &[&str]) -> Result<(), String> {
+                self.0.set(true);
+                Ok(())
+            }
+        }
+        let places = crate::tracker::trigger::Places { config: &config, config_dir: dir.path() };
+        let probes = crate::tracker::trigger::Probes { alive: &|_| false, can_pull: &|_| true };
+        let outcome = crate::tracker::trigger::refresh(&places, "work", "claims", Utc::now() + chrono::TimeDelta::minutes(2), &Never(&spawned), &probes);
+        assert_eq!(outcome, crate::tracker::trigger::Outcome::NotDue);
+        assert!(!spawned.get(), "the next session start spawns nothing");
+    }
+
     #[test]
     fn pull_rejects_an_unbound_project() {
         let (dir, config) = setup(false);
