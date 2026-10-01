@@ -329,7 +329,10 @@ fn project_mappings(raw: ProjectEntries) -> Result<BTreeMap<String, ProjectMappi
         }
         let paths: Vec<PathBuf> = entry.paths.iter().map(|p| project_path(&key, p)).collect::<Result<_, _>>()?;
         for path in &paths {
-            if let Some(owner) = owners.insert(path.clone(), key.clone()) {
+            // Existing folders compare by their real path, so a symlink to a
+            // folder mapped elsewhere is caught.
+            let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if let Some(owner) = owners.insert(real, key.clone()) {
                 let place = if owner == key { "twice in this entry".to_string() } else { format!("under both {owner} and {key}") };
                 return Err(invalid(&key, format!("path {} is listed {place}; keep it under one project", path.display())));
             }
@@ -737,5 +740,22 @@ trackers:
             let error = load(Some(f.path())).err().unwrap_or_else(|| panic!("{key} accepted")).to_string();
             assert!(error.contains("<domain>/<project>"), "{key}: {error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projects_reject_a_symlink_to_a_folder_mapped_under_another_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("code");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let yaml = format!("vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/a:\n    paths: [\"{}\"]\n  work/b:\n    paths: [\"{}\"]\n", real.display(), link.display());
+        let error = parse(&yaml).err().expect("same folder twice").to_string();
+        assert!(error.contains("work/a") && error.contains("work/b"), "{error}");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let fine = format!("vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/a:\n    paths: [\"{}\"]\n  work/b:\n    paths: [\"{}\"]\n", real.display(), other.display());
+        assert!(parse(&fine).is_ok());
     }
 }
