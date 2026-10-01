@@ -65,6 +65,18 @@ pub enum Attempt {
     Started { at: DateTime<Utc>, pid: u32 },
     /// A pull failed at this time with this code.
     Failed { at: DateTime<Utc>, code: FailureCode },
+    /// A pull started at this time was stopped at its deadline. Only the
+    /// local refresh state says so; the log holds a `timeout` failure.
+    Unfinished { at: DateTime<Utc> },
+}
+
+impl Attempt {
+    /// When the attempt happened.
+    pub fn at(self) -> DateTime<Utc> {
+        match self {
+            Attempt::Started { at, .. } | Attempt::Failed { at, .. } | Attempt::Unfinished { at } => at,
+        }
+    }
 }
 
 impl MirrorView {

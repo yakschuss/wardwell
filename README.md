@@ -755,10 +755,14 @@ No background service pulls the mirror. Two things start a pull instead.
 So the mirror refreshes while a session or the server runs, not on a clock
 when nothing runs.
 
-A pull writes a `pull_started` marker with its process id before it calls the
-provider. A pull stops after 15 minutes and writes `pull_failed` with the code
-`timeout`. A refresh that cannot start the pull writes `pull_failed` with the
-code `spawn`.
+A pull records its start, completion and failure in a local state file,
+`~/.wardwell/refresh/<domain>__<project>.json`. It also writes a
+`pull_started` marker with its process id to the log before it calls the
+provider. A pull stops after 15 minutes. It always records the timeout in the
+local state, and it writes a `pull_failed` marker with the code `timeout`
+when the vault can be written. `status` then says "A pull started at <time>
+and did not finish." A refresh that cannot start the pull records the code
+`spawn` the same way.
 
 Every surface says the same words about freshness: `status`, `tracker
 doctor`, `doctor` and the session-start section. Under 2 hours the mirror is

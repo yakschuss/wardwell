@@ -62,16 +62,17 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, g
         healthy &= checks.iter().all(|(_, outcome)| matches!(outcome, Outcome::Ok | Outcome::Found(_)));
         lines.extend(checks.into_iter().map(|(name, outcome)| format!("{key}: {name} {}", outcome.describe())));
     }
-    lines.extend(config.trackers.iter().map(|binding| mirror_line(&config.vault_path, binding, chrono::Utc::now())));
+    lines.extend(config.trackers.iter().map(|binding| mirror_line(&config.vault_path, config_dir, binding, chrono::Utc::now())));
     (lines, healthy)
 }
 
 /// `<key>: <provider> mirror: <freshness words>`, read from the log. A
 /// fact, not a check: it never fails the run.
-pub fn mirror_line(vault_root: &Path, binding: &TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
+pub fn mirror_line(vault_root: &Path, config_dir: &Path, binding: &TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
     let path = crate::tracker::log::path_for(vault_root, &binding.domain, &binding.project);
     let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
-    let fresh = crate::tracker::freshness::assess_read(&read, now, &crate::tracker::freshness::process_alive);
+    let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, &binding.domain, &binding.project), &binding.provider);
+    let fresh = crate::tracker::freshness::assess_read(&read, local.as_ref(), now, &crate::tracker::freshness::process_alive);
     format!("{}: {} mirror: {}", binding.key(), binding.provider, fresh.sentence())
 }
 
@@ -280,11 +281,11 @@ mod tests {
         let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{\"_schema\":\"tracker\"}\n\xff\n").unwrap();
-        let line = mirror_line(&config.vault_path, binding, chrono::Utc::now());
+        let line = mirror_line(&config.vault_path, _dir.path(), binding, chrono::Utc::now());
         assert_eq!(line, "work/claims: linear mirror: Could not read the mirror log: log_read.");
         std::fs::write(&path, "").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let line = mirror_line(&config.vault_path, binding, chrono::Utc::now());
+        let line = mirror_line(&config.vault_path, _dir.path(), binding, chrono::Utc::now());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(line, "work/claims: linear mirror: Could not read the mirror log: log_read.");
         assert!(!line.contains("No pull was tried"));
@@ -303,12 +304,12 @@ mod tests {
         };
         let write = |rows: &[String]| std::fs::write(&path, format!("{}\n{}\n", crate::tracker::events::SCHEMA_HEADER, rows.join("\n"))).unwrap();
         write(&[row("pull_completed", 30, "")]);
-        assert_eq!(mirror_line(&config.vault_path, binding, now), "work/claims: linear mirror: Last pulled 30m ago.");
+        assert_eq!(mirror_line(&config.vault_path, _dir.path(), binding, now), "work/claims: linear mirror: Last pulled 30m ago.");
         write(&[row("pull_completed", 300, ""), row("pull_failed", 60, r#","code":"timeout""#)]);
-        assert_eq!(mirror_line(&config.vault_path, binding, now), "work/claims: linear mirror: Last pulled 5h ago. Stale. Reason: The last pull failed: timeout.");
+        assert_eq!(mirror_line(&config.vault_path, _dir.path(), binding, now), "work/claims: linear mirror: Last pulled 5h ago. Stale. Reason: The last pull failed: timeout.");
         write(&[row("pull_completed", 300, ""), row("pull_started", 2, &format!(r#","pid":{}"#, std::process::id()))]);
         let at = (now - chrono::TimeDelta::minutes(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        assert_eq!(mirror_line(&config.vault_path, binding, now), format!("work/claims: linear mirror: Last pulled 5h ago; pull running since {at}."));
+        assert_eq!(mirror_line(&config.vault_path, _dir.path(), binding, now), format!("work/claims: linear mirror: Last pulled 5h ago; pull running since {at}."));
     }
 
     #[test]

@@ -38,7 +38,8 @@ pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain:
     let mut lines = Vec::new();
     for binding in &bindings {
         let view = view_of(&binding.provider);
-        let fresh = freshness::assess_read(&view, now, &freshness::process_alive);
+        let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, domain, project), &binding.provider);
+        let fresh = freshness::assess_read(&view, local.as_ref(), now, &freshness::process_alive);
         match crate::tracker::mirrors_issues(&binding.provider) {
             true => {
                 let blocked = crate::tracker::doctor::check_offline(config_dir, binding).err().map(|(code, _)| code);

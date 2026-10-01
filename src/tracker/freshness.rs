@@ -6,6 +6,7 @@
 //! Does NOT read files or start pulls; callers pass the view.
 
 use crate::tracker::events::FailureCode;
+use crate::tracker::state::ProviderState;
 use crate::tracker::view::{Attempt, MirrorView};
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 
@@ -84,11 +85,41 @@ impl Freshness {
     }
 }
 
+/// The view with the local refresh state folded in: the newer completion,
+/// and the newest start or failure after it. A timeout in the local state
+/// with its start reads as a pull that did not finish, so a pull stopped
+/// while the vault could not be written still shows.
+pub fn merged(view: &MirrorView, local: Option<&ProviderState>) -> MirrorView {
+    let mut view = view.clone();
+    let Some(local) = local else {
+        return view;
+    };
+    if let Some(done) = local.completed_at
+        && view.last_pull_at.is_none_or(|at| done > at)
+    {
+        view.last_pull_at = Some(done);
+    }
+    let attempt = [view.last_attempt, local_attempt(local)].into_iter().flatten().max_by_key(|a| a.at());
+    view.last_attempt = attempt.filter(|a| view.last_pull_at.is_none_or(|pulled| a.at() > pulled));
+    view
+}
+
+fn local_attempt(local: &ProviderState) -> Option<Attempt> {
+    if let Some((at, pid)) = local.open_start() {
+        return Some(Attempt::Started { at, pid: pid.unwrap_or(0) });
+    }
+    let (failed, code) = local.open_failure()?;
+    match (code, local.started_at) {
+        (FailureCode::Timeout, Some(start)) if start <= failed => Some(Attempt::Unfinished { at: start }),
+        _ => Some(Attempt::Failed { at: failed, code }),
+    }
+}
+
 /// The freshness of a log read: `assess` on a view, or the unreadable
 /// state when the read failed. An unreadable log is never "No pull was tried".
-pub fn assess_read(read: &Result<MirrorView, String>, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool) -> Freshness {
+pub fn assess_read(read: &Result<MirrorView, String>, local: Option<&ProviderState>, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool) -> Freshness {
     match read {
-        Ok(view) => assess(view, now, alive),
+        Ok(view) => assess(&merged(view, local), now, alive),
         Err(_) => Freshness { age: None, state: State::Unreadable(FailureCode::LogRead), unfinished: None },
     }
 }
@@ -101,7 +132,7 @@ pub fn assess(view: &MirrorView, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool
         Some(Attempt::Started { at, pid }) if is_recent(now - at, running_at_most()) && alive(pid) => {
             return Freshness { age, state: State::Running(at), unfinished: None };
         }
-        Some(Attempt::Started { at, .. }) => Reason::Unfinished(at),
+        Some(Attempt::Started { at, .. }) | Some(Attempt::Unfinished { at }) => Reason::Unfinished(at),
         Some(Attempt::Failed { code, .. }) => Reason::Failed(code),
         None => Reason::NotTried,
     };
@@ -238,9 +269,24 @@ mod tests {
 
     #[test]
     fn an_unreadable_log_says_so() {
-        let unreadable = assess_read(&Err("could not read".to_string()), now(), GONE);
+        let unreadable = assess_read(&Err("could not read".to_string()), None, now(), GONE);
         assert_eq!(unreadable.sentence(), "Could not read the mirror log: log_read.");
         assert!(!unreadable.is_clean());
+    }
+
+    #[test]
+    fn a_timeout_in_the_local_state_reads_as_a_pull_that_did_not_finish() {
+        let local = ProviderState {
+            started_at: Some(now() - TimeDelta::minutes(30)),
+            pid: Some(4242),
+            failed_at: Some(now() - TimeDelta::minutes(15)),
+            code: Some(FailureCode::Timeout),
+            ..Default::default()
+        };
+        let fresh = assess_read(&Ok(view(Some(5), None)), Some(&local), now(), GONE);
+        assert_eq!(fresh.sentence(), "Last pulled 5h ago. Stale. Reason: A pull started at 2026-10-01T07:03:00Z and did not finish.");
+        let done = ProviderState { completed_at: Some(now() - TimeDelta::minutes(10)), ..local };
+        assert_eq!(assess_read(&Ok(view(Some(5), None)), Some(&done), now(), GONE).sentence(), "Last pulled 10m ago.", "a later local completion wins");
     }
 
     #[test]

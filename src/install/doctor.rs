@@ -109,7 +109,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     println!("{row}");
                 }
                 all_ok &= trackers_ok;
-                for row in mirror_rows(&config, chrono::Utc::now()) {
+                for row in mirror_rows(&config, &config_dir(), chrono::Utc::now()) {
                     println!("{row}");
                 }
 
@@ -359,22 +359,23 @@ fn tracker_rows_with(
 
 /// One fact row per binding with the mirror's freshness words: fresh,
 /// stale and why, or the pull running since a time. Never fails doctor.
-fn mirror_rows(config: &crate::config::loader::WardwellConfig, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+fn mirror_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
     config
         .trackers
         .iter()
         .map(|binding| {
             let label = format!("Mirror {} {}", binding.key(), binding.provider);
-            format!("  {label:<38} {}", freshness_words(config, binding, now))
+            format!("  {label:<38} {}", freshness_words(config, config_dir, binding, now))
         })
         .collect()
 }
 
 /// The freshness words for one binding, read from its log.
-fn freshness_words(config: &crate::config::loader::WardwellConfig, binding: &crate::config::loader::TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
+fn freshness_words(config: &crate::config::loader::WardwellConfig, config_dir: &Path, binding: &crate::config::loader::TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
     let path = crate::tracker::log::path_for(&config.vault_path, &binding.domain, &binding.project);
     let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
-    crate::tracker::freshness::assess_read(&read, now, &crate::tracker::freshness::process_alive).sentence()
+    let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, &binding.domain, &binding.project), &binding.provider);
+    crate::tracker::freshness::assess_read(&read, local.as_ref(), now, &crate::tracker::freshness::process_alive).sentence()
 }
 
 /// One row per mapped project: whether each path exists, the age of the
@@ -399,7 +400,7 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
             }
             let today = now.with_timezone(&chrono::Local).date_naive();
             let rot = crate::inject::session::project_rot_line(&folder, today);
-            format!("  {label:<38} {mark} {}. {rot}{} {}", paths.join(", "), last_pull(config, mapping, now), last_block(config_dir, key, now))
+            format!("  {label:<38} {mark} {}. {rot}{} {}", paths.join(", "), last_pull(config, config_dir, mapping, now), last_block(config_dir, key, now))
         })
         .collect();
     (rows, ok)
@@ -421,8 +422,8 @@ fn path_status(path: &Path, git: &impl Fn(&Path) -> Option<crate::inject::git::G
 
 /// The freshness words for a bound project, such as ` Last pulled 45m ago.`,
 /// with a leading space; empty when it is not bound.
-fn last_pull(config: &crate::config::loader::WardwellConfig, mapping: &crate::config::loader::ProjectMapping, now: chrono::DateTime<chrono::Utc>) -> String {
-    config.tracker_for(&mapping.domain, &mapping.project).map_or(String::new(), |binding| format!(" {}", freshness_words(config, binding, now)))
+fn last_pull(config: &crate::config::loader::WardwellConfig, config_dir: &Path, mapping: &crate::config::loader::ProjectMapping, now: chrono::DateTime<chrono::Utc>) -> String {
+    config.tracker_for(&mapping.domain, &mapping.project).map_or(String::new(), |binding| format!(" {}", freshness_words(config, config_dir, binding, now)))
 }
 
 fn last_block(config_dir: &Path, key: &str, now: chrono::DateTime<chrono::Utc>) -> String {
@@ -713,14 +714,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = tracker_config(dir.path(), "linear");
         let now = chrono::Utc::now();
-        assert_eq!(mirror_rows(&config, now), vec![format!("  {:<38} Never pulled. Stale. Reason: No pull was tried.", "Mirror work/claims linear")]);
+        assert_eq!(mirror_rows(&config, dir.path(), now), vec![format!("  {:<38} Never pulled. Stale. Reason: No pull was tried.", "Mirror work/claims linear")]);
         let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let at = |minutes: i64| (now - chrono::TimeDelta::minutes(minutes)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let completed = format!(r#"{{"kind":"pull_completed","id":"p","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"p"}}"#, at(300));
         let started = format!(r#"{{"kind":"pull_started","id":"s","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"s","pid":{}}}"#, at(1), std::process::id());
         std::fs::write(&path, format!("{}\n{completed}\n{started}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
-        assert!(mirror_rows(&config, now)[0].ends_with(&format!("Last pulled 5h ago; pull running since {}.", at(1))), "{:?}", mirror_rows(&config, now));
+        assert!(mirror_rows(&config, dir.path(), now)[0].ends_with(&format!("Last pulled 5h ago; pull running since {}.", at(1))), "{:?}", mirror_rows(&config, dir.path(), now));
     }
 
     #[cfg(unix)]
@@ -733,9 +734,9 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let expected = vec![format!("  {:<38} Could not read the mirror log: log_read.", "Mirror work/claims linear")];
         std::fs::write(&path, b"\xff").unwrap();
-        assert_eq!(mirror_rows(&config, chrono::Utc::now()), expected);
+        assert_eq!(mirror_rows(&config, dir.path(), chrono::Utc::now()), expected);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let rows = mirror_rows(&config, chrono::Utc::now());
+        let rows = mirror_rows(&config, dir.path(), chrono::Utc::now());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(rows, expected);
     }

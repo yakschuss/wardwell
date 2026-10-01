@@ -221,8 +221,9 @@ fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &Tracke
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
-    let view = crate::tracker::view::MirrorView::read_for(&path, &binding.provider).unwrap_or_default();
-    let fresh = freshness::assess(&view, now, &freshness::process_alive);
+    let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
+    let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, &binding.domain, &binding.project), &binding.provider);
+    let fresh = freshness::assess_read(&read, local.as_ref(), now, &freshness::process_alive);
     let blocked = cannot_pull(config_dir, binding, gh_on_path).map(|code| format!(", cannot pull ({})", code.as_str()));
     let last = summary.last_failure.map(|(at, code)| format!(", last error {} at {}", code.as_str(), stamp(at)));
     let problems = format!("{}{}{}", blocked.unwrap_or_default(), last.unwrap_or_default(), freshness_tail(&fresh));
@@ -559,13 +560,15 @@ mod tests {
             }
         };
         pull(&config, dir.path(), None, Mode::Incremental, later, &github_breaks).unwrap_err();
-        let lines = status_with(&config, dir.path(), later, None, false);
+        // A second after the pulls: the local state holds each pull's clock
+        // at its end, a few milliseconds after `later`.
+        let lines = status_with(&config, dir.path(), later + chrono::TimeDelta::seconds(1), None, false);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert!(lines[0].starts_with("work/claims: linear COR (writable), last pull 2026-09-01T12:10:00Z"), "{}", lines[0]);
         assert!(lines[0].ends_with("no errors"), "{}", lines[0]);
         assert!(lines[1].starts_with("work/claims: github acme/app, last pull 2026-09-01T12:00:00Z (10m ago), last full resync never, 4 events"), "two starts, a completion, a failure: {}", lines[1]);
         assert!(lines[1].ends_with(", cannot pull (credential), last error provider at 2026-09-01T12:10:00Z"), "{}", lines[1]);
-        let reachable = status_with(&config, dir.path(), later, None, true);
+        let reachable = status_with(&config, dir.path(), later + chrono::TimeDelta::seconds(1), None, true);
         assert!(reachable[1].ends_with("10m ago), last full resync never, 4 events, last error provider at 2026-09-01T12:10:00Z"), "{}", reachable[1]);
     }
 
@@ -575,7 +578,7 @@ mod tests {
         pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(10);
         pull(&config, dir.path(), None, Mode::Incremental, later, &claims_breaks).unwrap_err();
-        let lines = status(&config, dir.path(), later, None);
+        let lines = status(&config, dir.path(), later + chrono::TimeDelta::seconds(1), None);
         assert_eq!(lines.len(), 3, "{lines:?}");
         let claims = lines.iter().find(|l| l.starts_with("work/claims")).unwrap();
         assert!(claims.contains("last pull 2026-09-01T12:00:00Z"), "{claims}");
@@ -691,6 +694,35 @@ mod tests {
         assert!(lines[1].starts_with("Scheduled tracker pull every 3600s"), "{lines:?}");
         let elsewhere = schedule(&home, &home.join(".wardwell"), Some(&home.join("notes")), 3600, &fake, Path::new("/bin/wardwell"), 501).unwrap();
         assert_eq!(elsewhere.len(), 1, "{elsewhere:?}");
+    }
+
+    #[test]
+    fn a_pull_stopped_at_the_deadline_while_the_vault_cannot_be_written_shows_in_status() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        seed(&config, now() - chrono::TimeDelta::hours(3), &[]);
+        let binding = config.trackers[0].clone();
+        let state_path = crate::tracker::state::path(dir.path(), "work", "claims");
+        let pid = 4242;
+        crate::tracker::state::record(&state_path, "linear", crate::tracker::state::Record::Started(pid), now() - chrono::TimeDelta::minutes(20)).unwrap();
+        #[cfg(unix)]
+        let project = config.vault_path.join("work/claims");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o500)).unwrap();
+            std::fs::set_permissions(log::path_for(&config.vault_path, "work", "claims"), std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        let marked = crate::tracker::deadline::record_timeouts(&config.vault_path, dir.path(), &[binding], pid, now() - chrono::TimeDelta::minutes(5));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(marked, vec!["work/claims linear"]);
+        assert!(!std::fs::read_to_string(log::path_for(&config.vault_path, "work", "claims")).unwrap().contains("timeout"), "the vault was not written");
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(". Stale. Reason: A pull started at 2026-09-01T11:40:00Z and did not finish."), "{line}");
     }
 
     #[test]

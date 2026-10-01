@@ -177,12 +177,12 @@ pub fn pull_binding(
     connect: &Connect<'_>,
 ) -> Result<PullOutcome, PullError> {
     let state = state::path(config_dir, &binding.domain, &binding.project);
-    let recording = Recording { state: &state, began: Utc::now() };
+    let recording = Recording::starting(&state, now);
     let result = pull_binding_recorded(vault_root, config_dir, binding, mode, now, connect, &recording);
     if let Err(error) = &result
         && error.code != FailureCode::LockBusy
     {
-        let _ = state::record(&state, &binding.provider, state::Record::Failed(error.code), Utc::now());
+        let _ = state::record(&state, &binding.provider, state::Record::Failed(error.code), recording.clock());
     }
     result
 }
@@ -254,12 +254,27 @@ pub fn pull_project_waiting(
     pull_recorded(vault_root, binding, adapter, mode, now, wait, None)
 }
 
-/// Where a pull records itself, and when it began, in wall-clock time.
+/// Where a pull records itself, and its clock: the pull's `now` when it
+/// began, before it waited for the lock, plus the time since. In use `now`
+/// is the wall clock, so the state holds wall-clock times.
 pub struct Recording<'a> {
     /// The project's refresh state file.
     pub state: &'a Path,
-    /// When this pull began, before it waited for the lock.
+    /// When this pull began.
     pub began: DateTime<Utc>,
+    start: std::time::Instant,
+}
+
+impl<'a> Recording<'a> {
+    /// A recording into `state` for a pull that begins at `now`.
+    pub fn starting(state: &'a Path, now: DateTime<Utc>) -> Self {
+        Self { state, began: now, start: std::time::Instant::now() }
+    }
+
+    /// The pull's clock: `began` plus the time since it began.
+    pub fn clock(&self) -> DateTime<Utc> {
+        self.began + TimeDelta::from_std(self.start.elapsed()).unwrap_or_default()
+    }
 }
 
 /// `pull_project_waiting`, recording into the refresh state when given.
@@ -303,7 +318,7 @@ pub fn pull_binding_held(
     let adapter = connect(binding, credential.as_ref()).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     let state = state::path(config_dir, &binding.domain, &binding.project);
-    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock, Some(&Recording { state: &state, began: Utc::now() }))
+    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock, Some(&Recording::starting(&state, now)))
 }
 
 /// The pull itself, under `_lock`: the start in the refresh state `state`
@@ -321,7 +336,7 @@ fn pull_held(
 ) -> Result<PullOutcome, PullError> {
     let record = |record| {
         if let Some(recording) = recording {
-            let _ = state::record(recording.state, &binding.provider, record, Utc::now());
+            let _ = state::record(recording.state, &binding.provider, record, recording.clock());
         }
     };
     let summary = log::read_for(path, &binding.provider);
@@ -788,7 +803,7 @@ mod tests {
         let reads_before = reads.load(std::sync::atomic::Ordering::SeqCst);
         let counter = std::sync::Arc::clone(&reads);
         let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(CountsReads(std::sync::Arc::clone(&counter)))) };
-        let fresh = pull_binding(vault.path(), config.path(), &binding(), Mode::IncrementalOnly, at(12), &connect).unwrap();
+        let fresh = pull_binding(vault.path(), config.path(), &binding(), Mode::IncrementalOnly, Utc::now() + TimeDelta::seconds(1), &connect).unwrap();
         assert!(!fresh.skipped, "a completion before this pull began does not stop it");
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), reads_before + 1);
     }
