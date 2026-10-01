@@ -28,8 +28,26 @@ pub const PROTECTED_SENTENCE: &str = "macOS asks for consent after every upgrade
 /// Whether `vault` is under a folder of `home` that macOS protects. Compares
 /// the paths as written and, where they exist, with links resolved.
 pub fn is_protected(vault: &Path, home: &Path) -> bool {
-    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    PROTECTED_FOLDERS.iter().map(|folder| home.join(folder)).any(|folder| vault.starts_with(&folder) || real(vault).starts_with(real(&folder)))
+    PROTECTED_FOLDERS.iter().map(|folder| home.join(folder)).any(|folder| vault.starts_with(&folder) || resolved(vault).starts_with(resolved(&folder)))
+}
+
+/// `path` with links resolved in its longest existing ancestor, and the
+/// rest appended, so a folder that does not exist yet still resolves.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(real) = current.canonicalize() {
+            return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
 }
 
 /// The launchd agent at Wardwell's label path, as `setup`, `uninstall` and
@@ -331,6 +349,20 @@ mod tests {
         std::fs::create_dir_all(home.join("Documents/vault")).unwrap();
         std::os::unix::fs::symlink(home.join("Documents/vault"), root.path().join("vault")).unwrap();
         assert!(is_protected(&root.path().join("vault"), &home));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_vault_folder_not_yet_made_under_a_symlinked_home_is_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let real_home = root.path().join("real-home");
+        std::fs::create_dir_all(&real_home).unwrap();
+        let linked_home = root.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let later = "Library/Mobile Documents/iCloud~md~obsidian/Documents/Notes";
+        assert!(is_protected(&linked_home.join(later), &real_home), "vault through the link, home real");
+        assert!(is_protected(&real_home.join("Documents/vault"), &linked_home), "vault real, home through the link");
+        assert!(!is_protected(&linked_home.join("notes/vault"), &real_home));
     }
 
     #[test]
