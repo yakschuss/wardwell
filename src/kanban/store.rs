@@ -224,6 +224,11 @@ impl KanbanStore {
         Ok(store)
     }
 
+    /// The ticket prefix `project` uses, or would use for its first ticket.
+    pub fn native_prefix(&self, project: &str, config_prefixes: &HashMap<String, String>) -> Option<String> {
+        native_prefix_in(&*self.conn().ok()?, project, config_prefixes)
+    }
+
     pub fn conn(&self) -> Result<MutexGuard<'_, Connection>, KanbanError> {
         self.conn.lock().map_err(|_| KanbanError::LockPoisoned)
     }
@@ -1393,6 +1398,16 @@ pub fn default_kanban_queries() -> HashMap<String, String> {
     m.insert("recent".into(), "updated_at > datetime('now', '-2 days')".into());
     m.insert("by_epic".into(), "epic IS NOT NULL AND status != 'done'".into());
     m
+}
+
+/// The prefix `project` is registered with in `conn`. None when the project
+/// has no native ticket yet, or the tables cannot be read. A prefix the
+/// project would only derive later is not returned: a project that holds a
+/// mirror and no native ticket has nothing for a tracker key to collide with.
+pub fn native_prefix_in(conn: &Connection, project: &str, _config_prefixes: &HashMap<String, String>) -> Option<String> {
+    conn.query_row("SELECT prefix FROM kanban_projects WHERE project=?1", rusqlite::params![project], |row| row.get(0))
+        .optional()
+        .ok()?
 }
 
 pub fn merge_kanban_queries(config_queries: &HashMap<String, String>) -> HashMap<String, String> {

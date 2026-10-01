@@ -32,7 +32,14 @@ pub struct WardwellServer {
     allowed_domains: Vec<String>,
     kanban: Option<Arc<crate::kanban::store::KanbanStore>>,
     kanban_queries: std::collections::HashMap<String, String>,
+    /// Where tracker credentials live, for the kanban `get` on-miss refresh.
+    tracker_config_dir: PathBuf,
+    /// Builds the adapter for an on-miss refresh. Replaced in tests.
+    tracker_connect: Arc<TrackerConnect>,
 }
+
+/// `pull::Connect`, shareable across the server's clones.
+type TrackerConnect = dyn Fn(&crate::config::loader::TrackerBinding, &crate::tracker::credential::Credential) -> Result<Box<dyn crate::tracker::adapter::Adapter>, String> + Send + Sync;
 
 // -- Tool parameter types --
 
@@ -353,6 +360,8 @@ impl WardwellServer {
             allowed_domains,
             kanban,
             kanban_queries,
+            tracker_config_dir: crate::config::loader::config_dir(),
+            tracker_connect: Arc::new(crate::tracker::pull::connect_provider),
         }
     }
 
@@ -2184,7 +2193,20 @@ impl WardwellServer {
                 return json_error(&e);
             }
         match kanban.get_item(ticket_id) {
-            Ok(item) => serde_json::to_string(&serde_json::json!({"item": item})).unwrap_or_default(),
+            Ok(item) => serde_json::to_string(&serde_json::json!({"item": crate::tracker::items::native(&item)})).unwrap_or_default(),
+            Err(crate::kanban::store::KanbanError::NotFound(missing)) => {
+                let (found, reason) = self.mirror_lookup(ticket_id, p);
+                let mut response = match found {
+                    Some(item) => serde_json::json!({"item": item}),
+                    None => serde_json::json!({"error": crate::kanban::store::KanbanError::NotFound(missing).to_string()}),
+                };
+                response["refreshed"] = serde_json::json!(reason.is_some_and(|r| r.refreshed()));
+                if let Some(reason) = reason {
+                    response["refresh_reason"] = serde_json::json!(reason.label());
+                }
+                self.add_collision_note(&mut response, p);
+                serde_json::to_string(&response).unwrap_or_default()
+            }
             Err(e) => json_error(&e.to_string()),
         }
     }
@@ -2196,8 +2218,16 @@ impl WardwellServer {
         let domains = if self.allowed_domains.is_empty() { None } else { Some(self.allowed_domains.as_slice()) };
         match kanban.search(query, p.project.as_deref(), domains) {
             Ok(items) => {
+                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::SEARCH_CAP, false, &|issue| crate::tracker::items::search_keeps(issue, query));
+                items.extend(mirrored);
                 let total = items.len();
-                serde_json::to_string(&serde_json::json!({"items": items, "total": total})).unwrap_or_default()
+                let mut response = serde_json::json!({"items": items, "total": total});
+                if truncated > 0 {
+                    response["tracker_truncated"] = serde_json::json!(truncated);
+                }
+                self.add_collision_note(&mut response, p);
+                serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
@@ -2220,10 +2250,24 @@ impl WardwellServer {
             domains,
         ) {
             Ok(items) => {
+                let filter = crate::tracker::items::ListFilter {
+                    status: p.status.as_deref(),
+                    priority: p.priority.as_deref(),
+                    assignee: p.assignee.as_deref(),
+                    epic: p.epic.as_deref(),
+                    tag: p.tag.as_deref(),
+                    include_done: p.include_done.unwrap_or(false),
+                };
+                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, true, &|issue| filter.keeps(issue));
+                items.extend(mirrored);
                 let total = items.len();
-                serde_json::to_string(&serde_json::json!({
-                    "items": items, "total": total, "returned": total,
-                })).unwrap_or_default()
+                let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
+                if truncated > 0 {
+                    response["tracker_truncated"] = serde_json::json!(truncated);
+                }
+                self.add_collision_note(&mut response, p);
+                serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
@@ -2373,10 +2417,22 @@ impl WardwellServer {
         };
         match kanban.query(question, &self.kanban_queries, p.project.as_deref(), domains) {
             Ok(items) => {
+                let now = chrono::Utc::now();
+                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, true, &|issue| {
+                    crate::tracker::items::query_keeps(issue, question, now).unwrap_or(false)
+                });
+                items.extend(mirrored);
                 let total = items.len();
-                serde_json::to_string(&serde_json::json!({
-                    "items": items, "total": total, "returned": total,
-                })).unwrap_or_default()
+                let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
+                if truncated > 0 {
+                    response["tracker_truncated"] = serde_json::json!(truncated);
+                }
+                if !crate::tracker::items::MIRROR_QUERIES.contains(&question.as_str()) && !self.read_bindings(p).is_empty() {
+                    response["tracker_note"] = serde_json::json!(crate::tracker::items::QUERY_NOT_MIRRORED);
+                }
+                self.add_collision_note(&mut response, p);
+                serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
@@ -3591,10 +3647,154 @@ impl WardwellServer {
         if self.config.trackers.is_empty() {
             return None;
         }
+        if let Some(refusal) = self.mirrored_key_refusal(kanban, p) {
+            return Some(refusal);
+        }
         self.write_targets(kanban, p)
             .iter()
             .filter_map(|(domain, project)| self.config.tracker_for(domain, project))
             .find_map(crate::tracker::readonly_refusal)
+    }
+
+    /// Bindings a kanban read covers: the named project's, else every one,
+    /// in the named domain when one is given, within the session's domains.
+    /// A binding whose team key equals its project's native prefix is left
+    /// out; `add_collision_note` says why.
+    fn read_bindings(&self, p: &KanbanParams) -> Vec<&crate::config::loader::TrackerBinding> {
+        self.named_bindings(p).into_iter().filter(|b| self.prefix_collision(b).is_none()).collect()
+    }
+
+    fn named_bindings(&self, p: &KanbanParams) -> Vec<&crate::config::loader::TrackerBinding> {
+        self.config
+            .trackers
+            .values()
+            .filter(|b| p.project.as_deref().is_none_or(|name| b.project == name))
+            .filter(|b| p.domain.as_deref().is_none_or(|domain| b.domain == domain))
+            .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
+            .collect()
+    }
+
+    /// The collision sentence when the binding's team key equals the native
+    /// kanban prefix its project has, or would derive, in the store.
+    fn prefix_collision(&self, binding: &crate::config::loader::TrackerBinding) -> Option<String> {
+        let native = self.kanban.as_ref()?.native_prefix(&binding.project, &self.config.kanban_prefixes)?;
+        crate::tracker::prefix_collision(binding, &native)
+    }
+
+    /// Append to `tracker_note` the collision sentence of every binding the
+    /// read named but left out.
+    fn add_collision_note(&self, response: &mut serde_json::Value, p: &KanbanParams) {
+        let notes: Vec<String> = self.named_bindings(p).into_iter().filter_map(|b| self.prefix_collision(b)).collect();
+        if notes.is_empty() {
+            return;
+        }
+        let existing = response.get("tracker_note").and_then(|n| n.as_str()).map(str::to_string);
+        let joined = existing.into_iter().chain(notes).collect::<Vec<_>>().join(" ");
+        response["tracker_note"] = serde_json::json!(joined);
+    }
+
+    /// Mirrored issues of the covered bindings that `keep` accepts, as
+    /// summaries, at most `cap`, with how many were left out. `newest_first`
+    /// orders by the snapshot's update time before the cap, ties by key;
+    /// otherwise by key alone. A log that cannot be read contributes nothing.
+    fn mirror_items(&self, p: &KanbanParams, cap: usize, newest_first: bool, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> (Vec<serde_json::Value>, usize) {
+        let now = chrono::Utc::now();
+        let mut items: Vec<(String, chrono::DateTime<chrono::Utc>, serde_json::Value)> = self
+            .read_bindings(p)
+            .into_iter()
+            .filter_map(|binding| self.mirror_view(binding).map(|view| (binding, view)))
+            .flat_map(|(binding, view)| {
+                view.issues
+                    .values()
+                    .filter(|issue| keep(issue))
+                    .map(|issue| (issue.key.clone(), issue.updated_at, crate::tracker::items::summary(binding, &view, issue, now)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            let by_key = crate::tracker::items::key_order(&a.0, &b.0);
+            match newest_first {
+                true => b.1.cmp(&a.1).then(by_key),
+                false => by_key,
+            }
+        });
+        let truncated = items.len().saturating_sub(cap);
+        (items.into_iter().take(cap).map(|(_, _, item)| item).collect(), truncated)
+    }
+
+    /// The mirrored issue under `key` in any covered binding, removed and
+    /// archived included.
+    fn mirror_get(&self, key: &str, p: &KanbanParams) -> Option<serde_json::Value> {
+        let now = chrono::Utc::now();
+        self.read_bindings(p).into_iter().find_map(|binding| {
+            let view = self.mirror_view(binding)?;
+            view.get(key).map(|issue| crate::tracker::items::mirrored(binding, &view, issue, now))
+        })
+    }
+
+    /// The mirrored issue under `key`. On a miss, one labeled refresh and a
+    /// second look; the reason is None when the first look found it.
+    fn mirror_lookup(&self, key: &str, p: &KanbanParams) -> (Option<serde_json::Value>, Option<crate::tracker::refresh::Reason>) {
+        use crate::tracker::refresh::Reason;
+        if let Some(item) = self.mirror_get(key, p) {
+            return (Some(item), None);
+        }
+        if let Err(reason) = self.refresh_on_miss(key, p) {
+            return (None, Some(reason));
+        }
+        match self.mirror_get(key, p) {
+            Some(item) => (Some(item), Some(Reason::FoundAfterPull)),
+            None => (None, Some(Reason::StillMissing)),
+        }
+    }
+
+    /// One incremental pull for the binding whose team key prefixes `key`,
+    /// unless none does, its log has no pull marker, or its log shows a
+    /// pull within the cooldown. Never a full pull. The cooldown lives in
+    /// the log, so every server on the vault shares it. Both checks run
+    /// again once the project lock is held, so concurrent misses that
+    /// queued on the lock do not each pull.
+    fn refresh_on_miss(&self, key: &str, p: &KanbanParams) -> Result<(), crate::tracker::refresh::Reason> {
+        use crate::tracker::refresh::Reason;
+        let bindings = self.read_bindings(p);
+        let Some(binding) = crate::tracker::refresh::target(&bindings, key) else {
+            return Err(Reason::NoBinding);
+        };
+        crate::tracker::refresh::check(&self.mirror_view(binding).unwrap_or_default(), chrono::Utc::now())?;
+        let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
+        let lock = crate::tracker::pull::acquire_lock(&path, crate::tracker::refresh::LOCK_WAIT).map_err(|e| Reason::PullFailed(e.code))?;
+        let view = self.mirror_view(binding).unwrap_or_default();
+        if view.get(key).is_some() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now();
+        crate::tracker::refresh::check(&view, now)?;
+        let connect = |b: &crate::config::loader::TrackerBinding, c: &crate::tracker::credential::Credential| (self.tracker_connect)(b, c);
+        crate::tracker::pull::pull_binding_held(&self.vault_root, &self.tracker_config_dir, binding, now, &connect, &lock)
+            .map(|_| ())
+            .map_err(|error| Reason::PullFailed(error.code))
+    }
+
+    fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {
+        let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
+        crate::tracker::view::MirrorView::read(&path).ok()
+    }
+
+    /// Refusal when a ticket the action names is not a native ticket but an
+    /// issue some mirror holds, on read-only and writable bindings alike.
+    fn mirrored_key_refusal(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Option<String> {
+        [&p.ticket_id, &p.from_ticket_id, &p.to_ticket_id]
+            .into_iter()
+            .flatten()
+            .filter(|key| self.lookup_item_domain(kanban, key).is_none())
+            .find_map(|key| {
+                self.config
+                    .trackers
+                    .values()
+                    .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
+                    .filter(|b| self.prefix_collision(b).is_none())
+                    .find_map(|b| self.mirror_view(b)?.get(key).map(|issue| crate::tracker::mirrored_key_refusal(&issue.key, b)))
+            })
     }
 
     fn write_targets(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Vec<(String, String)> {
@@ -4195,6 +4395,10 @@ fn clipboard_copy(content: &str) -> Result<usize, String> {
     child.wait().map_err(|e| format!("pbcopy failed: {e}"))?;
     Ok(bytes)
 }
+
+#[cfg(test)]
+#[path = "server_tracker_tests.rs"]
+mod tracker_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

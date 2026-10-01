@@ -134,6 +134,8 @@ pub enum FailureCode {
     TeamNotFound,
     /// A full pull returned no issues while the mirror held open ones.
     EmptyFullResult,
+    /// Doctor only: the team key equals the project's native kanban prefix.
+    PrefixCollision,
 }
 
 impl FailureCode {
@@ -149,6 +151,7 @@ impl FailureCode {
             Self::Auth => "auth",
             Self::TeamNotFound => "team_not_found",
             Self::EmptyFullResult => "empty_full_result",
+            Self::PrefixCollision => "prefix_collision",
         }
     }
 }

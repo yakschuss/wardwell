@@ -342,6 +342,16 @@ trackers:
     readonly: true        # refuse kanban writes on this project
 ```
 
+A binding's team key may not equal a native kanban prefix set under
+`kanban.prefixes`. `config.yml` is rejected at load when it does, and the
+error names the binding, the team key and the project. A prefix the kanban
+derives for a project is only known to the kanban database, so it is checked
+where that database is open. When a binding's team key equals its project's
+native prefix, kanban reads leave that mirror out and add a `tracker_note`
+that names the collision and says to set a different native prefix in
+`kanban.prefixes`. `wardwell tracker doctor` prints a `kanban prefix` line per
+binding, and the `wardwell doctor` row fails with the same sentence.
+
 Store the token (a Linear personal API key) from standard input. It is written to
 `~/.wardwell/trackers/<name>.json` with owner-only permissions and is never
 printed or logged:
@@ -419,10 +429,11 @@ provider is known and the credential reads, and prints `cannot pull` with the
 code when either fails; it says `no errors` only when both pass and no pull
 failed. `pull` exits non-zero when any binding failed.
 
-`doctor` prints three lines per binding: whether the credential file exists
-with owner-only permissions, whether the provider accepts the token on one
-cheap request, and whether the team key resolves. A failure names one code:
-`credential`, `auth`, `provider` or `team_not_found`. `auth` means the
+`doctor` prints four lines per binding. They check whether the credential
+file exists with owner-only permissions, whether the provider accepts the token on one
+cheap request, whether the team key resolves, and whether the team key
+differs from the project's native kanban prefix. A failure names one code:
+`credential`, `auth`, `provider`, `team_not_found` or `prefix_collision`. `auth` means the
 provider refused the token; any other provider error, including a GraphQL
 error that is not about authentication, is `provider`. It never prints a
 token. `config.yml` is rejected at load when a binding names a provider
@@ -453,7 +464,62 @@ detach, sequence, groom, relationship_create, relationship_delete,
 question_create, question_update, question_answer, question_invalidate,
 proposal_create, proposal_approve, proposal_reject, proposal_apply, verify,
 status, and export_roadmap, which saves a PDF into the project folder) refuses
-and says to edit in the tracker. Reads are unaffected.
+and says to edit in the tracker. Reads are unaffected. A write action that
+names a key held in a mirror, such as a `move` of COR-12, is refused on
+read-only and writable bindings alike. The refusal names the provider and
+says to edit the issue there. It writes nothing.
+
+The kanban read actions `get`, `list`, `query` and `search` include the
+mirrored issues of a bound project. A mirrored item has `origin: "tracker"`
+and carries the provider, the external key, the tracker's state name and
+category, the parent, the relations, the url, `last_pulled_at`, and that
+pull's age in plain words, such as `3 hours ago`. A native kanban item keeps
+its fields, including its own `source`, and gains `origin: "kanban"`. `list`
+and `search` leave out removed and archived issues; `list` also leaves out
+completed and canceled ones unless `include_done` is set. The mirror has no
+epics or deadlines, so of the named queries it answers only `recent` and
+`stale`. Any other query returns a `tracker_note` that says so. Outside
+`get`, mirrored items carry no description. `list` and `query` return the 50
+most recently updated mirrored items, newest first. `search` returns at most
+20, sorted by key with the number compared as a number, so COR-2 comes before
+COR-10. When more match, the result adds `tracker_truncated` with the count
+left out.
+
+`get` for a key the mirror does not hold runs one incremental pull for the
+binding that owns the key, then looks again. A binding owns a key when its
+team key is the key's prefix. A `project` or `domain` in the call narrows the
+bindings first, and every kanban read honours them. A refresh never runs a
+full pull. It waits at most 2 seconds for the project lock. The cooldown
+comes from the log: no refresh runs within a minute of the newest
+`pull_completed`, `full_resync` or `pull_failed` marker, so every server on
+the vault shares it. The result carries `refreshed`,
+true when a pull completed, and `refresh_reason`: `found_after_pull`,
+`still_missing`, `cooldown`, `pull_failed:<code>`, `no_binding` or
+`never_pulled`. A mirror with no pull marker is not refreshed, because an
+incremental pull with no cursor would read the whole team. Run `wardwell
+tracker pull` first. `list`, `query` and `search` never pull.
+
+At session start, `wardwell inject` prints what it printed before: the
+domain's `current_state.md` when it has one, else a summary of each project
+that has its own. Every project without a tracker binding prints exactly
+that. Under a bound project it adds one rot line and a tracker section. The
+rot line reads like this: Last history entry 12 days ago. Last decision 3
+days ago. The history age comes from the last entry at the end of
+`history.jsonl`. When the domain's own state file is
+printed, only the bound projects follow it, each under its own header.
+Folders that are hidden or start with an underscore get no added lines. The
+section's first line is "Tracker mirror. Last pulled 2 hours ago. Not
+authoritative." Up to ten issues in a started state follow, each with key,
+title and state. When the last pull failed or is more than 24 hours old, the
+section shows only the age and that notice. A mirror never pulled says only
+"Tracker mirror. Never pulled. Not authoritative." Inject also runs the
+offline doctor check. When pulls cannot run, the section is one line, such as
+"Tracker mirror. Pulls cannot run: credential. Last pulled 3 days ago." It
+lists no issues.
+
+`wardwell doctor` prints one row per binding. It checks only the credential
+file and the provider, with no network call, and names `wardwell tracker
+doctor` for the live check.
 
 ```sh
 wardwell tracker schedule [--interval-seconds 3600]

@@ -35,6 +35,9 @@ pub const AUTOMATIC_FULL_RETRY_AFTER: TimeDelta = TimeDelta::hours(6);
 pub enum Mode {
     /// From the cursor; runs full when a full resync is due.
     Incremental,
+    /// From the cursor, never escalating to a full pull. The kanban on-miss
+    /// refresh uses it so a lookup never waits on a full resync.
+    IncrementalOnly,
     /// Every issue; records removals. Fails on an empty result while the
     /// mirror holds open issues.
     Full,
@@ -48,7 +51,7 @@ pub enum Mode {
 
 impl Mode {
     fn is_full(self) -> bool {
-        !matches!(self, Mode::Incremental)
+        !matches!(self, Mode::Incremental | Mode::IncrementalOnly)
     }
 }
 
@@ -142,6 +145,7 @@ pub fn pull_binding(
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<PullOutcome, PullError> {
+    let wait = lock::DEFAULT_WAIT;
     let credential = credential::path_in(config_dir, &binding.credential)
         .and_then(|path| credential::load(&path))
         .map_err(|message| PullError::new(FailureCode::Credential, message))?;
@@ -151,9 +155,9 @@ pub fn pull_binding(
         _ => None,
     };
     let Some(due) = resync_due else {
-        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, wait);
     };
-    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, wait);
     match pull(Mode::AutomaticFull) {
         Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), ..outcome }),
         // A failed automatic full must not stop the mirror moving.
@@ -198,17 +202,54 @@ pub fn pull_project_waiting(
     wait: Duration,
 ) -> Result<PullOutcome, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let _lock = lock::acquire(&path, wait).map_err(|message| {
+    let lock = acquire_lock(&path, wait)?;
+    pull_held(&path, binding, adapter, mode, now, &lock)
+}
+
+/// Take the project lock beside `log_path`, failing with `lock_busy` after `wait`.
+pub fn acquire_lock(log_path: &Path, wait: Duration) -> Result<lock::ProjectLock, PullError> {
+    lock::acquire(log_path, wait).map_err(|message| {
         let code = match message.contains(lock::LOCK_BUSY) {
             true => FailureCode::LockBusy,
             false => FailureCode::LogWrite,
         };
         PullError::new(code, message)
-    })?;
-    let mut summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
-    let result = pull_locked(&path, binding, adapter, mode, now, &mut summary);
+    })
+}
+
+/// An `IncrementalOnly` pull for a caller that already holds the project
+/// lock, so it can check the log under the lock before it pulls. Loads the
+/// credential first, like `pull_binding`.
+pub fn pull_binding_held(
+    vault_root: &Path,
+    config_dir: &Path,
+    binding: &TrackerBinding,
+    now: DateTime<Utc>,
+    connect: &Connect<'_>,
+    lock: &lock::ProjectLock,
+) -> Result<PullOutcome, PullError> {
+    let credential = credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .map_err(|message| PullError::new(FailureCode::Credential, message))?;
+    let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
+    let path = log::path_for(vault_root, &binding.domain, &binding.project);
+    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock)
+}
+
+/// The pull itself, under `_lock`. A failure appends a pull_failed marker
+/// (best effort) before it returns.
+fn pull_held(
+    path: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    mode: Mode,
+    now: DateTime<Utc>,
+    _lock: &lock::ProjectLock,
+) -> Result<PullOutcome, PullError> {
+    let mut summary = log::read(path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let result = pull_locked(path, binding, adapter, mode, now, &mut summary);
     if let Err(error) = &result {
-        let _ = log::append_new(&path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
+        let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
     }
     result
 }
@@ -741,6 +782,20 @@ mod tests {
         assert_eq!(outcome.resync_due, Some(ResyncDue::Stale));
         let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
         assert_eq!(summary.last_full_resync_at, Some(stale));
+    }
+
+    #[test]
+    fn an_incremental_only_pull_never_runs_full_even_when_a_resync_is_due() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![snapshot("COR-1", 9)]))) };
+        let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::IncrementalOnly, at(12), &connect).unwrap();
+        assert!(!outcome.full);
+        assert_eq!(outcome.resync_due, None);
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_full_resync_at, None, "no full resync ran");
+        assert!(summary.open_issues.contains_key("COR-1"));
+        assert_eq!(summary.last_pull_at, Some(at(12)));
     }
 
     #[test]

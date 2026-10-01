@@ -675,7 +675,7 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(domain_dir) = matched_domain {
         // Found a matching domain — output its project summaries
-        inject_domain_context(&domain_dir);
+        inject_domain_context(&config, &domain_dir);
     }
     // No match = no output. Don't pollute non-project sessions.
 
@@ -683,59 +683,9 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Output context for a specific domain's projects.
-fn inject_domain_context(domain_dir: &Path) {
-    let domain = domain_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-
-    // Check domain-level current_state.md
-    let state = domain_dir.join("current_state.md");
-    if state.exists()
-        && let Ok(content) = std::fs::read_to_string(&state)
-    {
-        print!("{content}");
-        return;
-    }
-
-    // Check subdirectory projects
-    if let Ok(entries) = std::fs::read_dir(domain_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                let state = p.join("current_state.md");
-                if state.exists()
-                    && let Ok(vf) = wardwell::vault::reader::read_file(&state)
-                {
-                    let project = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                    let status = vf
-                        .frontmatter
-                        .status
-                        .as_ref()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "active".to_string());
-                    let focus = extract_section_simple(&vf.body, "Focus");
-                    let next = extract_section_simple(&vf.body, "Next Action");
-                    println!("**{domain}/{project}** ({status}): {focus}");
-                    if !next.is_empty() {
-                        println!("  Next: {next}");
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Simple section extractor for inject (no dependency on server module).
-fn extract_section_simple(body: &str, heading: &str) -> String {
-    let marker = format!("## {heading}");
-    let start = match body.find(&marker) {
-        Some(pos) => pos + marker.len(),
-        None => return String::new(),
-    };
-    let rest = body[start..].trim_start();
-    let end = rest.find("\n## ").unwrap_or(rest.len());
-    rest[..end].trim().to_string()
+fn inject_domain_context(config: &wardwell::config::loader::WardwellConfig, domain_dir: &Path) {
+    let today = chrono::Local::now().date_naive();
+    print!("{}", wardwell::inject::domain::domain_context(config, &wardwell::config::loader::config_dir(), domain_dir, chrono::Utc::now(), today));
 }
 
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {

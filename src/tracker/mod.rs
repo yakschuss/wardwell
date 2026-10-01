@@ -6,15 +6,18 @@
 
 pub mod adapter;
 pub mod cli;
+pub mod compact;
 pub mod credential;
 pub mod doctor;
 pub mod events;
-pub mod compact;
+pub mod items;
 pub mod linear;
 pub mod lock;
 pub mod log;
 pub mod pull;
+pub mod refresh;
 pub mod schedule;
+pub mod view;
 
 /// Provider ids Wardwell has an adapter for.
 pub const SUPPORTED_PROVIDERS: &[&str] = &["linear"];
@@ -50,6 +53,30 @@ pub fn readonly_refusal(binding: &crate::config::loader::TrackerBinding) -> Opti
     })
 }
 
+/// Refusal for a kanban write addressed to `key`, an issue the mirror of
+/// `binding` holds. Applies whether or not the binding is read-only, since
+/// the issue lives in the tracker, not in the kanban.
+pub fn mirrored_key_refusal(key: &str, binding: &crate::config::loader::TrackerBinding) -> String {
+    let label = provider_label(&binding.provider);
+    format!(
+        "{key} is mirrored from {label} team {} into {}/{}; it is not a kanban ticket. Edit it in {label}; `wardwell tracker pull` brings the change into the vault.",
+        binding.team, binding.domain, binding.project
+    )
+}
+
+/// The sentence for a binding whose team key equals the native kanban
+/// prefix of its project, or None when they differ. Ticket ids of the two
+/// would be indistinguishable, so the mirror is left out of kanban reads.
+pub fn prefix_collision(binding: &crate::config::loader::TrackerBinding, native_prefix: &str) -> Option<String> {
+    let normal = |prefix: &str| prefix.trim_end_matches('-').to_ascii_uppercase();
+    (normal(native_prefix) == normal(&binding.team)).then(|| {
+        format!(
+            "Tracker team key {} of {}/{} equals the native kanban prefix {native_prefix} of project {}. Set a different native prefix for {} in kanban.prefixes.",
+            binding.team, binding.domain, binding.project, binding.project, binding.project
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +99,18 @@ mod tests {
         assert!(message.contains("work/claims is a read-only mirror of Linear team COR"), "{message}");
         assert!(message.contains("Edit it in Linear"), "{message}");
         assert!(readonly_refusal(&binding(false)).is_none());
+    }
+
+    #[test]
+    fn prefix_collision_compares_without_case_or_hyphen() {
+        assert!(prefix_collision(&binding(true), "cor-").is_some());
+        assert!(prefix_collision(&binding(true), "CL").is_none());
+    }
+
+    #[test]
+    fn mirrored_key_refusal_names_the_key_provider_and_where_to_edit() {
+        let message = mirrored_key_refusal("COR-12", &binding(false));
+        assert!(message.starts_with("COR-12 is mirrored from Linear team COR into work/claims"), "{message}");
+        assert!(message.contains("Edit it in Linear"), "{message}");
     }
 }

@@ -245,6 +245,7 @@ pub fn load(path: Option<&Path>) -> Result<WardwellConfig, ConfigError> {
     };
 
     let trackers = tracker_bindings(raw.trackers)?;
+    reject_prefix_collisions(&trackers, &kanban_prefixes)?;
 
     Ok(WardwellConfig {
         vault_path,
@@ -287,6 +288,30 @@ fn tracker_bindings(
         });
     }
     Ok(bindings)
+}
+
+/// A tracker key and a native kanban ticket id must never share a prefix,
+/// or a lookup could not tell them apart. `prefixes` maps project to prefix.
+fn reject_prefix_collisions(
+    trackers: &BTreeMap<String, TrackerBinding>,
+    prefixes: &HashMap<String, String>,
+) -> Result<(), ConfigError> {
+    let normal = |prefix: &str| prefix.trim_end_matches('-').to_ascii_uppercase();
+    for (key, binding) in trackers {
+        let mut clashes: Vec<(&String, &String)> =
+            prefixes.iter().filter(|(_, prefix)| normal(prefix) == normal(&binding.team)).collect();
+        clashes.sort();
+        if let Some((project, prefix)) = clashes.first() {
+            return Err(ConfigError::InvalidTrackerBinding {
+                key: key.clone(),
+                reason: format!(
+                    "team key {} equals the native kanban prefix {prefix} of project {project}; change one of them",
+                    binding.team
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn split_project_key(key: &str) -> Result<(String, String), ConfigError> {
@@ -537,5 +562,19 @@ trackers:
         assert!(error.contains("work/claims"), "{error}");
         assert!(error.contains("'jira'"), "{error}");
         assert!(error.contains("supported: linear"), "{error}");
+    }
+
+    #[test]
+    fn trackers_reject_a_team_key_that_is_a_native_kanban_prefix() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\nkanban:\n  enabled: true\n  prefixes:\n    billing: cor\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("prefix collision").to_string();
+        assert!(error.contains("work/claims"), "{error}");
+        assert!(error.contains("team key COR"), "{error}");
+        assert!(error.contains("kanban prefix cor of project billing"), "{error}");
+
+        let other = "vault_path: /tmp/v\nsession_sources: []\nkanban:\n  enabled: true\n  prefixes:\n    billing: BIL\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n";
+        let f = write_config(other).unwrap();
+        assert!(load(Some(f.path())).is_ok());
     }
 }

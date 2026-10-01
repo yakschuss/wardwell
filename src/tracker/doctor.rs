@@ -8,6 +8,7 @@ use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::credential::{self, Credential};
 use crate::tracker::events::FailureCode;
 use crate::tracker::linear::{self, HttpTransport, Transport};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Builds the provider transport for a binding. Injected so tests never
@@ -26,17 +27,62 @@ pub fn connect_transport(binding: &TrackerBinding, credential: &Credential) -> R
 /// the place of auth when the provider has no adapter. The bool is true when
 /// every check passed.
 pub fn run(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>) -> (Vec<String>, bool) {
+    run_with(config, config_dir, probe, &native_prefixes(config, &config_dir.join("kanban.db")))
+}
+
+/// `run`, with each binding's native kanban prefix given by binding key.
+/// Adds a fourth line per binding: whether the team key differs from it.
+pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, native: &BTreeMap<String, String>) -> (Vec<String>, bool) {
     if config.trackers.is_empty() {
         return (vec!["No trackers bound. Add a trackers section to config.yml.".to_string()], true);
     }
     let mut lines = Vec::new();
     let mut healthy = true;
     for (key, binding) in &config.trackers {
-        let checks = check_binding(config_dir, binding, probe);
+        let mut checks = check_binding(config_dir, binding, probe);
+        checks.push(("kanban prefix".to_string(), prefix_outcome(binding, native.get(key))));
         healthy &= checks.iter().all(|(_, outcome)| matches!(outcome, Outcome::Ok));
         lines.extend(checks.into_iter().map(|(name, outcome)| format!("{key}: {name} {}", outcome.describe())));
     }
     (lines, healthy)
+}
+
+/// The checks that need no network: the credential file exists with
+/// owner-only permissions, and Wardwell has an adapter for the provider.
+/// The error is a closed code and, for the credential, the path and fix.
+pub fn check_offline(config_dir: &Path, binding: &TrackerBinding) -> Result<(), (FailureCode, Option<String>)> {
+    credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .map_err(|message| (FailureCode::Credential, Some(message)))?;
+    match crate::tracker::SUPPORTED_PROVIDERS.contains(&binding.provider.as_str()) {
+        true => Ok(()),
+        false => Err((FailureCode::UnsupportedProvider, None)),
+    }
+}
+
+/// The native kanban prefix of each bound project, by binding key, read
+/// from the kanban database at `kanban_db` without writing or creating it.
+pub fn native_prefixes(config: &WardwellConfig, kanban_db: &Path) -> BTreeMap<String, String> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = rusqlite::Connection::open_with_flags(kanban_db, flags) else {
+        return BTreeMap::new();
+    };
+    config
+        .trackers
+        .iter()
+        .filter_map(|(key, b)| {
+            crate::kanban::store::native_prefix_in(&conn, &b.project, &config.kanban_prefixes).map(|prefix| (key.clone(), prefix))
+        })
+        .collect()
+}
+
+/// The prefix check as a doctor outcome, with the collision sentence.
+pub fn prefix_failure(binding: &TrackerBinding, native: Option<&String>) -> Option<String> {
+    native.and_then(|prefix| crate::tracker::prefix_collision(binding, prefix))
+}
+
+fn prefix_outcome(binding: &TrackerBinding, native: Option<&String>) -> Outcome {
+    prefix_failure(binding, native).map_or(Outcome::Ok, |sentence| Outcome::Failed(FailureCode::PrefixCollision, Some(sentence)))
 }
 
 enum Outcome {
@@ -143,7 +189,7 @@ mod tests {
     fn healthy_binding_prints_one_ok_line_per_check() {
         let (dir, config) = setup(true);
         let (lines, healthy) = doctor_with(dir.path(), &config, viewer_ok(), json!([{"key": "COR"}]));
-        assert_eq!(lines, vec!["work/claims: credential ok", "work/claims: auth ok", "work/claims: team COR ok"]);
+        assert_eq!(lines, vec!["work/claims: credential ok", "work/claims: auth ok", "work/claims: team COR ok", "work/claims: kanban prefix ok"]);
         assert!(healthy);
     }
 
@@ -152,7 +198,7 @@ mod tests {
         let (dir, config) = setup(false);
         let (lines, healthy) = doctor_with(dir.path(), &config, viewer_ok(), json!([{"key": "COR"}]));
         assert!(lines[0].starts_with("work/claims: credential failed (credential): tracker credential not configured"), "{}", lines[0]);
-        assert_eq!(&lines[1..], ["work/claims: auth skipped", "work/claims: team COR skipped"]);
+        assert_eq!(&lines[1..3], ["work/claims: auth skipped", "work/claims: team COR skipped"]);
         assert!(!healthy);
     }
 
@@ -177,7 +223,7 @@ mod tests {
             Ok(json!({"errors": [{"message": "Authentication required", "extensions": {"type": "authentication error"}}]})),
         ] {
             let (lines, healthy) = doctor_with(dir.path(), &config, viewer, json!([{"key": "COR"}]));
-            assert_eq!(&lines[1..], ["work/claims: auth failed (auth)", "work/claims: team COR skipped"]);
+            assert_eq!(&lines[1..3], ["work/claims: auth failed (auth)", "work/claims: team COR skipped"]);
             assert!(!lines.join("\n").contains("lin_api_secret"));
             assert!(!healthy);
         }
@@ -195,7 +241,7 @@ mod tests {
         let (dir, config) = setup(true);
         let viewer = Ok(json!({"errors": [{"message": "Rate limit exceeded", "extensions": {"code": "RATELIMITED"}}]}));
         let (lines, healthy) = doctor_with(dir.path(), &config, viewer, json!([{"key": "COR"}]));
-        assert_eq!(&lines[1..], ["work/claims: auth failed (provider)", "work/claims: team COR skipped"]);
+        assert_eq!(&lines[1..3], ["work/claims: auth failed (provider)", "work/claims: team COR skipped"]);
         assert!(!healthy);
     }
 
@@ -206,9 +252,54 @@ mod tests {
         let (lines, healthy) = run(&config, dir.path(), &connect_transport);
         assert_eq!(
             lines,
-            vec!["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped"]
+            vec!["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped", "work/claims: kanban prefix ok"]
         );
         assert!(!healthy);
+    }
+
+    #[test]
+    fn offline_checks_read_the_credential_and_provider_without_a_probe() {
+        let (dir, config) = setup(true);
+        let binding = &config.trackers["work/claims"];
+        assert_eq!(check_offline(dir.path(), binding), Ok(()));
+        let mut unknown = binding.clone();
+        unknown.provider = "jira".into();
+        assert_eq!(check_offline(dir.path(), &unknown), Err((FailureCode::UnsupportedProvider, None)));
+        let (empty, config) = setup(false);
+        let (code, detail) = check_offline(empty.path(), &config.trackers["work/claims"]).unwrap_err();
+        assert_eq!(code, FailureCode::Credential);
+        assert!(detail.unwrap().contains("not configured"));
+    }
+
+    #[test]
+    fn a_team_key_equal_to_a_native_prefix_fails_the_prefix_check() {
+        let (dir, config) = setup(true);
+        let native = std::collections::BTreeMap::from([("work/claims".to_string(), "COR".to_string())]);
+        let probe = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Transport>, String> {
+            Ok(Box::new(Canned { viewer: viewer_ok(), teams: json!([{"key": "COR"}]) }))
+        };
+        let (lines, healthy) = run_with(&config, dir.path(), &probe, &native);
+        assert_eq!(
+            lines.last().unwrap(),
+            "work/claims: kanban prefix failed (prefix_collision): Tracker team key COR of work/claims equals the native kanban prefix COR of project claims. Set a different native prefix for claims in kanban.prefixes."
+        );
+        assert!(!healthy);
+        let other = std::collections::BTreeMap::from([("work/claims".to_string(), "CL".to_string())]);
+        let (lines, healthy) = run_with(&config, dir.path(), &probe, &other);
+        assert_eq!(lines.last().unwrap(), "work/claims: kanban prefix ok");
+        assert!(healthy);
+    }
+
+    #[test]
+    fn native_prefixes_read_the_store_without_creating_it() {
+        let (dir, config) = setup(true);
+        let db = dir.path().join("kanban.db");
+        assert!(native_prefixes(&config, &db).is_empty());
+        assert!(!db.exists(), "doctor never creates the kanban database");
+        let store = crate::kanban::store::KanbanStore::open(&db, config.vault_path.clone()).unwrap();
+        store.create_item("t", "claims", "work", None, None, None, None, None, None, None, None, None, &std::collections::HashMap::new()).unwrap();
+        drop(store);
+        assert_eq!(native_prefixes(&config, &db)["work/claims"], "CL");
     }
 
     #[test]
