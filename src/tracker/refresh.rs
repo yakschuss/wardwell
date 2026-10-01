@@ -21,11 +21,14 @@ pub enum Reason {
     Cooldown,
     PullFailed(FailureCode),
     NoBinding,
+    /// The log has no pull marker, so an incremental pull would read the
+    /// whole team. `wardwell tracker pull` seeds it.
+    NeverPulled,
 }
 
 impl Reason {
     /// The closed label: `found_after_pull`, `still_missing`, `cooldown`,
-    /// `pull_failed:<code>` or `no_binding`.
+    /// `pull_failed:<code>`, `no_binding` or `never_pulled`.
     pub fn label(self) -> String {
         match self {
             Self::FoundAfterPull => "found_after_pull".to_string(),
@@ -33,6 +36,7 @@ impl Reason {
             Self::Cooldown => "cooldown".to_string(),
             Self::PullFailed(code) => format!("pull_failed:{}", code.as_str()),
             Self::NoBinding => "no_binding".to_string(),
+            Self::NeverPulled => "never_pulled".to_string(),
         }
     }
 
@@ -93,6 +97,8 @@ mod tests {
         assert_eq!(Reason::Cooldown.label(), "cooldown");
         assert_eq!(Reason::PullFailed(FailureCode::Auth).label(), "pull_failed:auth");
         assert_eq!(Reason::NoBinding.label(), "no_binding");
+        assert_eq!(Reason::NeverPulled.label(), "never_pulled");
+        assert!(!Reason::NeverPulled.refreshed());
         assert!(Reason::FoundAfterPull.refreshed() && Reason::StillMissing.refreshed());
         assert!(!Reason::Cooldown.refreshed() && !Reason::NoBinding.refreshed());
         assert!(!Reason::PullFailed(FailureCode::Provider).refreshed());

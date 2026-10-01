@@ -3712,13 +3712,17 @@ impl WardwellServer {
     }
 
     /// One incremental pull for the binding that would hold `key`, unless
-    /// none does or it pulled within the cooldown. Never a full pull.
+    /// none does, its log has no pull marker, or it pulled within the
+    /// cooldown. Never a full pull.
     fn refresh_on_miss(&self, key: &str, project: Option<&str>) -> Result<(), crate::tracker::refresh::Reason> {
         use crate::tracker::refresh::Reason;
         let bindings = self.read_bindings(project);
         let Some(binding) = crate::tracker::refresh::target(&bindings, key, project) else {
             return Err(Reason::NoBinding);
         };
+        if self.mirror_view(binding).is_none_or(|view| view.last_pull_at.is_none()) {
+            return Err(Reason::NeverPulled);
+        }
         let binding_key = format!("{}/{}", binding.domain, binding.project);
         let started = self
             .refresh_cooldown

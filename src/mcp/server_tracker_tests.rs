@@ -228,7 +228,12 @@ impl crate::tracker::adapter::Adapter for FakeAdapter {
 /// `fixture` with a saved credential and a fake adapter behind the
 /// server's connect seam. Returns the recorded pulls.
 fn refresh_fixture(events: Vec<Event>, error: Option<&str>) -> (Fixture, Arc<Mutex<Vec<bool>>>) {
-    let mut f = fixture(&standard_mirror(), true);
+    refresh_fixture_over(&standard_mirror(), events, error)
+}
+
+/// `refresh_fixture` over the given mirror events.
+fn refresh_fixture_over(mirror: &[Event], events: Vec<Event>, error: Option<&str>) -> (Fixture, Arc<Mutex<Vec<bool>>>) {
+    let mut f = fixture(mirror, true);
     let config_dir = f._dir.path().join("config");
     let path = crate::tracker::credential::path_in(&config_dir, "corr-linear").unwrap();
     crate::tracker::credential::save(&path, "t").unwrap();
@@ -362,4 +367,19 @@ fn search_caps_mirrored_items_at_twenty() {
     assert_eq!(&keys[..3], ["COR-0", "COR-1", "COR-2"]);
     assert_eq!(response["tracker_truncated"], 180);
     assert!(response["items"][0].get("description").is_none());
+}
+
+#[test]
+fn a_miss_on_a_mirror_never_pulled_does_not_pull_the_whole_team() {
+    let now = chrono::Utc::now();
+    let never = vec![snapshot("COR-1", "Seen once", "Todo", StateCategory::Unstarted, now)];
+    let (f, calls) = refresh_fixture_over(&never, vec![snapshot("COR-2", "x", "Todo", StateCategory::Unstarted, now)], None);
+    let response = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-2"}));
+    assert_eq!(response["refreshed"], false, "{response}");
+    assert_eq!(response["refresh_reason"], "never_pulled");
+    assert!(calls.lock().unwrap().is_empty());
+    let (empty, calls) = refresh_fixture_over(&[], vec![], None);
+    let response = kanban(&empty.server, json!({"action": "get", "ticket_id": "COR-2"}));
+    assert_eq!(response["refresh_reason"], "never_pulled");
+    assert!(calls.lock().unwrap().is_empty());
 }

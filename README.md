@@ -474,8 +474,10 @@ result adds `tracker_truncated` with the count left out.
 binding that owns the key, then looks again. It never runs a full pull, and
 each binding refreshes at most once a minute. The result carries `refreshed`,
 true when a pull completed, and `refresh_reason`: `found_after_pull`,
-`still_missing`, `cooldown`, `pull_failed:<code>` or `no_binding`. `list`,
-`query` and `search` never pull.
+`still_missing`, `cooldown`, `pull_failed:<code>`, `no_binding` or
+`never_pulled`. A mirror with no pull marker is not refreshed, because an
+incremental pull with no cursor would read the whole team. Run `wardwell
+tracker pull` first. `list`, `query` and `search` never pull.
 
 At session start, `wardwell inject` prints a rot line for each project
 folder in the matched domain. It reads like this: Last history entry 12 days
