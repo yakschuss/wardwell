@@ -11,6 +11,7 @@ use crate::config::loader::{WardwellConfig, parse};
 use crate::inject::git::{GitDirs, canonical};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// What the user asked `link` to do.
 pub struct LinkRequest<'a> {
@@ -22,10 +23,21 @@ pub struct LinkRequest<'a> {
     pub yes: bool,
 }
 
+/// How long `link` waits for another link to release config.yml.
+pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+
 /// Plan, preview, confirm and apply one link in `config_dir/config.yml`.
 /// `confirm` is asked once, only when a write is planned without `yes`.
 pub fn link(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) -> Option<GitDirs>, confirm: impl FnOnce() -> bool, out: &mut dyn Write) -> Result<(), String> {
+    link_waiting(config_dir, request, git, confirm, out, LOCK_WAIT)
+}
+
+/// `link` holding `config.yml.lock` from the read to the rename. The lock is
+/// released while the question waits for an answer; the write then checks
+/// that config.yml did not change in between.
+fn link_waiting(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) -> Option<GitDirs>, confirm: impl FnOnce() -> bool, out: &mut dyn Write, wait: Duration) -> Result<(), String> {
     let path = config_dir.join("config.yml");
+    let mut lock = Lock::take(&path, wait)?;
     let (before, config) = read_config(&path)?;
     let dir = recorded_dir(request.dir, git)?;
     let key = match request.key {
@@ -44,12 +56,46 @@ pub fn link(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) -> Opt
     if request.dry_run {
         return say(out, "\n  Dry run complete. Nothing changed.".into());
     }
-    if !request.yes && !confirm() {
-        return say(out, "\n  Cancelled. Nothing changed.".into());
+    if !request.yes {
+        drop(lock);
+        if !confirm() {
+            return say(out, "\n  Cancelled. Nothing changed.".into());
+        }
+        lock = Lock::take(&path, wait)?;
     }
     let backup = write(&path, &before, &after)?;
+    drop(lock);
     say(out, format!("\n  OK linked.\n    backup: {}", backup.display()))?;
     say(out, format!("\n  New sessions started in {} or its worktrees load {key}.\n  Sessions already running do not change.", dir.display()))
+}
+
+/// `config.yml.lock` beside config.yml, created exclusively and removed when
+/// dropped, on every exit path.
+struct Lock(PathBuf);
+
+impl Lock {
+    fn take(config: &Path, wait: Duration) -> Result<Self, String> {
+        let path = config.with_file_name("config.yml.lock");
+        let started = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && started.elapsed() < wait => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(format!("Another link holds {}. Nothing changed. If no link is running, delete that file and run again.", path.display()));
+                }
+                Err(_) => return Err(format!("Could not create {}. Nothing changed.", path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Every mapping in `config_dir/config.yml`, one project per block.
@@ -271,5 +317,54 @@ mod tests {
         let mut out = Vec::new();
         list(&f.cfg, &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), format!("wardwell project list\n\n  personal/corrtex\n    {}\n", f.code.display()));
+    }
+
+    #[test]
+    fn eight_parallel_links_of_eight_paths_keep_all_eight_and_leave_no_lock() {
+        let f = fixture();
+        let root = f.code.parent().unwrap().to_path_buf();
+        let dirs: Vec<PathBuf> = (0..8).map(|i| root.join(format!("c{i}"))).collect();
+        dirs.iter().for_each(|d| std::fs::create_dir_all(d).unwrap());
+        std::thread::scope(|scope| {
+            for dir in &dirs {
+                let cfg = f.cfg.clone();
+                scope.spawn(move || {
+                    let request = LinkRequest { key: Some("personal/corrtex"), dir, dry_run: false, yes: true };
+                    link(&cfg, &request, |_: &Path| None, || true, &mut Vec::new()).unwrap();
+                });
+            }
+        });
+        let paths = &parse(&config_text(&f)).unwrap().projects["personal/corrtex"].paths;
+        assert_eq!(paths.len(), 8, "{paths:?}");
+        assert!(!f.cfg.join("config.yml.lock").exists());
+    }
+
+    #[test]
+    fn a_held_lock_times_out_with_a_clear_message_and_is_not_removed() {
+        let f = fixture();
+        std::fs::write(f.cfg.join("config.yml.lock"), "").unwrap();
+        let error = link_with_wait(&f.cfg, &LinkRequest { key: Some("personal/corrtex"), dir: &f.code, dry_run: false, yes: true }, std::time::Duration::from_millis(100)).unwrap_err();
+        assert!(error.contains("config.yml.lock") && error.contains("Nothing changed"), "{error}");
+        assert!(f.cfg.join("config.yml.lock").exists(), "another process's lock is left alone");
+        assert_eq!(parse(&config_text(&f)).unwrap().projects.len(), 0);
+    }
+
+    #[test]
+    fn every_exit_path_removes_the_lock() {
+        let f = fixture();
+        let lock = f.cfg.join("config.yml.lock");
+        run(&f, Some("personal/corrtex"), &f.code, true, true).unwrap();
+        assert!(!lock.exists(), "dry run");
+        run(&f, Some("personal/corrtex"), &f.code, false, false).unwrap();
+        assert!(!lock.exists(), "cancelled");
+        run(&f, Some("personal/nope"), &f.code, false, true).unwrap_err();
+        assert!(!lock.exists(), "refused");
+        run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+        run(&f, Some("personal/corrtex"), &f.code, false, true).unwrap();
+        assert!(!lock.exists(), "written and unchanged");
+    }
+
+    fn link_with_wait(cfg: &Path, request: &LinkRequest, wait: std::time::Duration) -> Result<(), String> {
+        link_waiting(cfg, request, |_: &Path| None, || true, &mut Vec::new(), wait)
     }
 }
