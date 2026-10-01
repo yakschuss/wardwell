@@ -480,6 +480,7 @@ mod tests {
             team: "COR".into(),
             credential: "corr-linear".into(),
             readonly: true,
+            gate: false,
         }
     }
 

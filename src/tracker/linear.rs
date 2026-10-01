@@ -696,6 +696,7 @@ mod tests {
             team: "COR".into(),
             credential: "corr-linear".into(),
             readonly: true,
+            gate: false,
         };
         let vault = tempfile::tempdir().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();
@@ -736,6 +737,7 @@ mod tests {
             team: "COR".into(),
             credential: "corr-linear".into(),
             readonly: true,
+            gate: false,
         };
         let vault = tempfile::tempdir().unwrap();
         let path = log::path_for(vault.path(), "work", "claims");
@@ -793,6 +795,7 @@ mod tests {
             team: "COR".into(),
             credential: "corr-linear".into(),
             readonly: true,
+            gate: false,
         };
         let vault = tempfile::tempdir().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();
@@ -837,6 +840,7 @@ mod tests {
             team: "COR".into(),
             credential: "corr-linear".into(),
             readonly: true,
+            gate: false,
         };
         let vault = tempfile::tempdir().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();

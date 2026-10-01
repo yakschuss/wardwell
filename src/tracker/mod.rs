@@ -90,6 +90,7 @@ mod tests {
             team: "COR".into(),
             credential: "c".into(),
             readonly,
+            gate: false,
         }
     }
 

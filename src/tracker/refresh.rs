@@ -87,6 +87,7 @@ mod tests {
             team: team.into(),
             credential: "c".into(),
             readonly: true,
+            gate: false,
         }
     }
 

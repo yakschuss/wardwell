@@ -69,6 +69,9 @@ pub struct TrackerBinding {
     pub credential: String,
     /// When true, kanban write actions on this project are refused.
     pub readonly: bool,
+    /// When true, `wardwell setup` installs the tracker policy for this
+    /// provider: the write gate and the deny list. Optional, off by default.
+    pub gate: bool,
 }
 
 /// Maps working directories to one vault project, so a session started in
@@ -170,6 +173,8 @@ struct RawTrackerBinding {
     credential: String,
     #[serde(default)]
     readonly: bool,
+    #[serde(default)]
+    gate: bool,
 }
 
 fn default_true() -> bool {
@@ -377,6 +382,7 @@ fn tracker_bindings(
             team: entry.team,
             credential: entry.credential,
             readonly: entry.readonly,
+            gate: entry.gate,
         });
     }
     Ok(bindings)
@@ -639,6 +645,15 @@ trackers:
         assert!(!config.trackers.get("work/other").unwrap().readonly);
         assert_eq!(config.tracker_for("work", "claims").map(|b| b.team.as_str()), Some("COR"));
         assert!(config.tracker_for("work", "missing").is_none());
+    }
+
+    #[test]
+    fn trackers_gate_is_optional_and_defaults_to_false() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n    gate: true\n  work/other:\n    provider: linear\n    team: OTH\n    credential: c\n";
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert!(config.trackers.get("work/claims").unwrap().gate);
+        assert!(!config.trackers.get("work/other").unwrap().gate);
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub(super) fn binding(readonly: bool) -> TrackerBinding {
         team: "COR".into(),
         credential: "corr-linear".into(),
         readonly,
+        gate: false,
     }
 }
 
