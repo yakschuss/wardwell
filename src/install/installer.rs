@@ -428,39 +428,144 @@ pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Result<Plan, String> {
     Ok(Plan { lines, changes, pull, policy: false, settings: false })
 }
 
-/// Write the plan. Every file is re-checked against the preview first, so a
-/// concurrent edit stops the run before anything is written.
-pub fn apply(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Result<u32, String>) -> Result<Vec<String>, String> {
+/// An apply that stopped: the lines of the steps that ran, and why it stopped.
+#[derive(Debug)]
+pub struct Failed {
+    pub lines: Vec<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failed {}
+
+fn stop(lines: &[String], message: impl Into<String>) -> Failed {
+    Failed { lines: lines.to_vec(), message: message.into() }
+}
+
+/// Write the plan. Every file is re-checked against the preview, staged as a
+/// temp file beside its target, and backed up before the first rename. Files
+/// are renamed in plan order: settings first, then the install record. When a
+/// later rename fails, the files already renamed are restored from their
+/// backups. The pull service runs last.
+pub fn apply(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Result<u32, String>) -> Result<Vec<String>, Failed> {
+    apply_with(plan, runner, uid, &|from, to| std::fs::rename(from, to))
+}
+
+type Rename = dyn Fn(&Path, &Path) -> std::io::Result<()>;
+
+fn apply_with(plan: &Plan, runner: &dyn LaunchctlRunner, uid: &dyn Fn() -> Result<u32, String>, rename: &Rename) -> Result<Vec<String>, Failed> {
+    let mut lines = Vec::new();
     for change in &plan.changes {
-        if read_optional(&change.path)? != change.before {
-            return Err(format!("{} changed since the preview; nothing was written. Run the command again.", change.path.display()));
+        if read_optional(&change.path).map_err(|e| stop(&lines, e))? != change.before {
+            return Err(stop(&lines, format!("{} changed since the preview; nothing was written. Run the command again.", change.path.display())));
         }
     }
-    let mut report = Vec::new();
+    let mut staged: Vec<PathBuf> = Vec::new();
+    let discard = |staged: &[PathBuf]| staged.iter().for_each(|temp| drop(std::fs::remove_file(temp)));
     for change in &plan.changes {
-        if read_optional(&change.path)? != change.before {
-            return Err(format!(
-                "{} changed during installation. Earlier files have .wardwell-backup files for rollback; rerun after review.",
-                change.path.display()
-            ));
-        }
-        let backup = change.before.as_ref().map(|bytes| backup_file(&change.path, bytes)).transpose()?;
-        atomic_write(&change.path, &change.after)
-            .map_err(|error| format!("{error}; any earlier changed files have .wardwell-backup files for rollback"))?;
-        restore_mode(&change.path, change.mode)?;
-        report.push(format!("  OK {}", change.path.display()));
-        if let Some(backup) = backup {
-            report.push(format!("    backup: {}", backup.display()));
+        match stage(&change.path, &change.after, change.mode) {
+            Ok(temp) => staged.push(temp),
+            Err(error) => {
+                discard(&staged);
+                return Err(stop(&lines, format!("Could not stage {} ({error}); nothing was written.", change.path.display())));
+            }
         }
     }
-    match &plan.pull {
+    let mut backups = Vec::new();
+    for change in &plan.changes {
+        match change.before.as_ref().map(|bytes| backup_file(&change.path, bytes)).transpose() {
+            Ok(backup) => backups.push(backup),
+            Err(error) => {
+                discard(&staged);
+                return Err(stop(&lines, format!("{error} for {}; nothing was written.", change.path.display())));
+            }
+        }
+    }
+    for (index, (change, temp)) in plan.changes.iter().zip(&staged).enumerate() {
+        if let Err(error) = rename(temp, &change.path) {
+            discard(&staged[index..]);
+            let restored = restore(&plan.changes[..index], &mut lines);
+            return Err(stop(&lines, format!("Could not write {} ({error}). {restored}", change.path.display())));
+        }
+        sync_parent(&change.path);
+        lines.push(format!("  OK {}", change.path.display()));
+        if let Some(backup) = &backups[index] {
+            lines.push(format!("    backup: {}", backup.display()));
+        }
+    }
+    let pull = match &plan.pull {
         Pull::Install { home, config_dir, binary, interval } => {
-            report.push(format!("  OK {}", schedule::schedule(home, config_dir, *interval, runner, binary, uid()?)?));
+            uid().and_then(|uid| schedule::schedule(home, config_dir, *interval, runner, binary, uid)).map(Some)
         }
-        Pull::Remove { home } => report.push(format!("  OK {}", schedule::unschedule(home, runner, uid()?)?)),
-        Pull::Keep | Pull::Manual => {}
+        Pull::Remove { home } => uid().and_then(|uid| schedule::unschedule(home, runner, uid)).map(Some),
+        Pull::Keep | Pull::Manual => Ok(None),
+    };
+    match pull {
+        Ok(Some(line)) => lines.push(format!("  OK {line}")),
+        Ok(None) => {}
+        Err(error) => return Err(stop(&lines, format!("Tracker pull service: {error}"))),
     }
-    Ok(report)
+    Ok(lines)
+}
+
+/// Write `bytes` to a new temp file beside `path` with `mode` (0600 when the
+/// file is new), synced to disk. Returns the temp path.
+fn stage(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("no parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err("the destination is a symbolic link".into());
+    }
+    let temp = parent.join(format!(".wardwell-install-{}", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let written = options
+        .open(&temp)
+        .and_then(|mut file| file.write_all(bytes).and_then(|_| file.sync_all()))
+        .map_err(|error| error.to_string())
+        .and_then(|_| restore_mode(&temp, mode.or(Some(0o600))));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(temp)
+}
+
+fn sync_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+    }
+}
+
+/// Put back the files already renamed: their original bytes and mode, or
+/// no file when there was none. Returns the sentence for the failure.
+fn restore(done: &[Change], lines: &mut Vec<String>) -> String {
+    if done.is_empty() {
+        return "Nothing was written.".into();
+    }
+    let mut failed = Vec::new();
+    for change in done {
+        let result = match &change.before {
+            Some(bytes) => atomic_write(&change.path, bytes).and_then(|_| restore_mode(&change.path, change.mode)),
+            None => std::fs::remove_file(&change.path).map_err(|error| error.to_string()),
+        };
+        match result {
+            Ok(()) => lines.push(format!("  RESTORED {}", change.path.display())),
+            Err(_) => failed.push(change.path.display().to_string()),
+        }
+    }
+    match failed.is_empty() {
+        true => "The files already written were restored from their backups. Nothing changed.".into(),
+        false => format!("Could not restore {}; its .wardwell-backup file beside it holds the original.", failed.join(", ")),
+    }
 }
 
 #[cfg(test)]
@@ -733,13 +838,51 @@ mod tests {
         assert!(error.contains("an array"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_config_dir_leaves_settings_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let h = home();
+        put_settings(&h, json!({"model": "keep"}));
+        let before = fs::read(settings_path(&h.home)).unwrap();
+        let plan = plan_for(&h, &binding("linear", true), false);
+        fs::set_permissions(&h.cfg, fs::Permissions::from_mode(0o500)).unwrap();
+        let failed = apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap_err();
+        fs::set_permissions(&h.cfg, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(failed.message.contains("install-manifest.json"), "{}", failed.message);
+        assert_eq!(fs::read(settings_path(&h.home)).unwrap(), before);
+        let leftovers: Vec<_> = fs::read_dir(h.home.join(".claude")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+        assert!(!manifest::path(&h.cfg).exists());
+    }
+
+    #[test]
+    fn a_failed_record_rename_restores_settings_and_keeps_the_lines() {
+        let h = home();
+        put_settings(&h, json!({"model": "keep"}));
+        let before = fs::read(settings_path(&h.home)).unwrap();
+        let plan = plan_for(&h, &binding("linear", true), false);
+        let rename = |from: &Path, to: &Path| match to.ends_with(manifest::FILE) {
+            true => Err(std::io::Error::other("disk full")),
+            false => fs::rename(from, to),
+        };
+        let failed = apply_with(&plan, &Fake::new(&[]), &|| Ok(501), &rename).unwrap_err();
+        assert!(failed.message.contains("disk full"), "{}", failed.message);
+        assert!(failed.message.contains("restored"), "{}", failed.message);
+        assert!(failed.lines.iter().any(|l| l.contains("settings.json")), "{:?}", failed.lines);
+        assert_eq!(fs::read(settings_path(&h.home)).unwrap(), before);
+        assert!(!manifest::path(&h.cfg).exists());
+        let temps = fs::read_dir(&h.cfg).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(".wardwell-install-")).count();
+        assert_eq!(temps, 0);
+    }
+
     #[test]
     fn a_concurrent_edit_after_the_preview_writes_nothing() {
         let h = home();
         put_settings(&h, json!({}));
         let plan = plan_for(&h, &binding("linear", true), false);
         fs::write(settings_path(&h.home), "{\"model\": \"new\"}").unwrap();
-        assert!(apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap_err().contains("changed since the preview"));
+        assert!(apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap_err().message.contains("changed since the preview"));
         assert_eq!(fs::read_to_string(settings_path(&h.home)).unwrap(), "{\"model\": \"new\"}");
         assert!(!manifest::path(&h.cfg).exists());
     }

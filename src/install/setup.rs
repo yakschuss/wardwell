@@ -91,8 +91,12 @@ pub fn run(dry_run: bool, yes: bool) -> Result<(), Box<dyn std::error::Error>> {
         let result = reconcile(client, &paths, &binary_path, false)?;
         print_applied(client, &result);
     }
-    for line in installer::apply(&plan, &SystemRunner, &current_uid)? {
-        println!("{line}");
+    match installer::apply(&plan, &SystemRunner, &current_uid) {
+        Ok(lines) => lines.iter().for_each(|line| println!("{line}")),
+        Err(failed) => {
+            failed.lines.iter().for_each(|line| println!("{line}"));
+            return Err(failed.message.into());
+        }
     }
 
     println!();

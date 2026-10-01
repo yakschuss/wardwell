@@ -58,7 +58,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             match installer::apply(&plan, &SystemRunner, &current_uid) {
                 Ok(report) => report.iter().for_each(|line| println!("{line}")),
-                Err(error) => println!("    unchanged: {error}"),
+                Err(failed) => {
+                    failed.lines.iter().for_each(|line| println!("{line}"));
+                    println!("    unchanged: {}", failed.message);
+                }
             }
         }
         Err(error) => println!("    unchanged: {error}"),

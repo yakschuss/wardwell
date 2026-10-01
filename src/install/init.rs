@@ -610,7 +610,13 @@ fn hooks_plan(binary_path: &Path) -> Result<installer::Plan, String> {
 /// Apply the installer's plan; the lines to print, activation notes last.
 fn install_hooks(binary_path: &Path) -> Result<Vec<String>, String> {
     let plan = hooks_plan(binary_path)?;
-    let mut lines = installer::apply(&plan, &SystemRunner, &current_uid)?;
+    let mut lines = installer::apply(&plan, &SystemRunner, &current_uid).map_err(|failed| {
+        let mut text = failed.lines.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text + &failed.message
+    })?;
     lines.push("  \u{2713} Hooks installed".to_string());
     lines.extend(plan.activation().into_iter().map(|note| format!("    {note}")));
     Ok(lines)
