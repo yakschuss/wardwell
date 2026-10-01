@@ -1,0 +1,208 @@
+//! Kanban reads through the MCP handlers on a project bound to a tracker
+//! mirror.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use super::*;
+use crate::config::loader::TrackerBinding;
+use crate::tracker::events::{Common, Event, IssueSnapshot, Priority, StateCategory};
+use serde_json::{Value, json};
+
+pub(super) struct Fixture {
+    /// Holds the vault and config dir alive for the test.
+    pub _dir: tempfile::TempDir,
+    pub server: WardwellServer,
+}
+
+pub(super) fn binding(readonly: bool) -> TrackerBinding {
+    TrackerBinding {
+        domain: "work".into(),
+        project: "claims".into(),
+        provider: "linear".into(),
+        team: "COR".into(),
+        credential: "corr-linear".into(),
+        readonly,
+    }
+}
+
+/// A server with kanban on, `work/claims` bound to a mirror, one native
+/// ticket in that project, and the given mirror events on disk.
+pub(super) fn fixture(events: &[Event], readonly: bool) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let vault = dir.path().join("vault");
+    std::fs::create_dir_all(vault.join("work/claims")).unwrap();
+    let kanban = crate::kanban::store::KanbanStore::open(&dir.path().join("kanban.db"), vault.clone()).unwrap();
+    kanban
+        .create_item("Native claims task", "claims", "work", None, None, None, None, None, Some("hank"), None, None, None, &std::collections::HashMap::new())
+        .unwrap();
+    write_mirror(&vault, events);
+    let index = Arc::new(crate::index::store::IndexStore::open(&dir.path().join("index.db")).unwrap());
+    let mut trackers = std::collections::BTreeMap::new();
+    trackers.insert("work/claims".to_string(), binding(readonly));
+    let config = crate::config::loader::WardwellConfig {
+        vault_path: vault,
+        registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
+        session_sources: vec![],
+        exclude: vec![],
+        ai: Default::default(),
+        stop_hook: true,
+        kanban_enabled: true,
+        kanban_queries: std::collections::HashMap::new(),
+        kanban_prefixes: std::collections::HashMap::new(),
+        features: Default::default(),
+        trackers,
+    };
+    let server = WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None, Some(kanban));
+    Fixture { _dir: dir, server }
+}
+
+pub(super) fn write_mirror(vault: &std::path::Path, events: &[Event]) {
+    let path = crate::tracker::log::path_for(vault, "work", "claims");
+    let mut summary = crate::tracker::log::read(&path).unwrap();
+    crate::tracker::log::append_new(&path, events, &mut summary).unwrap();
+}
+
+pub(super) fn common(id: &str, key: &str, at: chrono::DateTime<chrono::Utc>) -> Common {
+    Common {
+        id: id.into(),
+        provider: "linear".into(),
+        external_key: key.into(),
+        external_id: format!("{key}-uuid"),
+        actor: None,
+        occurred_at: at,
+        title: format!("{key} title"),
+        raw: Value::Null,
+    }
+}
+
+pub(super) fn snapshot(key: &str, title: &str, state: &str, category: StateCategory, at: chrono::DateTime<chrono::Utc>) -> Event {
+    Event::IssueUpserted {
+        common: common(&format!("linear:issue:{key}:{at}"), key, at),
+        issue: Box::new(IssueSnapshot {
+            issue_title: title.into(),
+            state: state.into(),
+            state_category: category,
+            priority: Priority::High,
+            labels: vec!["billing".into()],
+            url: Some(format!("https://example.com/{key}")),
+            parent_key: Some("COR-5".into()),
+            ..Default::default()
+        }),
+    }
+}
+
+pub(super) fn pulled(at: chrono::DateTime<chrono::Utc>) -> Event {
+    Event::PullCompleted { common: common(&format!("wardwell:pull_completed:COR:{at}"), "COR", at), through: Some(at) }
+}
+
+pub(super) fn standard_mirror() -> Vec<Event> {
+    let now = chrono::Utc::now();
+    let hour = chrono::TimeDelta::hours(1);
+    vec![
+        snapshot("COR-12", "Claims inbox shows wrong payer", "In Progress", StateCategory::Started, now - hour * 2),
+        snapshot("COR-13", "Payer lookup times out", "Done", StateCategory::Completed, now - hour * 2),
+        snapshot("COR-14", "Old work", "Todo", StateCategory::Unstarted, now - chrono::TimeDelta::days(10)),
+        pulled(now - hour),
+    ]
+}
+
+pub(super) fn kanban(server: &WardwellServer, args: Value) -> Value {
+    let mut args = args;
+    args["action"] = args.get("action").cloned().unwrap_or(json!("list"));
+    let params: KanbanParams = serde_json::from_value(args).unwrap();
+    let store = server.kanban.as_ref().unwrap();
+    let raw = match params.action.as_str() {
+        "list" => server.kanban_list(store, &params),
+        "get" => server.kanban_get(store, &params),
+        "query" => server.kanban_query(store, &params),
+        "search" => server.kanban_search(store, &params),
+        other => panic!("unexpected action {other}"),
+    };
+    serde_json::from_str(&raw).unwrap()
+}
+
+fn keys(response: &Value) -> Vec<String> {
+    response["items"].as_array().unwrap().iter().map(|i| i["ticket_id"].as_str().unwrap().to_string()).collect()
+}
+
+fn origins(response: &Value) -> Vec<String> {
+    response["items"].as_array().unwrap().iter().map(|i| i["origin"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn list_merges_open_mirrored_issues_with_native_items() {
+    let f = fixture(&standard_mirror(), true);
+    let response = kanban(&f.server, json!({"action": "list", "project": "claims"}));
+    assert_eq!(keys(&response), vec!["CL-1", "COR-12", "COR-14"], "{response}");
+    assert_eq!(origins(&response), vec!["kanban", "tracker", "tracker"]);
+    assert_eq!(response["total"], 3);
+    let native = &response["items"][0];
+    assert_eq!(native["source"], "hank", "native items keep their own source field");
+    let mirrored = &response["items"][1];
+    assert_eq!(mirrored["provider"], "linear");
+    assert_eq!(mirrored["external_key"], "COR-12");
+    assert_eq!(mirrored["state"], "In Progress");
+    assert_eq!(mirrored["state_category"], "started");
+    assert_eq!(mirrored["parent_key"], "COR-5");
+    assert_eq!(mirrored["url"], "https://example.com/COR-12");
+    assert_eq!(mirrored["last_pulled_age"], "1 hour ago");
+    assert!(mirrored["last_pulled_at"].is_string());
+
+    let done = kanban(&f.server, json!({"action": "list", "project": "claims", "include_done": true}));
+    assert!(keys(&done).contains(&"COR-13".to_string()));
+    let started = kanban(&f.server, json!({"action": "list", "project": "claims", "status": "in_progress"}));
+    assert_eq!(keys(&started), vec!["COR-12"]);
+}
+
+#[test]
+fn an_unbound_project_lists_only_native_items() {
+    let f = fixture(&standard_mirror(), true);
+    let response = kanban(&f.server, json!({"action": "list", "project": "billing"}));
+    assert!(keys(&response).is_empty(), "{response}");
+}
+
+#[test]
+fn search_finds_mirrored_issues_by_key_and_title() {
+    let f = fixture(&standard_mirror(), true);
+    let by_key = kanban(&f.server, json!({"action": "search", "query": "COR-12"}));
+    assert_eq!(keys(&by_key), vec!["COR-12"]);
+    let by_title = kanban(&f.server, json!({"action": "search", "query": "payer", "project": "claims"}));
+    assert_eq!(keys(&by_title), vec!["COR-12", "COR-13"]);
+    let native = kanban(&f.server, json!({"action": "search", "query": "Native"}));
+    assert_eq!(origins(&native), vec!["kanban"]);
+}
+
+#[test]
+fn query_includes_mirrored_issues_it_can_answer_and_says_when_it_cannot() {
+    let f = fixture(&standard_mirror(), true);
+    let stale = kanban(&f.server, json!({"action": "query", "question": "stale", "project": "claims"}));
+    assert_eq!(keys(&stale), vec!["COR-14"], "{stale}");
+    assert!(stale.get("tracker_note").is_none());
+    let recent = kanban(&f.server, json!({"action": "query", "question": "recent", "project": "claims"}));
+    assert_eq!(keys(&recent), vec!["CL-1", "COR-12", "COR-13"]);
+    let overdue = kanban(&f.server, json!({"action": "query", "question": "overdue", "project": "claims"}));
+    assert_eq!(overdue["tracker_note"], crate::tracker::items::QUERY_NOT_MIRRORED);
+}
+
+#[test]
+fn get_returns_native_and_mirrored_items_by_origin() {
+    let f = fixture(&standard_mirror(), true);
+    let native = kanban(&f.server, json!({"action": "get", "ticket_id": "CL-1"}));
+    assert_eq!(native["item"]["origin"], "kanban");
+    assert_eq!(native["item"]["title"], "Native claims task");
+    assert!(native.get("refreshed").is_none());
+    let mirrored = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-13"}));
+    assert_eq!(mirrored["item"]["origin"], "tracker");
+    assert_eq!(mirrored["item"]["state"], "Done");
+    assert_eq!(mirrored["refreshed"], false);
+}
+
+#[test]
+fn writes_stay_refused_on_a_readonly_project() {
+    let f = fixture(&standard_mirror(), true);
+    let params: KanbanParams = serde_json::from_value(json!({"action": "create", "project": "claims", "domain": "work", "title": "x"})).unwrap();
+    let refusal = f.server.tracker_refusal(f.server.kanban.as_ref().unwrap(), &params).unwrap();
+    assert!(refusal.contains("read-only mirror of Linear team COR"), "{refusal}");
+    let writable = fixture(&standard_mirror(), false);
+    assert!(writable.server.tracker_refusal(writable.server.kanban.as_ref().unwrap(), &params).is_none());
+}

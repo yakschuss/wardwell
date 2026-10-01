@@ -9,6 +9,7 @@ pub mod cli;
 pub mod credential;
 pub mod doctor;
 pub mod events;
+pub mod items;
 pub mod compact;
 pub mod linear;
 pub mod lock;

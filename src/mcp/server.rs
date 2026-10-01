@@ -2184,7 +2184,11 @@ impl WardwellServer {
                 return json_error(&e);
             }
         match kanban.get_item(ticket_id) {
-            Ok(item) => serde_json::to_string(&serde_json::json!({"item": item})).unwrap_or_default(),
+            Ok(item) => serde_json::to_string(&serde_json::json!({"item": crate::tracker::items::native(&item)})).unwrap_or_default(),
+            Err(crate::kanban::store::KanbanError::NotFound(missing)) => match self.mirror_get(ticket_id, p.project.as_deref()) {
+                Some(item) => serde_json::to_string(&serde_json::json!({"item": item, "refreshed": false})).unwrap_or_default(),
+                None => json_error(&crate::kanban::store::KanbanError::NotFound(missing).to_string()),
+            },
             Err(e) => json_error(&e.to_string()),
         }
     }
@@ -2196,6 +2200,9 @@ impl WardwellServer {
         let domains = if self.allowed_domains.is_empty() { None } else { Some(self.allowed_domains.as_slice()) };
         match kanban.search(query, p.project.as_deref(), domains) {
             Ok(items) => {
+                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let mirrored = self.mirror_items(p.project.as_deref(), &|issue| crate::tracker::items::search_keeps(issue, query));
+                items.extend(mirrored.into_iter().take(20));
                 let total = items.len();
                 serde_json::to_string(&serde_json::json!({"items": items, "total": total})).unwrap_or_default()
             }
@@ -2220,6 +2227,16 @@ impl WardwellServer {
             domains,
         ) {
             Ok(items) => {
+                let filter = crate::tracker::items::ListFilter {
+                    status: p.status.as_deref(),
+                    priority: p.priority.as_deref(),
+                    assignee: p.assignee.as_deref(),
+                    epic: p.epic.as_deref(),
+                    tag: p.tag.as_deref(),
+                    include_done: p.include_done.unwrap_or(false),
+                };
+                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                items.extend(self.mirror_items(p.project.as_deref(), &|issue| filter.keeps(issue)));
                 let total = items.len();
                 serde_json::to_string(&serde_json::json!({
                     "items": items, "total": total, "returned": total,
@@ -2373,10 +2390,17 @@ impl WardwellServer {
         };
         match kanban.query(question, &self.kanban_queries, p.project.as_deref(), domains) {
             Ok(items) => {
+                let now = chrono::Utc::now();
+                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                items.extend(self.mirror_items(p.project.as_deref(), &|issue| {
+                    crate::tracker::items::query_keeps(issue, question, now).unwrap_or(false)
+                }));
                 let total = items.len();
-                serde_json::to_string(&serde_json::json!({
-                    "items": items, "total": total, "returned": total,
-                })).unwrap_or_default()
+                let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
+                if !crate::tracker::items::MIRROR_QUERIES.contains(&question.as_str()) && !self.read_bindings(p.project.as_deref()).is_empty() {
+                    response["tracker_note"] = serde_json::json!(crate::tracker::items::QUERY_NOT_MIRRORED);
+                }
+                serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
         }
@@ -3597,6 +3621,45 @@ impl WardwellServer {
             .find_map(crate::tracker::readonly_refusal)
     }
 
+    /// Bindings a kanban read covers: the named project's, else every one,
+    /// within the session's domains.
+    fn read_bindings(&self, project: Option<&str>) -> Vec<&crate::config::loader::TrackerBinding> {
+        self.config
+            .trackers
+            .values()
+            .filter(|b| project.is_none_or(|name| b.project == name))
+            .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
+            .collect()
+    }
+
+    /// Mirrored issues of the covered bindings that `keep` accepts, as read
+    /// results. A log that cannot be read contributes nothing.
+    fn mirror_items(&self, project: Option<&str>, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> Vec<serde_json::Value> {
+        let now = chrono::Utc::now();
+        self.read_bindings(project)
+            .into_iter()
+            .filter_map(|binding| self.mirror_view(binding).map(|view| (binding, view)))
+            .flat_map(|(binding, view)| {
+                view.issues.values().filter(|issue| keep(issue)).map(|issue| crate::tracker::items::mirrored(binding, &view, issue, now)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The mirrored issue under `key` in any covered binding, removed and
+    /// archived included.
+    fn mirror_get(&self, key: &str, project: Option<&str>) -> Option<serde_json::Value> {
+        let now = chrono::Utc::now();
+        self.read_bindings(project).into_iter().find_map(|binding| {
+            let view = self.mirror_view(binding)?;
+            view.get(key).map(|issue| crate::tracker::items::mirrored(binding, &view, issue, now))
+        })
+    }
+
+    fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {
+        let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
+        crate::tracker::view::MirrorView::read(&path).ok()
+    }
+
     fn write_targets(&self, kanban: &crate::kanban::store::KanbanStore, p: &KanbanParams) -> Vec<(String, String)> {
         let mut targets: Vec<(String, String)> = [&p.ticket_id, &p.from_ticket_id, &p.to_ticket_id]
             .into_iter()
@@ -4195,6 +4258,10 @@ fn clipboard_copy(content: &str) -> Result<usize, String> {
     child.wait().map_err(|e| format!("pbcopy failed: {e}"))?;
     Ok(bytes)
 }
+
+#[cfg(test)]
+#[path = "server_tracker_tests.rs"]
+mod tracker_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
