@@ -675,15 +675,17 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(domain_dir) = matched_domain {
         // Found a matching domain — output its project summaries
-        inject_domain_context(&domain_dir);
+        inject_domain_context(&config, &domain_dir);
     }
     // No match = no output. Don't pollute non-project sessions.
 
     Ok(())
 }
 
-/// Output context for a specific domain's projects.
-fn inject_domain_context(domain_dir: &Path) {
+/// Output context for a specific domain's projects: the domain's own
+/// state or each project's summary, then each project's rot line and,
+/// for a bound project, its tracker section.
+fn inject_domain_context(config: &wardwell::config::loader::WardwellConfig, domain_dir: &Path) {
     let domain = domain_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -691,39 +693,59 @@ fn inject_domain_context(domain_dir: &Path) {
 
     // Check domain-level current_state.md
     let state = domain_dir.join("current_state.md");
-    if state.exists()
-        && let Ok(content) = std::fs::read_to_string(&state)
-    {
-        print!("{content}");
-        return;
-    }
-
-    // Check subdirectory projects
-    if let Ok(entries) = std::fs::read_dir(domain_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                let state = p.join("current_state.md");
-                if state.exists()
-                    && let Ok(vf) = wardwell::vault::reader::read_file(&state)
-                {
-                    let project = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                    let status = vf
-                        .frontmatter
-                        .status
-                        .as_ref()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "active".to_string());
-                    let focus = extract_section_simple(&vf.body, "Focus");
-                    let next = extract_section_simple(&vf.body, "Next Action");
-                    println!("**{domain}/{project}** ({status}): {focus}");
-                    if !next.is_empty() {
-                        println!("  Next: {next}");
-                    }
-                }
+    let domain_state = state.exists()
+        && match std::fs::read_to_string(&state) {
+            Ok(content) => {
+                print!("{content}");
+                true
             }
+            Err(_) => false,
+        };
+
+    let mut projects: Vec<std::path::PathBuf> = std::fs::read_dir(domain_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    projects.sort();
+    let now = chrono::Utc::now();
+    let today = chrono::Local::now().date_naive();
+    for p in projects {
+        let project = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+        if domain_state || !print_project_summary(domain, project, &p) {
+            println!("**{domain}/{project}**");
+        }
+        for line in wardwell::inject::session::project_lines(config, domain, &p, now, today) {
+            println!("  {line}");
         }
     }
+}
+
+/// Print a project's status, focus and next action from its
+/// current_state.md. False when it has none.
+fn print_project_summary(domain: &str, project: &str, p: &Path) -> bool {
+    let state = p.join("current_state.md");
+    let Ok(vf) = wardwell::vault::reader::read_file(&state) else {
+        return false;
+    };
+    let status = vf
+        .frontmatter
+        .status
+        .as_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "active".to_string());
+    let focus = extract_section_simple(&vf.body, "Focus");
+    let next = extract_section_simple(&vf.body, "Next Action");
+    println!("**{domain}/{project}** ({status}): {focus}");
+    if !next.is_empty() {
+        println!("  Next: {next}");
+    }
+    true
 }
 
 /// Simple section extractor for inject (no dependency on server module).

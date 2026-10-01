@@ -1,3 +1,4 @@
 pub mod claude_md;
+pub mod session;
 
 pub use claude_md::*;

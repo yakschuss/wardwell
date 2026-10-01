@@ -1,0 +1,221 @@
+//! Per-project lines `wardwell inject` adds at session start: a rot line
+//! with the age of the newest history entry and decision, and for a
+//! project bound to a tracker, a short section from its mirror.
+//!
+//! Does NOT pull, write, or decide which projects a session sees.
+
+use crate::config::loader::WardwellConfig;
+use crate::tracker::events::StateCategory;
+use crate::tracker::view::{MirrorView, age_words};
+use chrono::{DateTime, Local, NaiveDate, TimeDelta, Utc};
+use std::path::Path;
+
+/// A mirror whose last pull is older than this lists no issues.
+pub const STALE_AFTER: TimeDelta = TimeDelta::hours(24);
+
+/// At most this many started issues in the tracker section.
+pub const MAX_STARTED: usize = 10;
+
+/// The rot line and, when the project is bound, the tracker section.
+pub fn project_lines(config: &WardwellConfig, domain: &str, project_dir: &Path, now: DateTime<Utc>, today: NaiveDate) -> Vec<String> {
+    let mut lines = vec![rot_line(last_history_date(project_dir), last_decision_date(project_dir), today)];
+    let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if config.tracker_for(domain, project).is_some() {
+        let view = MirrorView::read(&project_dir.join(crate::tracker::events::FILE_NAME)).unwrap_or_default();
+        lines.extend(tracker_section(&view, now));
+    }
+    lines
+}
+
+/// `Last history entry 12 days ago. Last decision 3 days ago.`
+pub fn rot_line(last_history: Option<NaiveDate>, last_decision: Option<NaiveDate>, today: NaiveDate) -> String {
+    let history = last_history.map_or("No history entries.".to_string(), |d| format!("Last history entry {}.", days_ago(d, today)));
+    let decision = last_decision.map_or("No decisions.".to_string(), |d| format!("Last decision {}.", days_ago(d, today)));
+    format!("{history} {decision}")
+}
+
+fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
+    match (today - date).num_days().max(0) {
+        0 => "today".to_string(),
+        1 => "1 day ago".to_string(),
+        n => format!("{n} days ago"),
+    }
+}
+
+/// The tracker section for a mirror at `now`. A failed or stale last pull
+/// shows only the age and the notice; otherwise up to ten started issues,
+/// most recently updated first.
+pub fn tracker_section(view: &MirrorView, now: DateTime<Utc>) -> Vec<String> {
+    let head = match view.last_pull_at {
+        Some(at) => format!("Tracker mirror. Last pulled {} ago. Not authoritative.", age_words(now - at)),
+        None => "Tracker mirror. Never pulled. Not authoritative.".to_string(),
+    };
+    let mut lines = vec![head];
+    let failed = view.failed_since_last_pull();
+    let stale = view.last_pull_at.is_none_or(|at| now - at > STALE_AFTER);
+    if let Some(code) = failed {
+        lines.push(format!("The last pull failed: {}. Run `wardwell tracker status`.", code.as_str()));
+    }
+    if stale {
+        lines.push("The mirror is more than 24 hours old. Run `wardwell tracker pull`.".to_string());
+    }
+    if failed.is_some() || stale {
+        return lines;
+    }
+    let mut started: Vec<_> = view.open().filter(|i| i.issue.state_category == StateCategory::Started).collect();
+    started.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.key.cmp(&b.key)));
+    lines.extend(started.into_iter().take(MAX_STARTED).map(|i| format!("- {} {} ({})", i.key, i.issue.issue_title, i.issue.state)));
+    lines
+}
+
+/// Local date of the newest `date` in `history.jsonl`.
+pub fn last_history_date(project_dir: &Path) -> Option<NaiveDate> {
+    let content = std::fs::read_to_string(project_dir.join("history.jsonl")).ok()?;
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|entry| entry.get("date").and_then(|d| d.as_str()).and_then(local_date))
+        .max()
+}
+
+/// Newest `## YYYY-MM-DD` heading date in `decisions.md`.
+pub fn last_decision_date(project_dir: &Path) -> Option<NaiveDate> {
+    let content = std::fs::read_to_string(project_dir.join("decisions.md")).ok()?;
+    content
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .filter_map(|rest| rest.get(..10).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()))
+        .max()
+}
+
+fn local_date(value: &str) -> Option<NaiveDate> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|t| t.with_timezone(&Local).date_naive())
+        .ok()
+        .or_else(|| value.get(..10).and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::tracker::events::{FailureCode, IssueSnapshot};
+    use crate::tracker::view::MirroredIssue;
+    use chrono::TimeZone;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap()
+    }
+
+    fn date(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 9, day).unwrap()
+    }
+
+    fn issue(n: i64, category: StateCategory) -> MirroredIssue {
+        MirroredIssue {
+            key: format!("COR-{n}"),
+            provider: "linear".into(),
+            external_id: format!("id-{n}"),
+            issue: IssueSnapshot {
+                issue_title: format!("Work {n}"),
+                state: "In Progress".into(),
+                state_category: category,
+                ..Default::default()
+            },
+            updated_at: now() - TimeDelta::minutes(n),
+            removed_at: None,
+        }
+    }
+
+    fn view(pulled_hours_ago: i64, issues: Vec<MirroredIssue>) -> MirrorView {
+        MirrorView {
+            issues: issues.into_iter().map(|i| (i.key.clone(), i)).collect(),
+            last_pull_at: Some(now() - TimeDelta::hours(pulled_hours_ago)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rot_line_names_both_ages_in_days() {
+        assert_eq!(rot_line(Some(date(18)), Some(date(27)), date(30)), "Last history entry 12 days ago. Last decision 3 days ago.");
+        assert_eq!(rot_line(Some(date(30)), Some(date(29)), date(30)), "Last history entry today. Last decision 1 day ago.");
+        assert_eq!(rot_line(None, None, date(30)), "No history entries. No decisions.");
+    }
+
+    #[test]
+    fn a_fresh_mirror_lists_started_issues_newest_first_capped_at_ten() {
+        let mut issues: Vec<MirroredIssue> = (1..=12).map(|n| issue(n, StateCategory::Started)).collect();
+        issues.push(issue(20, StateCategory::Unstarted));
+        let mut archived = issue(0, StateCategory::Started);
+        archived.issue.archived_at = Some(now());
+        issues.push(archived);
+        let lines = tracker_section(&view(3, issues), now());
+        assert_eq!(lines[0], "Tracker mirror. Last pulled 3 hours ago. Not authoritative.");
+        assert_eq!(lines.len(), 1 + MAX_STARTED);
+        assert_eq!(lines[1], "- COR-1 Work 1 (In Progress)");
+        assert_eq!(lines[10], "- COR-10 Work 10 (In Progress)");
+        assert!(!lines.iter().any(|l| l.contains("COR-20") || l.contains("COR-0 ")));
+    }
+
+    #[test]
+    fn a_stale_mirror_shows_only_the_age_and_the_notice() {
+        let lines = tracker_section(&view(25, vec![issue(1, StateCategory::Started)]), now());
+        assert_eq!(lines, vec![
+            "Tracker mirror. Last pulled 1 day ago. Not authoritative.",
+            "The mirror is more than 24 hours old. Run `wardwell tracker pull`.",
+        ]);
+    }
+
+    #[test]
+    fn a_failed_last_pull_shows_only_the_age_and_the_failure() {
+        let mut failed = view(2, vec![issue(1, StateCategory::Started)]);
+        failed.last_failure = Some((now() - TimeDelta::hours(1), FailureCode::Auth));
+        let lines = tracker_section(&failed, now());
+        assert_eq!(lines, vec![
+            "Tracker mirror. Last pulled 2 hours ago. Not authoritative.",
+            "The last pull failed: auth. Run `wardwell tracker status`.",
+        ]);
+    }
+
+    #[test]
+    fn a_mirror_never_pulled_says_so() {
+        let lines = tracker_section(&MirrorView::default(), now());
+        assert_eq!(lines[0], "Tracker mirror. Never pulled. Not authoritative.");
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn dates_read_from_history_and_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("history.jsonl"),
+            "{\"_schema\":\"history\"}\n{\"date\":\"2026-09-20\",\"title\":\"a\"}\n{\"date\":\"2026-09-18T15:00:00+00:00\",\"title\":\"b\"}\nnot json\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("decisions.md"), "# p Decisions\n\n## 2026-09-27 — Pick\n\nbody\n\n## 2026-09-01 — Old\n").unwrap();
+        assert_eq!(last_history_date(dir.path()), Some(date(20)));
+        assert_eq!(last_decision_date(dir.path()), Some(date(27)));
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(last_history_date(empty.path()), None);
+        assert_eq!(last_decision_date(empty.path()), None);
+    }
+
+    #[test]
+    fn project_lines_add_the_tracker_section_only_for_a_bound_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("work/claims")).unwrap();
+        std::fs::create_dir_all(vault.join("work/ops")).unwrap();
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n",
+            vault.display()
+        );
+        let config_path = dir.path().join("config.yml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let config = crate::config::loader::load(Some(&config_path)).unwrap();
+        let bound = project_lines(&config, "work", &vault.join("work/claims"), now(), date(30));
+        assert_eq!(bound, vec!["No history entries. No decisions.", "Tracker mirror. Never pulled. Not authoritative.", "The mirror is more than 24 hours old. Run `wardwell tracker pull`."]);
+        let unbound = project_lines(&config, "work", &vault.join("work/ops"), now(), date(30));
+        assert_eq!(unbound, vec!["No history entries. No decisions."]);
+    }
+}
