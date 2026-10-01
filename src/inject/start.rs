@@ -17,19 +17,32 @@ use std::path::Path;
 /// started a background refresh.
 pub type Refresh<'a> = dyn Fn(&str, &str) -> bool + 'a;
 
-/// The session-start output for `cwd` at `now` and local date `today`.
-/// `refresh` runs only for a resolved project with a vault folder.
+/// The session-start output for `cwd` at `now` and local date `today`,
+/// as `write` emits it.
 pub fn output(cwd: &Path, config: &WardwellConfig, config_dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>, now: DateTime<Utc>, today: NaiveDate, refresh: &Refresh<'_>) -> String {
+    let mut out = Vec::new();
+    let _ = write(&mut out, cwd, config, config_dir, git, now, today, refresh);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Write the session-start output to `out`: the project context with its
+/// tracker section first, flushed, then the refresh trigger last, and its
+/// one line when it started a pull. `refresh` runs only for a resolved
+/// project with a vault folder.
+#[allow(clippy::too_many_arguments)]
+pub fn write(out: &mut dyn std::io::Write, cwd: &Path, config: &WardwellConfig, config_dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>, now: DateTime<Utc>, today: NaiveDate, refresh: &Refresh<'_>) -> std::io::Result<()> {
     match resolve(cwd, config, git) {
         Some(Resolution::Project { domain, project }) => {
-            let mut out = crate::inject::domain::project_context(config, config_dir, &domain, &project, now, today);
-            if !out.is_empty() && refresh(&domain, &project) {
-                out.push_str(&format!("  {}\n", crate::tracker::trigger::STARTED_LINE));
+            let context = crate::inject::domain::project_context(config, config_dir, &domain, &project, now, today);
+            out.write_all(context.as_bytes())?;
+            out.flush()?;
+            if !context.is_empty() && refresh(&domain, &project) {
+                writeln!(out, "  {}", crate::tracker::trigger::STARTED_LINE)?;
             }
-            out
+            Ok(())
         }
-        Some(Resolution::Domain(dir)) => crate::inject::domain::domain_context(config, config_dir, &dir, now, today),
-        None => String::new(),
+        Some(Resolution::Domain(dir)) => out.write_all(crate::inject::domain::domain_context(config, config_dir, &dir, now, today).as_bytes()),
+        None => Ok(()),
     }
 }
 

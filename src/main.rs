@@ -795,11 +795,10 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     let refresh = |domain: &str, project: &str| {
         wardwell::tracker::trigger::refresh_detached(&config, &config_dir, domain, project, now) == wardwell::tracker::trigger::Outcome::Started
     };
-    // No match prints nothing. Don't pollute non-project sessions.
-    print!(
-        "{}",
-        wardwell::inject::start::output(&cwd, &config, &config_dir, wardwell::inject::git::dirs, now, today, &refresh)
-    );
+    // No match prints nothing. Don't pollute non-project sessions. The
+    // context is printed and flushed before the trigger runs.
+    let mut stdout = std::io::stdout().lock();
+    wardwell::inject::start::write(&mut stdout, &cwd, &config, &config_dir, wardwell::inject::git::dirs, now, today, &refresh)?;
     Ok(())
 }
 

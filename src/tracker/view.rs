@@ -80,6 +80,24 @@ impl MirrorView {
         Self::read_filtered(path, None)
     }
 
+    /// Fold the log at `path` once into one view per provider. A missing
+    /// file is no views.
+    pub fn read_by_provider(path: &Path) -> Result<std::collections::BTreeMap<String, Self>, String> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(_) => return Err(format!("could not read {}", path.display())),
+        };
+        let mut views: std::collections::BTreeMap<String, Self> = Default::default();
+        content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("{\"_schema\""))
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .for_each(|event| views.entry(event.common().provider.clone()).or_default().observe(event));
+        Ok(views)
+    }
+
     fn read_filtered(path: &Path, provider: Option<&str>) -> Result<Self, String> {
         let content = match std::fs::read_to_string(path) {
             Ok(content) => content,
@@ -368,6 +386,20 @@ mod tests {
         let github = MirrorView::read_for(&path, "github").unwrap();
         assert!(github.issues.is_empty(), "a merged change is not an issue");
         assert_eq!(github.failed_since_last_pull(), Some(FailureCode::Provider));
+    }
+
+    #[test]
+    fn one_parse_gives_the_same_view_per_provider_as_reading_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        std::fs::write(&path, two_provider_log()).unwrap();
+        let views = MirrorView::read_by_provider(&path).unwrap();
+        for provider in ["linear", "github"] {
+            let one = MirrorView::read_for(&path, provider).unwrap();
+            assert_eq!(views[provider].last_pull_at, one.last_pull_at, "{provider}");
+            assert_eq!(views[provider].last_attempt, one.last_attempt, "{provider}");
+            assert_eq!(views[provider].issues, one.issues, "{provider}");
+        }
     }
 
     #[test]
