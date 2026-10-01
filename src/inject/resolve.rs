@@ -24,8 +24,9 @@ pub enum Resolution {
 /// repository directories for a path, or None outside a repository.
 pub fn resolve(cwd: &Path, config: &WardwellConfig, git: impl Fn(&Path) -> Option<GitDirs>) -> Option<Resolution> {
     let cwd = canonical(cwd);
-    mapped_project(&match_dir(&cwd, git), config)
-        .or_else(|| domain_named(&cwd, &config.vault_path))
+    // With no mappings there is nothing for git to find; skip the spawn.
+    let mapped = (!config.projects.is_empty()).then(|| mapped_project(&match_dir(&cwd, git), config)).flatten();
+    mapped.or_else(|| domain_named(&cwd, &config.vault_path))
 }
 
 /// The directory to match: inside a git work tree, the same place in the
@@ -182,5 +183,20 @@ mod tests {
         std::fs::remove_dir_all(tmp.path().join("vault/personal/outer")).unwrap();
         let found = resolve(&work, &config, |_: &Path| None);
         assert_eq!(found, Some(Resolution::Domain(tmp.path().join("vault/work"))), "then the domain-name match");
+    }
+
+    #[test]
+    fn no_projects_means_no_git_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config(tmp.path(), &[]);
+        let work = tmp.path().join("checkouts/work");
+        std::fs::create_dir_all(&work).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let counting = |_: &Path| {
+            calls.set(calls.get() + 1);
+            None
+        };
+        assert_eq!(resolve(&work, &config, counting), Some(Resolution::Domain(tmp.path().join("vault/work"))));
+        assert_eq!(calls.get(), 0);
     }
 }
