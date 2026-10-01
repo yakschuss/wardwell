@@ -45,11 +45,10 @@ wardwell setup
 wardwell doctor
 ```
 
-Run `wardwell setup` after every upgrade. The pull service's plist names the
-resolved binary path inside the Homebrew Cellar, which changes with each
-version. `wardwell doctor` fails the "Tracker pull service" row until setup
-rewrites it. Start a new Claude Code session afterwards; running sessions keep
-their old hooks.
+The hooks and the pull service name the path you ran `wardwell` from, such as
+`/opt/homebrew/bin/wardwell`, never the versioned Cellar path behind it, so
+they survive `brew upgrade`. Start a new Claude Code session afterwards;
+running sessions keep their old hooks.
 
 ## Homebrew `service` block (optional)
 
@@ -67,8 +66,7 @@ launchd agent, `com.wardwell.tracker-pull`, whenever a tracker binding exists.
   end
 ```
 
-`opt_bin` survives upgrades, which the setup agent's Cellar path does not. If
-you start it with `brew services start wardwell`, both agents pull. The
+If you start it with `brew services start wardwell`, both agents pull. The
 per-project tracker lock keeps two pulls from writing at once, but each pull
 still calls the provider. Use one. `wardwell setup` installs its own agent again
 whenever it is missing, so the setup agent is the one to rely on.

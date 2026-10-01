@@ -137,7 +137,9 @@ pub fn schedule(
             "interval must be between {MIN_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS} seconds"
         ));
     }
-    let binary = current_exe.canonicalize().unwrap_or_else(|_| current_exe.to_path_buf());
+    // Never resolve symlinks: a package manager's stable link (for example
+    // /opt/homebrew/bin/wardwell) survives an upgrade; its versioned target does not.
+    let binary = current_exe.to_path_buf();
     if !cfg!(target_os = "macos") {
         return Err(format!(
             "launchd scheduling is macOS only. Add this line to your crontab:\n{}",
@@ -274,6 +276,20 @@ mod tests {
         assert_eq!(schedule_status(home.path()), Some(1800));
         let body = std::fs::read_to_string(plist_path(home.path())).unwrap();
         assert!(body.contains("cfg/tracker-pull.log"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_writes_the_symlink_path_so_the_agent_survives_an_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let versioned = root.path().join("Cellar/wardwell/0.12.0/bin");
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::write(versioned.join("wardwell"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("bin")).unwrap();
+        let link = root.path().join("bin/wardwell");
+        std::os::unix::fs::symlink(versioned.join("wardwell"), &link).unwrap();
+        schedule(root.path(), &root.path().join("cfg"), 3600, &Fake::new(&[]), &link, 501).unwrap();
+        assert_eq!(scheduled_program(root.path()), Some(link));
     }
 
     #[cfg(target_os = "macos")]

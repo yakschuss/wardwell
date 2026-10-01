@@ -286,7 +286,8 @@ fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
     if inputs.trackers.is_empty() {
         return Pull::Keep;
     }
-    let binary = inputs.binary.canonicalize().unwrap_or_else(|_| inputs.binary.to_path_buf());
+    // The path the hooks get, never resolved, so an upgrade keeps it valid.
+    let binary = inputs.binary.to_path_buf();
     if !inputs.launchd {
         let label = format!("Hourly tracker pull: launchd is macOS only. Add to your crontab: 0 * * * * {} tracker pull", binary.display());
         lines.push(Line { action: Action::Manual, label, path: None });
@@ -636,6 +637,24 @@ mod tests {
         let fake = Fake::new(&[]);
         apply(&second, &fake, &|| Ok(501)).unwrap();
         assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pull_plan_uses_the_symlink_path_the_hooks_get() {
+        let h = home();
+        let versioned = h.home.join("Cellar/wardwell/0.12.0/bin");
+        fs::create_dir_all(&versioned).unwrap();
+        fs::write(versioned.join("wardwell"), "").unwrap();
+        fs::create_dir_all(h.home.join("bin")).unwrap();
+        let link = h.home.join("bin/wardwell");
+        std::os::unix::fs::symlink(versioned.join("wardwell"), &link).unwrap();
+        let plist = schedule::plist_path(&h.home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, schedule::launch_agent_plist(&link, 3600, &schedule::log_path(&h.cfg))).unwrap();
+        let trackers = binding("linear", false);
+        let plan = plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: &link, trackers: &trackers, claude_code: false, launchd: true }).unwrap();
+        assert_eq!(action_of(&plan, "Tracker pull service"), Action::Unchanged, "{}", rendered(&plan));
     }
 
     #[test]
