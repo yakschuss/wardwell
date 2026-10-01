@@ -8,16 +8,82 @@
 use crate::config::loader::TrackerBinding;
 use crate::tracker::adapter::Adapter;
 use crate::tracker::credential::{self, Credential};
-use crate::tracker::events::{Common, Event};
+use crate::tracker::events::{Common, Event, FailureCode};
 use crate::tracker::linear::{HttpTransport, Linear};
-use crate::tracker::{log, provider_label};
+use crate::tracker::{lock, log, provider_label};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 /// How far before the last completed pull's `through` an incremental pull starts.
 /// Covers clock skew and updates that land while a pull is paging.
 pub const CURSOR_OVERLAP: TimeDelta = TimeDelta::hours(1);
+
+/// A pull runs full when the newest full resync is older than this, or
+/// absent. Linear does not timestamp every change (a new relation, an
+/// archive of an old issue), so an incremental pull alone can miss them.
+pub const FULL_RESYNC_MAX_AGE: TimeDelta = TimeDelta::hours(24);
+
+/// After an automatic full pull fails, no automatic full is tried again for
+/// this long; incremental pulls carry on meanwhile. An explicit `--full` is
+/// never held back.
+pub const AUTOMATIC_FULL_RETRY_AFTER: TimeDelta = TimeDelta::hours(6);
+
+/// What a pull was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// From the cursor; runs full when a full resync is due.
+    Incremental,
+    /// Every issue; records removals. Fails on an empty result while the
+    /// mirror holds open issues.
+    Full,
+    /// `Full` that accepts an empty result and removes every open issue.
+    /// Only a person asks for this; an automatic full pull never does.
+    FullAllowEmpty,
+    /// `Full` started by `pull_binding` because a full resync was due. Its
+    /// failure marker holds back the next automatic full.
+    AutomaticFull,
+}
+
+impl Mode {
+    fn is_full(self) -> bool {
+        !matches!(self, Mode::Incremental)
+    }
+}
+
+/// Why a pull that was not asked to be full ran full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResyncDue {
+    /// The log has no full_resync marker.
+    NeverRan,
+    /// The newest full_resync marker is older than `FULL_RESYNC_MAX_AGE`.
+    Stale,
+}
+
+impl ResyncDue {
+    /// The reason as the pull output line prints it.
+    pub fn describe(self) -> String {
+        match self {
+            Self::NeverRan => "no full resync on record".to_string(),
+            Self::Stale => format!("last full resync over {} hours ago", FULL_RESYNC_MAX_AGE.num_hours()),
+        }
+    }
+
+    /// Whether a pull at `now` must run full, given the log: a full resync
+    /// is missing or stale, and no automatic full failed within
+    /// `AUTOMATIC_FULL_RETRY_AFTER`.
+    pub fn check(summary: &log::LogSummary, now: DateTime<Utc>) -> Option<Self> {
+        if summary.last_automatic_full_failure.is_some_and(|at| now - at < AUTOMATIC_FULL_RETRY_AFTER) {
+            return None;
+        }
+        match summary.last_full_resync_at {
+            None => Some(Self::NeverRan),
+            Some(at) if now - at > FULL_RESYNC_MAX_AGE => Some(Self::Stale),
+            Some(_) => None,
+        }
+    }
+}
 
 /// Result of pulling one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +91,11 @@ pub struct PullOutcome {
     pub appended: usize,
     pub removed: usize,
     pub full: bool,
+    /// Set when a full resync was due, so a full pull was attempted.
+    pub resync_due: Option<ResyncDue>,
+    /// Why the due full pull failed; the outcome is then the incremental
+    /// pull that ran after it.
+    pub failed_full: Option<PullError>,
 }
 
 /// Builds the adapter for a binding. Injected so tests never reach a network.
@@ -41,19 +112,63 @@ pub fn connect_provider(binding: &TrackerBinding, credential: &Credential) -> Re
     }
 }
 
+/// Why a pull stopped: a closed code for the log and the status line, and a
+/// message for the person running it. Neither carries a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullError {
+    pub code: FailureCode,
+    pub message: String,
+}
+
+impl PullError {
+    fn new(code: FailureCode, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
+impl std::fmt::Display for PullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code.as_str())
+    }
+}
+
 /// Load the binding's credential, then pull. A missing or unreadable
 /// credential fails before the log is read or written.
 pub fn pull_binding(
     vault_root: &Path,
     config_dir: &Path,
     binding: &TrackerBinding,
-    full: bool,
+    mode: Mode,
     now: DateTime<Utc>,
     connect: &Connect<'_>,
-) -> Result<PullOutcome, String> {
-    let credential = credential::load(&credential::path_in(config_dir, &binding.credential)?)?;
-    let adapter = connect(binding, &credential)?;
-    pull_project(vault_root, binding, adapter.as_ref(), full, now)
+) -> Result<PullOutcome, PullError> {
+    let credential = credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .map_err(|message| PullError::new(FailureCode::Credential, message))?;
+    let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
+    let resync_due = match mode {
+        Mode::Incremental => resync_due(vault_root, binding, now)?,
+        _ => None,
+    };
+    let Some(due) = resync_due else {
+        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+    };
+    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+    match pull(Mode::AutomaticFull) {
+        Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), ..outcome }),
+        // A failed automatic full must not stop the mirror moving.
+        Err(failed) => match pull(Mode::Incremental) {
+            Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), failed_full: Some(failed), ..outcome }),
+            Err(error) => Err(PullError::new(error.code, format!("automatic full pull failed: {failed}; incremental pull: {}", error.message))),
+        },
+    }
+}
+
+/// Whether the binding's log is due a full resync at `now`.
+fn resync_due(vault_root: &Path, binding: &TrackerBinding, now: DateTime<Utc>) -> Result<Option<ResyncDue>, PullError> {
+    let path = log::path_for(vault_root, &binding.domain, &binding.project);
+    let summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    Ok(ResyncDue::check(&summary, now))
 }
 
 /// Pull one project through `adapter` and append what is new.
@@ -63,9 +178,50 @@ pub fn pull_project(
     adapter: &dyn Adapter,
     full: bool,
     now: DateTime<Utc>,
-) -> Result<PullOutcome, String> {
+) -> Result<PullOutcome, PullError> {
+    let mode = match full {
+        true => Mode::Full,
+        false => Mode::Incremental,
+    };
+    pull_project_waiting(vault_root, binding, adapter, mode, now, lock::DEFAULT_WAIT)
+}
+
+/// `pull_project`, waiting up to `wait` for a compaction holding the
+/// project lock. A failure after the lock is taken appends a pull_failed
+/// marker (best effort) before it returns.
+pub fn pull_project_waiting(
+    vault_root: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    mode: Mode,
+    now: DateTime<Utc>,
+    wait: Duration,
+) -> Result<PullOutcome, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let mut summary = log::read(&path)?;
+    let _lock = lock::acquire(&path, wait).map_err(|message| {
+        let code = match message.contains(lock::LOCK_BUSY) {
+            true => FailureCode::LockBusy,
+            false => FailureCode::LogWrite,
+        };
+        PullError::new(code, message)
+    })?;
+    let mut summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let result = pull_locked(&path, binding, adapter, mode, now, &mut summary);
+    if let Err(error) = &result {
+        let _ = log::append_new(&path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
+    }
+    result
+}
+
+fn pull_locked(
+    path: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    mode: Mode,
+    now: DateTime<Utc>,
+    summary: &mut log::LogSummary,
+) -> Result<PullOutcome, PullError> {
+    let full = mode.is_full();
     let since = match full {
         true => None,
         false => summary.cursor.map(|t| t - CURSOR_OVERLAP),
@@ -73,25 +229,65 @@ pub fn pull_project(
     let mut through = summary.cursor;
     let mut appended = 0;
     let mut returned: HashSet<String> = HashSet::new();
+    let mut write_failed = false;
     // Each page is appended as it arrives (event ids make re-pulls
     // idempotent), so a failure keeps the pages already read. The cursor
     // moves only through the marker below, so a failure leaves it alone
     // whatever order the provider delivers pages in.
-    adapter.pull(since, full, &mut |page| {
+    let pulled = adapter.pull(since, full, &mut |page| {
         returned.extend(upserted_keys(&page));
         through = page.iter().fold(through, |t, e| log::later(t, e.common().occurred_at));
-        appended += log::append_new(&path, &page, &mut summary)?;
+        appended += log::append_new(path, &page, summary).inspect_err(|_| write_failed = true)?;
         Ok(())
+    });
+    pulled.map_err(|message| {
+        let code = match (write_failed, message.contains(crate::tracker::adapter::AUTH_REFUSED)) {
+            (true, _) => FailureCode::LogWrite,
+            (false, true) => FailureCode::Auth,
+            (false, false) => FailureCode::Provider,
+        };
+        PullError::new(code, message)
     })?;
+    // A full result with no issues while the mirror holds open ones is far
+    // more likely a lost team or token scope than an emptied tracker.
+    if full && returned.is_empty() && !summary.open_issues.is_empty() && mode != Mode::FullAllowEmpty {
+        return Err(PullError::new(
+            FailureCode::EmptyFullResult,
+            format!(
+                "full pull returned no issues while the mirror holds {}; nothing removed. Check the team key and the token's access, or pass --allow-empty",
+                summary.open_issues.len()
+            ),
+        ));
+    }
     // Removals are only knowable after every page arrived.
     let markers = match full {
-        true => resync_markers(binding, &returned, &summary, now, through),
+        true => resync_markers(binding, &returned, summary, now, through),
         false => vec![pull_completed(binding, now, through)],
     };
     let removed = markers.len().saturating_sub(1);
-    log::append_new(&path, &markers, &mut summary)?;
+    log::append_new(path, &markers, summary).map_err(|message| PullError::new(FailureCode::LogWrite, message))?;
     appended += removed;
-    Ok(PullOutcome { appended, removed, full })
+    Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None })
+}
+
+/// Marker for a pull that stopped early. The title names only the code.
+fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode, automatic_full: bool) -> Event {
+    let label = provider_label(&binding.provider);
+    Event::PullFailed {
+        common: local_common(
+            binding,
+            match automatic_full {
+                true => format!("wardwell:pull_failed:{}:{}:automatic_full", binding.team, now.to_rfc3339()),
+                false => format!("wardwell:pull_failed:{}:{}", binding.team, now.to_rfc3339()),
+            },
+            &binding.team,
+            &binding.team,
+            now,
+            format!("{} pull from {label} failed: {}", binding.team, code.as_str()),
+        ),
+        code,
+        automatic_full,
+    }
 }
 
 /// Cursor marker for an incremental pull that delivered every page.
@@ -216,7 +412,7 @@ mod tests {
                 title: format!("{key} Title: Todo"),
                 raw: serde_json::Value::Null,
             },
-            issue: IssueSnapshot {
+            issue: Box::new(IssueSnapshot {
                 issue_title: format!("{key} work"),
                 description: None,
                 state: "Todo".into(),
@@ -230,7 +426,8 @@ mod tests {
                 url: None,
                 created_at: None,
                 archived_at: None,
-            },
+                ..Default::default()
+            }),
         }
     }
 
@@ -261,7 +458,8 @@ mod tests {
             calls: RefCell::new(vec![]),
         };
         let error = pull_project(vault.path(), &binding(), &broken, true, at(14)).unwrap_err();
-        assert_eq!(error, "Linear request failed");
+        assert_eq!(error.message, "Linear request failed");
+        assert_eq!(error.code, FailureCode::Provider);
 
         let path = log::path_for(vault.path(), "work", "claims");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -271,6 +469,55 @@ mod tests {
         let summary = log::read(&path).unwrap();
         assert!(summary.open_issues.contains_key("COR-1"));
         assert_eq!(summary.last_full_resync_at, None);
+    }
+
+    #[test]
+    fn provider_failure_appends_a_pull_failed_marker_with_a_closed_code() {
+        let vault = tempfile::tempdir().unwrap();
+        pull_project(vault.path(), &binding(), &fake(vec![snapshot("COR-1", 9)]), false, at(12)).unwrap();
+        let broken = FakeAdapter {
+            pages: vec![],
+            fail_after: Some("Linear returned an error: token lin_api_secret rejected"),
+            calls: RefCell::new(vec![]),
+        };
+        let error = pull_project(vault.path(), &binding(), &broken, false, at(13)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Provider);
+
+        let path = log::path_for(vault.path(), "work", "claims");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let last: Event = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        let Event::PullFailed { common, code, .. } = last else { panic!("{content}") };
+        assert_eq!(code, FailureCode::Provider);
+        assert_eq!(common.title, "COR pull from Linear failed: provider");
+        assert!(!content.contains("lin_api_secret"), "no provider text in the log");
+        let summary = log::read(&path).unwrap();
+        assert_eq!(summary.last_failure, Some((at(13), FailureCode::Provider)));
+        assert_eq!(summary.last_pull_at, Some(at(12)), "a failure is not a pull");
+        assert_eq!(summary.cursor, Some(at(9)));
+    }
+
+    #[test]
+    fn a_refused_token_is_recorded_as_auth() {
+        let vault = tempfile::tempdir().unwrap();
+        let message = format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED);
+        let revoked = FakeAdapter { pages: vec![], fail_after: Some(message.leak()), calls: RefCell::new(vec![]) };
+        let error = pull_project(vault.path(), &binding(), &revoked, false, at(13)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Auth, "{error}");
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_failure, Some((at(13), FailureCode::Auth)));
+    }
+
+    #[test]
+    fn a_failing_sink_is_a_log_write_failure() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        std::fs::create_dir_all(log::raw_path_for(&path)).unwrap();
+        let mut event = snapshot("COR-1", 9);
+        if let Event::IssueUpserted { common, .. } = &mut event {
+            common.raw = serde_json::json!({"id": "x"});
+        }
+        let error = pull_project(vault.path(), &binding(), &fake(vec![event]), false, at(12)).unwrap_err();
+        assert_eq!(error.code, FailureCode::LogWrite, "{error}");
     }
 
     #[test]
@@ -385,6 +632,23 @@ mod tests {
     }
 
     #[test]
+    fn pull_during_a_held_lock_fails_with_the_closed_code_after_the_wait() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let held = lock::acquire(&path, Duration::ZERO).unwrap();
+        let adapter = fake(vec![snapshot("COR-1", 9)]);
+        let started = std::time::Instant::now();
+        let error = pull_project_waiting(vault.path(), &binding(), &adapter, Mode::Incremental, at(12), Duration::from_millis(150)).unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert_eq!(error.code, FailureCode::LockBusy, "{error}");
+        assert!(error.to_string().ends_with("(lock_busy)"), "{error}");
+        assert!(adapter.calls.borrow().is_empty(), "no provider call while locked");
+        assert!(!path.exists());
+        drop(held);
+        pull_project_waiting(vault.path(), &binding(), &adapter, Mode::Incremental, at(12), Duration::ZERO).unwrap();
+    }
+
+    #[test]
     fn empty_first_pull_creates_the_log_with_a_marker_and_no_cursor() {
         let vault = tempfile::tempdir().unwrap();
         let outcome = pull_project(vault.path(), &binding(), &fake(vec![]), false, at(12)).unwrap();
@@ -411,7 +675,8 @@ mod tests {
         let result = pull_project(vault.path(), &binding(), &fake(vec![]), false, at(13));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = result.unwrap_err();
-        assert!(error.contains("could not append"), "{error}");
+        assert!(error.message.contains("could not append"), "{error}");
+        assert_eq!(error.code, FailureCode::LogWrite);
     }
 
     #[test]
@@ -428,10 +693,221 @@ mod tests {
             *called.borrow_mut() = true;
             Ok(Box::new(fake(vec![snapshot("COR-1", 9)])))
         };
-        let error = pull_binding(vault.path(), config_dir.path(), &binding(), false, at(12), &connect).unwrap_err();
-        assert!(error.contains("not configured"), "{error}");
+        let error = pull_binding(vault.path(), config_dir.path(), &binding(), Mode::Incremental, at(12), &connect).unwrap_err();
+        assert!(error.message.contains("not configured"), "{error}");
+        assert_eq!(error.code, FailureCode::Credential);
         assert!(!*called.borrow(), "no adapter without a credential");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A config dir holding the binding's credential.
+    fn credential_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
+        crate::tracker::credential::save(&path, "t").unwrap();
+        dir
+    }
+
+    /// Pull an empty fake through `pull_binding` at `now`.
+    fn scheduled_pull(vault: &Path, config: &Path, full: bool, now: DateTime<Utc>) -> PullOutcome {
+        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
+        pull_binding(vault, config, &binding(), if full { Mode::Full } else { Mode::Incremental }, now, &connect).unwrap()
+    }
+
+    #[test]
+    fn pull_without_a_full_resync_on_record_runs_full() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let outcome = scheduled_pull(vault.path(), config.path(), false, at(12));
+        assert!(outcome.full);
+        assert_eq!(outcome.resync_due, Some(ResyncDue::NeverRan));
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_full_resync_at, Some(at(12)));
+    }
+
+    #[test]
+    fn pull_runs_full_once_the_last_full_resync_is_older_than_the_limit() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        scheduled_pull(vault.path(), config.path(), true, at(0));
+        let fresh = at(0) + FULL_RESYNC_MAX_AGE - TimeDelta::minutes(1);
+        let outcome = scheduled_pull(vault.path(), config.path(), false, fresh);
+        assert!(!outcome.full, "within the limit the pull stays incremental");
+        assert_eq!(outcome.resync_due, None);
+
+        let stale = at(0) + FULL_RESYNC_MAX_AGE + TimeDelta::minutes(1);
+        let outcome = scheduled_pull(vault.path(), config.path(), false, stale);
+        assert!(outcome.full);
+        assert_eq!(outcome.resync_due, Some(ResyncDue::Stale));
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_full_resync_at, Some(stale));
+    }
+
+    #[test]
+    fn a_requested_full_pull_has_no_resync_reason() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let outcome = scheduled_pull(vault.path(), config.path(), true, at(12));
+        assert!(outcome.full);
+        assert_eq!(outcome.resync_due, None);
+    }
+
+    #[test]
+    fn a_stale_resync_reaches_the_adapter_as_a_full_pull() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let adapter = std::rc::Rc::new(fake(vec![]));
+        let shared = adapter.clone();
+        struct Shared(std::rc::Rc<FakeAdapter>);
+        impl Adapter for Shared {
+            fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
+                self.0.pull(since, full, sink)
+            }
+        }
+        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Shared(shared.clone()))) };
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, at(1), &connect).unwrap();
+        assert_eq!(adapter.calls.borrow()[0], (None, true));
+    }
+
+    fn kinds(vault: &Path) -> String {
+        std::fs::read_to_string(log::path_for(vault, "work", "claims")).unwrap()
+    }
+
+    #[test]
+    fn an_empty_full_result_with_open_issues_fails_instead_of_removing() {
+        let vault = tempfile::tempdir().unwrap();
+        let three = fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
+        pull_project(vault.path(), &binding(), &three, true, at(10)).unwrap();
+
+        let error = pull_project(vault.path(), &binding(), &fake(vec![]), true, at(11)).unwrap_err();
+        assert_eq!(error.code, FailureCode::EmptyFullResult, "{error}");
+        let content = kinds(vault.path());
+        assert!(!content.contains("\"issue_removed\""), "{content}");
+        assert_eq!(content.matches("\"full_resync\"").count(), 1, "only the first full pull: {content}");
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_failure, Some((at(11), FailureCode::EmptyFullResult)));
+        assert_eq!(summary.open_issues.len(), 3);
+
+        let allowed = pull_project_waiting(vault.path(), &binding(), &fake(vec![]), Mode::FullAllowEmpty, at(12), Duration::ZERO).unwrap();
+        assert_eq!(allowed.removed, 3, "--allow-empty removes them");
+        assert!(log::read(&log::path_for(vault.path(), "work", "claims")).unwrap().open_issues.is_empty());
+    }
+
+    #[test]
+    fn an_empty_full_result_on_an_empty_mirror_is_fine() {
+        let vault = tempfile::tempdir().unwrap();
+        let outcome = pull_project(vault.path(), &binding(), &fake(vec![]), true, at(10)).unwrap();
+        assert!(outcome.full);
+    }
+
+    #[test]
+    fn an_automatic_full_pull_never_allows_an_empty_result() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let three = || fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
+        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(three())) };
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, at(10), &connect).unwrap();
+
+        let empty = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
+        let later = at(10) + FULL_RESYNC_MAX_AGE + TimeDelta::hours(1);
+        let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, later, &empty).unwrap();
+        assert_eq!(outcome.failed_full.map(|e| e.code), Some(FailureCode::EmptyFullResult));
+        let content = kinds(vault.path());
+        assert!(!content.contains("\"issue_removed\""), "{content}");
+        assert!(content.contains("\"code\":\"empty_full_result\""), "{content}");
+        assert_eq!(log::read(&log::path_for(vault.path(), "work", "claims")).unwrap().open_issues.len(), 3);
+    }
+
+    /// Three issues pulled, then removed by an allowed empty full pull.
+    fn removed_three(vault: &Path) {
+        let three = fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
+        pull_project(vault, &binding(), &three, true, at(10)).unwrap();
+        let removed = pull_project_waiting(vault, &binding(), &fake(vec![]), Mode::FullAllowEmpty, at(11), Duration::ZERO).unwrap();
+        assert_eq!(removed.removed, 3);
+        assert!(log::read(&log::path_for(vault, "work", "claims")).unwrap().open_issues.is_empty());
+    }
+
+    fn restored_ids(vault: &Path) -> Vec<String> {
+        let content = kinds(vault);
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .map(|event| event.common().id.clone())
+            .filter(|id| id.contains(":restored:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_removed_issue_that_returns_reappears_once() {
+        for mode in [Mode::Incremental, Mode::Full] {
+            let vault = tempfile::tempdir().unwrap();
+            removed_three(vault.path());
+            let back = || fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
+
+            let outcome = pull_project_waiting(vault.path(), &binding(), &back(), mode, at(12), Duration::ZERO).unwrap();
+            assert_eq!((outcome.appended, outcome.removed), (3, 0), "{mode:?}");
+            let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+            assert_eq!(summary.open_issues.keys().collect::<Vec<_>>(), vec!["COR-1", "COR-2", "COR-3"], "{mode:?}");
+            let ids = restored_ids(vault.path());
+            assert_eq!(ids.len(), 3, "{mode:?}");
+            assert!(ids.contains(&format!("linear:issue:COR-1:9:restored:{}", at(11).to_rfc3339())), "{ids:?}");
+
+            for again in [Mode::Incremental, Mode::Full] {
+                let outcome = pull_project_waiting(vault.path(), &binding(), &back(), again, at(13), Duration::ZERO).unwrap();
+                assert_eq!((outcome.appended, outcome.removed), (0, 0), "{mode:?} then {again:?}");
+            }
+            assert_eq!(restored_ids(vault.path()).len(), 3);
+        }
+    }
+
+    /// Fails every full pull; incremental pulls succeed. Records `full` per call.
+    struct FullFails(std::rc::Rc<RefCell<Vec<bool>>>);
+    impl Adapter for FullFails {
+        fn pull(&self, _: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
+            self.0.borrow_mut().push(full);
+            sink(vec![snapshot("COR-1", 1)])?;
+            match full {
+                true => Err("Linear request failed".to_string()),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_automatic_full_runs_the_incremental_and_waits_before_trying_again() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let hour = |h: i64| at(0) + TimeDelta::hours(h);
+        let first = fake(vec![snapshot("COR-1", 0)]);
+        pull_project(vault.path(), &binding(), &first, true, hour(0)).unwrap();
+
+        let calls = std::rc::Rc::new(RefCell::new(vec![]));
+        let shared = calls.clone();
+        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails(shared.clone()))) };
+        let failed = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, hour(25), &connect).unwrap();
+        assert_eq!(failed.resync_due, Some(ResyncDue::Stale));
+        assert!(!failed.full, "the outcome is the incremental pull's");
+        assert_eq!(failed.failed_full.as_ref().map(|e| e.code), Some(FailureCode::Provider));
+        for h in 26..=29 {
+            let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, hour(h), &connect).unwrap();
+            assert_eq!((outcome.full, outcome.resync_due, outcome.failed_full), (false, None, None), "hour {h}");
+        }
+        assert_eq!(*calls.borrow(), vec![true, false, false, false, false, false], "one full attempt, five incrementals");
+
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_pull_at, Some(hour(29)), "incrementals kept the mirror moving");
+
+        // An explicit full is never held back.
+        calls.borrow_mut().clear();
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Full, hour(30), &connect).unwrap_err();
+        assert_eq!(*calls.borrow(), vec![true]);
+
+        // Once the hold since the last automatic failure passes, it tries again.
+        calls.borrow_mut().clear();
+        let held_until = hour(25) + AUTOMATIC_FULL_RETRY_AFTER;
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, held_until - TimeDelta::minutes(1), &connect).unwrap();
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, held_until + TimeDelta::minutes(1), &connect).unwrap();
+        assert_eq!(*calls.borrow(), vec![false, true, false]);
     }
 
     #[test]

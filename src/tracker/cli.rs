@@ -3,9 +3,10 @@
 //! returns or formats a token.
 
 use crate::config::loader::{TrackerBinding, WardwellConfig};
-use crate::tracker::pull::{Connect, pull_binding};
+use crate::tracker::pull::{Connect, Mode, pull_binding};
 use crate::tracker::schedule::{self, LaunchctlRunner};
-use crate::tracker::{credential, log};
+use crate::tracker::events::FailureCode;
+use crate::tracker::{compact, credential, lock, log};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
 
@@ -16,13 +17,14 @@ pub fn connect(config_dir: &Path, name: &str, token: &str) -> Result<String, Str
     Ok(format!("Saved tracker credential '{name}' to {}", path.display()))
 }
 
-/// Pull every bound project, or only `only`. Returns one line per project;
-/// fails with every project's error if any project failed.
+/// Pull every bound project, or only `only`. A project that fails does not
+/// stop the others. Returns one line per project; fails with every
+/// project's line, the errors ending in their closed code, if any failed.
 pub fn pull(
     config: &WardwellConfig,
     config_dir: &Path,
     only: Option<&str>,
-    full: bool,
+    mode: Mode,
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<Vec<String>, String> {
@@ -30,12 +32,54 @@ pub fn pull(
     let mut lines = Vec::new();
     let mut failures = Vec::new();
     for (key, binding) in bindings {
-        match pull_binding(&config.vault_path, config_dir, binding, full, now, connect) {
+        match pull_binding(&config.vault_path, config_dir, binding, mode, now, connect) {
+            Ok(outcome) => match (&outcome.failed_full, outcome.resync_due) {
+                (Some(failed), Some(due)) => failures.push(format!(
+                    "{key}: automatic full pull failed ({}): {failed}; {}",
+                    due.describe(),
+                    pull_summary(&outcome)
+                )),
+                _ => lines.push(format!("{key}: {}", pull_summary(&outcome))),
+            },
+            Err(error) => failures.push(format!("{key}: {error}")),
+        }
+    }
+    match failures.is_empty() {
+        true => Ok(lines),
+        false => Err(lines.into_iter().chain(failures).collect::<Vec<_>>().join("\n")),
+    }
+}
+
+fn pull_summary(outcome: &crate::tracker::pull::PullOutcome) -> String {
+    let mode = match (outcome.full, outcome.resync_due) {
+        (true, Some(due)) => format!("full pull ({}, so this pull ran full)", due.describe()),
+        (true, None) => "full pull".to_string(),
+        (false, _) => "incremental pull".to_string(),
+    };
+    format!("{mode} appended {} events, {} removed", outcome.appended, outcome.removed)
+}
+
+/// Compaction drops the rewritten log's vectors; the watcher re-adds its
+/// text without them, and a server start does not re-embed an unchanged
+/// file. Only a reindex restores them.
+const SEARCH_BY_MEANING_RETURNS: &str = "Search by meaning returns for this log after you run `wardwell reindex`.";
+
+/// Compact every bound project's log, or only `only`. One line per
+/// project; fails with every project's error if any project failed.
+pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    let mut failures = Vec::new();
+    for (key, binding) in selected(config, only)? {
+        let path = log::path_for(&config.vault_path, &binding.domain, &binding.project);
+        match compact::compact(&path, force, lock::DEFAULT_WAIT) {
+            Ok(outcome) if !outcome.changed => lines.push(format!("{key}: already compact, {} events", outcome.events)),
             Ok(outcome) => lines.push(format!(
-                "{key}: {} pull appended {} events, {} removed",
-                if outcome.full { "full" } else { "incremental" },
-                outcome.appended,
-                outcome.removed,
+                "{key}: compacted to {} events, moved {} raw payloads to {}, removed {} duplicates, backup at {}. {SEARCH_BY_MEANING_RETURNS}",
+                outcome.events,
+                outcome.moved_raw,
+                crate::tracker::events::RAW_FILE_NAME,
+                outcome.duplicates_removed,
+                outcome.backup.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
             )),
             Err(error) => failures.push(format!("{key}: {error}")),
         }
@@ -43,6 +87,15 @@ pub fn pull(
     match failures.is_empty() {
         true => Ok(lines),
         false => Err(lines.into_iter().chain(failures).collect::<Vec<_>>().join("\n")),
+    }
+}
+
+/// Credential, auth and team checks for every binding, one line each.
+/// Fails with every line when any check failed.
+pub fn doctor(config: &WardwellConfig, config_dir: &Path, probe: &crate::tracker::doctor::Probe<'_>) -> Result<Vec<String>, String> {
+    match crate::tracker::doctor::run(config, config_dir, probe) {
+        (lines, true) => Ok(lines),
+        (lines, false) => Err(lines.join("\n")),
     }
 }
 
@@ -58,15 +111,16 @@ fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(&
 }
 
 /// One line per bound project: provider, last pull and its age, last full
-/// resync, event count, readonly flag; then one line on the pull schedule
+/// resync, event count, readonly flag, and the closed code when the binding
+/// cannot pull or its last pull failed; then one line on the pull schedule
 /// (`scheduled` is the interval from the installed plist, if any).
-pub fn status(config: &WardwellConfig, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
+pub fn status(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
     let mut lines = match config.trackers.is_empty() {
         true => vec!["No trackers bound. Add a trackers section to config.yml.".to_string()],
         false => config
             .trackers
             .iter()
-            .map(|(key, binding)| status_line(&config.vault_path, key, binding, now))
+            .map(|(key, binding)| status_line(&config.vault_path, config_dir, key, binding, now))
             .collect(),
     };
     lines.push(schedule_line(scheduled));
@@ -97,7 +151,19 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
     schedule::unschedule(home, runner, uid)
 }
 
-fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>) -> String {
+/// Read-only check that a pull could start: a known provider and a
+/// readable credential. Never opens the network.
+fn cannot_pull(config_dir: &Path, binding: &TrackerBinding) -> Option<FailureCode> {
+    if !crate::tracker::SUPPORTED_PROVIDERS.contains(&binding.provider.as_str()) {
+        return Some(FailureCode::UnsupportedProvider);
+    }
+    credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .err()
+        .map(|_| FailureCode::Credential)
+}
+
+fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>) -> String {
     let mode = if binding.readonly { "readonly" } else { "writable" };
     let head = format!("{key}: {} {} ({mode})", binding.provider, binding.team);
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
@@ -105,12 +171,18 @@ fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: Date
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
+    let blocked = cannot_pull(config_dir, binding).map(|code| format!(", cannot pull ({})", code.as_str()));
+    let last = summary.last_failure.map(|(at, code)| format!(", last error {} at {}", code.as_str(), stamp(at)));
+    let failure = match (blocked, last) {
+        (None, None) => ", no errors".to_string(),
+        (blocked, last) => format!("{}{}", blocked.unwrap_or_default(), last.unwrap_or_default()),
+    };
     let Some(pulled) = summary.last_pull_at else {
-        return format!("{head}, never pulled");
+        return format!("{head}, never pulled{failure}");
     };
     let resync = summary.last_full_resync_at.map_or("never".to_string(), stamp);
     format!(
-        "{head}, last pull {} ({} ago), last full resync {resync}, {} events",
+        "{head}, last pull {} ({} ago), last full resync {resync}, {} events{failure}",
         stamp(pulled),
         age(now - pulled),
         summary.event_count
@@ -179,7 +251,7 @@ mod tests {
     #[test]
     fn pull_rejects_an_unbound_project() {
         let (dir, config) = setup(false);
-        let error = pull(&config, dir.path(), Some("work/nope"), false, now(), &fake_connect).unwrap_err();
+        let error = pull(&config, dir.path(), Some("work/nope"), Mode::Incremental, now(), &fake_connect).unwrap_err();
         assert!(error.contains("work/nope"), "{error}");
     }
 
@@ -187,37 +259,76 @@ mod tests {
     fn pull_reports_each_project_and_fails_when_any_fails() {
         let (dir, config) = setup(false);
         // No credential yet: the project fails and the run reports failure.
-        let error = pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap_err();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap_err();
         assert!(error.contains("work/claims") && error.contains("not configured"), "{error}");
 
         connect(dir.path(), "corr-linear", "t").unwrap();
-        let lines = pull(&config, dir.path(), Some("work/claims"), true, now(), &fake_connect).unwrap();
+        let lines = pull(&config, dir.path(), Some("work/claims"), Mode::Full, now(), &fake_connect).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("work/claims") && lines[0].contains("full"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn pull_line_says_when_a_due_full_resync_made_the_pull_full() {
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let first = pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
+        assert_eq!(first, vec!["work/claims: full pull (no full resync on record, so this pull ran full) appended 0 events, 0 removed"]);
+        let soon = now() + chrono::TimeDelta::hours(1);
+        let second = pull(&config, dir.path(), None, Mode::Incremental, soon, &fake_connect).unwrap();
+        assert_eq!(second, vec!["work/claims: incremental pull appended 0 events, 0 removed"]);
+        let day_later = soon + crate::tracker::pull::FULL_RESYNC_MAX_AGE;
+        let third = pull(&config, dir.path(), None, Mode::Incremental, day_later, &fake_connect).unwrap();
+        assert_eq!(third, vec!["work/claims: full pull (last full resync over 24 hours ago, so this pull ran full) appended 0 events, 0 removed"]);
+        let asked = pull(&config, dir.path(), None, Mode::Full, day_later, &fake_connect).unwrap();
+        assert_eq!(asked, vec!["work/claims: full pull appended 0 events, 0 removed"]);
+    }
+
+    #[test]
+    fn a_failed_automatic_full_reports_both_pulls_and_fails_the_run() {
+        struct FullFails;
+        impl Adapter for FullFails {
+            fn pull(&self, _: Option<DateTime<Utc>>, full: bool, _: &mut Sink<'_>) -> Result<(), String> {
+                match full {
+                    true => Err("Linear request failed".to_string()),
+                    false => Ok(()),
+                }
+            }
+        }
+        let full_fails = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails)) };
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &full_fails).unwrap_err();
+        assert_eq!(
+            error,
+            "work/claims: automatic full pull failed (no full resync on record): Linear request failed (provider); incremental pull appended 0 events, 0 removed"
+        );
+        let next = pull(&config, dir.path(), None, Mode::Incremental, now() + chrono::TimeDelta::hours(1), &full_fails).unwrap();
+        assert_eq!(next, vec!["work/claims: incremental pull appended 0 events, 0 removed"]);
     }
 
     #[test]
     fn status_reads_the_last_pull_from_a_pull_that_found_nothing() {
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
-        pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(5);
-        pull(&config, dir.path(), None, false, later, &fake_connect).unwrap();
-        let line = &status(&config, later, None)[0];
+        pull(&config, dir.path(), None, Mode::Incremental, later, &fake_connect).unwrap();
+        let line = &status(&config, dir.path(), later, None)[0];
         assert!(line.contains("last pull 2026-09-01T12:05:00Z (0m ago)"), "{line}");
-        assert!(line.contains("last full resync never"), "{line}");
+        assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "the first pull runs full: {line}");
     }
 
     #[test]
     fn status_shows_pull_age_resync_count_and_readonly() {
         let (dir, config) = setup(true);
-        let before = status(&config, now(), None);
+        let before = status(&config, dir.path(), now(), None);
         assert!(before[0].contains("never pulled"), "{}", before[0]);
 
         connect(dir.path(), "corr-linear", "lin_api_secret").unwrap();
-        pull(&config, dir.path(), None, true, now(), &fake_connect).unwrap();
+        pull(&config, dir.path(), None, Mode::Full, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(90);
-        let lines = status(&config, later, None);
+        let lines = status(&config, dir.path(), later, None);
         let line = &lines[0];
         assert!(line.contains("work/claims"), "{line}");
         assert!(line.contains("readonly"), "{line}");
@@ -228,9 +339,136 @@ mod tests {
     }
 
     #[test]
+    fn compact_reports_each_project_and_is_idempotent() {
+        let (dir, config) = setup(false);
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let row = r#"{"kind":"pull_completed","id":"p1","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T12:00:00Z","title":"COR pull","raw":null}"#;
+        std::fs::write(&path, format!("{}\n{row}\n{row}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+
+        let lines = compact(&config, None, false).unwrap();
+        assert!(lines[0].starts_with("work/claims: compacted to 1 events"), "{}", lines[0]);
+        assert!(lines[0].contains("removed 1 duplicates"), "{}", lines[0]);
+        assert!(
+            lines[0].ends_with(". Search by meaning returns for this log after you run `wardwell reindex`."),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(compact(&config, Some("work/claims"), false).unwrap(), vec!["work/claims: already compact, 1 events"]);
+        assert!(compact(&config, Some("work/nope"), false).unwrap_err().contains("work/nope"));
+        drop(dir);
+    }
+
+    /// Fails every pull with provider text that must never reach the vault.
+    struct Broken;
+    impl Adapter for Broken {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            Err("Linear returned HTTP 500".to_string())
+        }
+    }
+
+    fn two_bindings() -> (tempfile::TempDir, WardwellConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: corr-linear\n  work/ops:\n    provider: linear\n    team: OPS\n    credential: corr-linear\n",
+            vault.display()
+        );
+        let config_path = dir.path().join("config.yml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let config = crate::config::loader::load(Some(&config_path)).unwrap();
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        (dir, config)
+    }
+
+    fn claims_breaks(binding: &TrackerBinding, _: &crate::tracker::credential::Credential) -> Result<Box<dyn Adapter>, String> {
+        match binding.team.as_str() {
+            "COR" => Ok(Box::new(Broken)),
+            _ => Ok(Box::new(Empty)),
+        }
+    }
+
+    #[test]
+    fn one_failing_binding_does_not_stop_the_others_and_fails_the_run() {
+        let (dir, config) = two_bindings();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &claims_breaks).unwrap_err();
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(lines.len(), 2, "{error}");
+        assert!(lines[0].starts_with("work/ops: full pull (no full resync on record, so this pull ran full) appended"), "{error}");
+        assert_eq!(
+            lines[1],
+            "work/claims: automatic full pull failed: Linear returned HTTP 500 (provider); incremental pull: Linear returned HTTP 500 (provider)"
+        );
+        let ops = log::read(&log::path_for(&config.vault_path, "work", "ops")).unwrap();
+        assert_eq!(ops.last_pull_at, Some(now()));
+        let claims = log::read(&log::path_for(&config.vault_path, "work", "claims")).unwrap();
+        assert_eq!(claims.last_failure.map(|(_, code)| code.as_str()), Some("provider"));
+    }
+
+    #[test]
+    fn status_lists_every_binding_with_its_last_error() {
+        let (dir, config) = two_bindings();
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
+        let later = now() + chrono::TimeDelta::minutes(10);
+        pull(&config, dir.path(), None, Mode::Incremental, later, &claims_breaks).unwrap_err();
+        let lines = status(&config, dir.path(), later, None);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let claims = lines.iter().find(|l| l.starts_with("work/claims")).unwrap();
+        assert!(claims.contains("last pull 2026-09-01T12:00:00Z"), "{claims}");
+        assert!(claims.ends_with("last error provider at 2026-09-01T12:10:00Z"), "{claims}");
+        assert!(!claims.contains("HTTP 500"), "{claims}");
+        let ops = lines.iter().find(|l| l.starts_with("work/ops")).unwrap();
+        assert!(ops.ends_with("no errors"), "{ops}");
+    }
+
+    #[test]
+    fn status_names_the_code_when_a_binding_cannot_pull() {
+        let (dir, mut config) = two_bindings();
+        std::fs::remove_file(crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap()).unwrap();
+        let lines = status(&config, dir.path(), now(), None);
+        assert!(lines[0].ends_with("never pulled, cannot pull (credential)"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("no errors")), "{lines:?}");
+
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        config.trackers.get_mut("work/ops").unwrap().provider = "jira".into();
+        let lines = status(&config, dir.path(), now(), None);
+        assert!(lines[0].ends_with("never pulled, no errors"), "{lines:?}");
+        assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider)"), "{lines:?}");
+    }
+
+    #[test]
+    fn status_shows_a_refused_token_as_auth() {
+        struct Revoked;
+        impl Adapter for Revoked {
+            fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+                Err(format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED))
+            }
+        }
+        let revoked = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Revoked)) };
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &revoked).unwrap_err();
+        assert!(error.ends_with("(auth)"), "{error}");
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z"), "{line}");
+    }
+
+    #[test]
+    fn doctor_fails_the_run_when_a_check_fails() {
+        let (dir, config) = setup(false);
+        let unreachable = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn crate::tracker::linear::Transport>, String> {
+            Err("never called without a credential".into())
+        };
+        let error = doctor(&config, dir.path(), &unreachable).unwrap_err();
+        assert_eq!(error.lines().count(), 3, "{error}");
+        assert!(error.starts_with("work/claims: credential failed (credential)"), "{error}");
+    }
+
+    #[test]
     fn status_ends_with_the_schedule_line() {
-        let (_dir, config) = setup(false);
-        assert_eq!(status(&config, now(), None).last().unwrap(), "pull schedule: not scheduled");
-        assert_eq!(status(&config, now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
+        let (dir, config) = setup(false);
+        assert_eq!(status(&config, dir.path(), now(), None).last().unwrap(), "pull schedule: not scheduled");
+        assert_eq!(status(&config, dir.path(), now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
     }
 }

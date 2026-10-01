@@ -5,6 +5,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
+/// Paths whose changes reach the index; raw payload sidecars never do.
+fn watches(path: &std::path::Path) -> bool {
+    crate::vault::reader::is_indexable(path)
+}
+
 /// Watch the vault directory for file changes and update the index.
 /// If a registry is provided, changes under `vault/domains/` trigger a registry rebuild.
 pub async fn watch_vault(
@@ -22,7 +27,7 @@ pub async fn watch_vault(
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                         for path in event.paths {
-                            if path.extension().and_then(|e| e.to_str()).is_some_and(|ext| ext == "md" || ext == "jsonl") {
+                            if watches(&path) {
                                 let _ = rt_tx.blocking_send(path);
                             }
                         }
@@ -108,4 +113,22 @@ pub async fn watch_vault(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn watcher_skips_raw_sidecars() {
+        assert!(watches(Path::new("/v/work/claims/tracker.jsonl")));
+        assert!(watches(Path::new("/v/work/claims/history.jsonl")));
+        assert!(watches(Path::new("/v/work/claims/INDEX.md")));
+        assert!(!watches(Path::new("/v/work/claims/tracker.raw.jsonl")));
+        assert!(!watches(Path::new("/v/work/claims/tracker.jsonl.bak")));
+        assert!(!watches(Path::new("/v/work/claims/tracker.lock")));
+        assert!(!watches(Path::new("/v/work/claims/tracker.jsonl.compact")), "the compact temp file");
+        assert!(!watches(Path::new("/v/work/claims/tracker.jsonl.bak.new")), "the next backup");
+    }
 }

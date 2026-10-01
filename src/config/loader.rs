@@ -267,6 +267,16 @@ fn tracker_bindings(
     let mut bindings = BTreeMap::new();
     for (key, entry) in raw {
         let (domain, project) = split_project_key(&key)?;
+        if !crate::tracker::SUPPORTED_PROVIDERS.contains(&entry.provider.as_str()) {
+            return Err(ConfigError::InvalidTrackerBinding {
+                key: key.clone(),
+                reason: format!(
+                    "provider '{}' is not supported; supported: {}",
+                    entry.provider,
+                    crate::tracker::SUPPORTED_PROVIDERS.join(", ")
+                ),
+            });
+        }
         bindings.insert(key.clone(), TrackerBinding {
             domain,
             project,
@@ -517,5 +527,15 @@ trackers:
             let error = load(Some(f.path())).err().expect("malformed key");
             assert!(error.to_string().contains(key), "{error}");
         }
+    }
+
+    #[test]
+    fn trackers_reject_an_unknown_provider_and_list_the_supported_ones() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: jira\n    team: COR\n    credential: c\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("unknown provider").to_string();
+        assert!(error.contains("work/claims"), "{error}");
+        assert!(error.contains("'jira'"), "{error}");
+        assert!(error.contains("supported: linear"), "{error}");
     }
 }

@@ -178,7 +178,9 @@ wardwell reindex              Rebuild the vault search index from scratch
 wardwell seed <path>          Create domain or project folders
 wardwell tracker connect <name> --token-stdin   Store a tracker API token
 wardwell tracker pull [--project <d/p>] [--full] Mirror tracker events into the vault
-wardwell tracker status       Last pull, last full resync, event count per project
+wardwell tracker status       Last pull, last error, last full resync, event count per project
+wardwell tracker doctor       Check each binding's credential, auth and team
+wardwell tracker compact [--project <d/p>] [--force]   Move raw payloads to the sidecar, drop duplicates
 ```
 
 ### wardwell init
@@ -318,11 +320,16 @@ exclude:
 
 ## Tracker mirror
 
-Wardwell can mirror an external issue tracker into the vault as a read-only,
-append-only event log. Each bound project gets `<domain>/<project>/tracker.jsonl`
+Wardwell can mirror an external issue tracker into the vault as a read-only
+event log that pulls only append to. Each bound project gets `<domain>/<project>/tracker.jsonl`
 (header `{"_schema":"tracker","_version":"1.0"}`), indexed like any other JSONL,
-so `wardwell_search` finds tracker history. Linear is the first provider.
-Wardwell never writes back to the tracker.
+so `wardwell_search` finds tracker history. A ticket key in a query, such as
+`COR-12` or `COR-12 OR COR-13`, is matched as a key. Linear is the first
+provider. Wardwell never writes back to the tracker.
+
+One tracker per project: a binding maps one project folder to one team. A
+second tracker, or a second team, is a second project folder with its own
+binding and credential.
 
 Bind projects in `~/.wardwell/config.yml`:
 
@@ -349,13 +356,31 @@ Then:
 wardwell tracker pull                          # every bound project
 wardwell tracker pull --project work/claims    # one project
 wardwell tracker pull --full                   # re-pull everything, record removals
-wardwell tracker status
+wardwell tracker pull --full --allow-empty     # accept an empty result and remove every issue
+wardwell tracker status                        # every binding: last pull, last error
+wardwell tracker doctor                        # credential, auth, team per binding
+wardwell tracker compact [--project work/claims] [--force]
 ```
 
-Each event carries `kind` (`issue_upserted`, `comment_upserted`, `state_changed`,
-`link_added`, `issue_removed`, `full_resync`, `pull_completed`), `provider`,
-`external_key` (e.g. `COR-12`), `external_id`, `actor`, `occurred_at`, a readable
-`title`, and the provider's payload under `raw`. There is no cursor file: each
+Each event carries `kind`, which is one of `issue_upserted`, `comment_upserted`,
+`state_changed`, `link_added`, `issue_removed`, `full_resync`, `pull_completed`
+or `pull_failed`. It also carries `provider`, `external_key` such as `COR-12`,
+`external_id`, `actor`, `occurred_at`, and a readable `title`. An `issue_upserted` snapshot holds the
+issue's fields in provider-neutral names: `issue_title`, `description`,
+`state`, `state_category`, `priority`, `team`, `project`, `assignee`,
+`creator`, `labels`, `url`, `created_at`, `archived_at`, `parent_key`,
+`branch_name`, and `relations`, a list of `{kind, key}` with kind `related`,
+`blocks`, `blocked_by` or `duplicate_of`. A provider link type outside those
+four stays only in the raw payload. The title of a sub-issue's snapshot names
+its parent. A snapshot's id includes a short digest of its structure, so a
+re-parent or a new relation records a new snapshot even when the provider did
+not bump the issue's update time.
+
+The log rows are light. The provider's raw payload for each event goes to
+`tracker.raw.jsonl` beside the log, one line per event id, written before the
+log row. The indexer and the watcher skip every `*.raw.jsonl` file. Logs
+written by earlier versions carry `raw` inline and still read; `wardwell
+tracker compact` migrates them. There is no cursor file: each
 pull that delivers every page ends with a `pull_completed` marker whose `through`
 is the newest provider time seen, and the next incremental pull starts one hour
 before the latest marker's `through`. Pages are appended as they arrive and
@@ -364,9 +389,63 @@ read but does not move the cursor; the next pull re-requests from the same
 point whatever order the provider returned pages in. With no marker, a pull
 starts from the beginning. `--full` re-pulls every issue (archived included),
 appends `issue_removed` for issues the tracker no longer returns, and ends with
-a `full_resync` marker that also sets the cursor. `status` reads the last pull
+a `full_resync` marker that also sets the cursor. Linear does not timestamp
+every change; a new relation or the archive of an old issue can leave the
+update time alone, so an incremental pull would miss it. A pull therefore runs
+full, and says so in its output line, when the newest `full_resync` marker is
+more than 24 hours old or there is none. With the hourly schedule that is one
+full pull a day. A full pull that returns no issues while the mirror holds
+open ones removes nothing: it fails with `empty_full_result`, since a renamed
+team key or a token that lost access looks the same as an emptied tracker.
+Only `--full --allow-empty` accepts an empty result; the automatic full pull
+never does. When an automatic full pull fails, the same run goes on with
+an incremental pull and the output line reports both; the run still exits
+non-zero. No automatic full is tried again for 6 hours after that failure,
+so incremental pulls keep the mirror moving meanwhile. An explicit `--full`
+is never held back. An issue that was removed and then comes back reappears: its
+snapshot is appended even though its id is in the log, under the id
+suffixed `:restored:<removal time>`. `status` reads the last pull
 time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
+
+One binding that fails does not stop the others. A failure after the log is
+open appends a `pull_failed` marker with a closed `code` and no provider text.
+The codes are `auth` when the provider refuses the token, `provider` for any
+other provider failure, `empty_full_result`, `log_read` and `log_write`. Three failures write
+nothing to the log: a missing credential is `credential`, an unknown provider
+is `unsupported_provider`, and a held lock is `lock_busy`. `status` lists every
+binding with its last error. It also checks, without a network call, that the
+provider is known and the credential reads, and prints `cannot pull` with the
+code when either fails; it says `no errors` only when both pass and no pull
+failed. `pull` exits non-zero when any binding failed.
+
+`doctor` prints three lines per binding: whether the credential file exists
+with owner-only permissions, whether the provider accepts the token on one
+cheap request, and whether the team key resolves. A failure names one code:
+`credential`, `auth`, `provider` or `team_not_found`. `auth` means the
+provider refused the token; any other provider error, including a GraphQL
+error that is not about authentication, is `provider`. It never prints a
+token. `config.yml` is rejected at load when a binding names a provider
+Wardwell has no adapter for; the error lists the supported ones. Should one
+reach `doctor` anyway, its second line reads `provider failed
+(unsupported_provider)`.
+
+`compact` is the only command that rewrites a tracker log, and only
+`tracker.jsonl`; it may because the log is a re-pullable mirror, not a system
+of record. It moves inline `raw` into the sidecar and removes exact duplicate
+events. It takes a per-project lock file, `tracker.lock`, that `pull` also
+takes. A pull that finds the lock held waits up to 30 seconds, then fails with
+`lock_busy`. Before it writes anything it refuses a log in which two rows
+share an id but differ; it names the id, `--force` does not override it, and
+the two rows must be resolved by hand. It then writes the sidecar, verifies
+that every moved payload reads back from it, writes the new log beside the old
+one, links the old one to `tracker.jsonl.bak.new`, renames the new log into
+place, and only then renames `.bak.new` over `tracker.jsonl.bak`. If any step
+fails, the log and the previous backup are left as they were. The
+backup stays until the next compact, which refuses to run while it exists
+unless given `--force`. A log that is already compact is left alone. A
+compacted log is searchable by text at once; search by meaning returns for it
+after you run `wardwell reindex`.
 
 With `readonly: true`, every kanban MCP action that appends to a file in that
 project's folder or its ticket audit log (create, update, move, note, attach,
@@ -390,7 +469,11 @@ crontab line instead, marked approximate when cron cannot express the interval.
 read from the plist on disk, not whether launchd has the job loaded.
 
 Follow-up, not in this version: importing a tracker's CSV or JSON export from a
-file instead of pulling over the API.
+file instead of pulling over the API. Also a follow-up: a debounce in the
+watcher. Each change to a tracker log makes the indexer hash every indexed
+line to detect a rewrite; an index on `vault_chunks(path, chunk_index)`,
+added to an existing `index.db` when it opens, keeps the stored-hash lookup
+to that file's rows.
 
 ## Domain Scoping
 

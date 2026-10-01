@@ -4,8 +4,8 @@
 //!
 //! Does NOT write to Linear, decide the cursor, or touch the vault.
 
-use crate::tracker::adapter::{Adapter, Sink};
-use crate::tracker::events::{Common, Event, IssueSnapshot, Priority, StateCategory};
+use crate::tracker::adapter::{AUTH_REFUSED, Adapter, Sink};
+use crate::tracker::events::{Common, Event, FailureCode, IssueSnapshot, Priority, Relation, RelationKind, StateCategory};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -27,7 +27,10 @@ const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($first: Int!, $after: St
   issues(first: $first, after: $after, includeArchived: true, orderBy: updatedAt, filter: $filter) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id identifier title description url priority createdAt updatedAt archivedAt
+      id identifier title description url priority createdAt updatedAt archivedAt branchName
+      parent { identifier }
+      relations(first: 50) { nodes { type relatedIssue { identifier } } }
+      inverseRelations(first: 50) { nodes { type issue { identifier } } }
       state { name type }
       team { key }
       project { name }
@@ -40,6 +43,47 @@ const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($first: Int!, $after: St
     }
   }
 }"#;
+
+const VIEWER_QUERY: &str = "query WardwellDoctorViewer { viewer { id } }";
+
+const TEAM_QUERY: &str = r#"query WardwellDoctorTeam($key: String!) {
+  teams(first: 1, filter: { key: { eq: $key } }) { nodes { key } }
+}"#;
+
+/// Doctor check: one cheap authenticated request. HTTP 401/403 or a GraphQL
+/// authentication error means the token was refused; any other error is a
+/// provider failure.
+pub fn check_auth(transport: &dyn Transport) -> Result<(), FailureCode> {
+    let response = transport.post(&json!({"query": VIEWER_QUERY})).map_err(transport_code)?;
+    match response.get("errors").and_then(Value::as_array) {
+        Some(errors) if errors.iter().any(is_auth_error) => Err(FailureCode::Auth),
+        Some(_) => Err(FailureCode::Provider),
+        None if response["data"]["viewer"]["id"].is_string() => Ok(()),
+        None => Err(FailureCode::Provider),
+    }
+}
+
+/// Doctor check: the bound team key exists and the token can see it.
+pub fn check_team(transport: &dyn Transport, team: &str) -> Result<(), FailureCode> {
+    let body = json!({"query": TEAM_QUERY, "variables": {"key": team}});
+    let response = transport.post(&body).map_err(transport_code)?;
+    if response.get("errors").is_some() {
+        return Err(FailureCode::Provider);
+    }
+    let found = response["data"]["teams"]["nodes"]
+        .as_array()
+        .ok_or(FailureCode::Provider)?
+        .iter()
+        .any(|node| node["key"].as_str() == Some(team));
+    found.then_some(()).ok_or(FailureCode::TeamNotFound)
+}
+
+fn transport_code(error: String) -> FailureCode {
+    match error.contains(AUTH_REFUSED) {
+        true => FailureCode::Auth,
+        false => FailureCode::Provider,
+    }
+}
 
 /// Posts one GraphQL body and returns the decoded JSON response.
 /// Exists so tests can inject canned responses.
@@ -110,6 +154,9 @@ struct Page<'a> {
 
 fn issues_page(response: &Value) -> Result<Page<'_>, String> {
     if let Some(errors) = response.get("errors").and_then(Value::as_array) {
+        if errors.iter().any(is_auth_error) {
+            return Err(format!("Linear returned an error: {AUTH_REFUSED}"));
+        }
         let message = errors
             .first()
             .and_then(|e| e.get("message"))
@@ -210,9 +257,31 @@ fn translate_issue(node: &Value) -> Result<Vec<Event>, String> {
 fn snapshot_event(issue: &IssueRef, node: &Value, issue_title: String) -> Result<Event, String> {
     let state = name_of(node, "state").unwrap_or_default();
     let archived_at = time(node, "archivedAt")?;
+    let snapshot = IssueSnapshot {
+        issue_title,
+        description: text(node, "description"),
+        state_category: StateCategory::from_type(node["state"]["type"].as_str().unwrap_or_default()),
+        state: state.clone(),
+        priority: Priority::from_level(node["priority"].as_i64().unwrap_or(0)),
+        team: node.get("team").and_then(|t| text(t, "key")),
+        project: name_of(node, "project"),
+        assignee: name_of(node, "assignee"),
+        creator: name_of(node, "creator"),
+        labels: nodes(node, "labels").iter().filter_map(|l| text(l, "name")).collect(),
+        url: text(node, "url"),
+        created_at: time(node, "createdAt")?,
+        archived_at,
+        parent_key: node.get("parent").and_then(|p| text(p, "identifier")),
+        relations: relations(node),
+        branch_name: text(node, "branchName"),
+    };
+    let heading = match &snapshot.parent_key {
+        Some(parent) => format!("{} (sub-issue of {parent})", issue.heading),
+        None => issue.heading.clone(),
+    };
     let title = match archived_at {
-        Some(_) => format!("{}: archived ({state})", issue.heading),
-        None => format!("{}: {state}", issue.heading),
+        Some(_) => format!("{heading}: archived ({state})"),
+        None => format!("{heading}: {state}"),
     };
     let mut raw = node.clone();
     if let Some(object) = raw.as_object_mut() {
@@ -221,30 +290,44 @@ fn snapshot_event(issue: &IssueRef, node: &Value, issue_title: String) -> Result
         }
     }
     let mut common = issue.common("issue", node, required_time(node, "updatedAt")?, None, title)?;
-    // Linear does not bump updatedAt on archive, so the archive time joins the
-    // id; unarchived ids stay as they were so earlier logs still dedup.
+    // Linear does not bump updatedAt on archive or on a new relation, so the
+    // archive time and a digest of the structure join the id. A snapshot with
+    // neither keeps the id earlier logs hold, so they still dedup.
     if let Some(raw_archived) = text(node, "archivedAt") {
         common.id = format!("{}:{raw_archived}", common.id);
     }
+    if let Some(digest) = snapshot.structure_digest() {
+        common.id = format!("{}:{digest}", common.id);
+    }
     common.raw = raw;
-    Ok(Event::IssueUpserted {
-        common,
-        issue: IssueSnapshot {
-            issue_title,
-            description: text(node, "description"),
-            state_category: StateCategory::from_type(node["state"]["type"].as_str().unwrap_or_default()),
-            state,
-            priority: Priority::from_level(node["priority"].as_i64().unwrap_or(0)),
-            team: node.get("team").and_then(|t| text(t, "key")),
-            project: name_of(node, "project"),
-            assignee: name_of(node, "assignee"),
-            creator: name_of(node, "creator"),
-            labels: nodes(node, "labels").iter().filter_map(|l| text(l, "name")).collect(),
-            url: text(node, "url"),
-            created_at: time(node, "createdAt")?,
-            archived_at,
-        },
-    })
+    Ok(Event::IssueUpserted { common, issue: Box::new(snapshot) })
+}
+
+/// Linear relations in Wardwell's kinds, sorted and deduplicated. `relations`
+/// reads from this issue's side, `inverseRelations` from the other issue's.
+/// Types with no Wardwell kind (similar, the duplicated-by side) stay in raw.
+fn relations(node: &Value) -> Vec<Relation> {
+    let outward = nodes(node, "relations").iter().filter_map(|r| {
+        let kind = match r["type"].as_str()? {
+            "related" => RelationKind::Related,
+            "blocks" => RelationKind::Blocks,
+            "duplicate" => RelationKind::DuplicateOf,
+            _ => return None,
+        };
+        Some(Relation { kind, key: text(&r["relatedIssue"], "identifier")? })
+    });
+    let inward = nodes(node, "inverseRelations").iter().filter_map(|r| {
+        let kind = match r["type"].as_str()? {
+            "related" => RelationKind::Related,
+            "blocks" => RelationKind::BlockedBy,
+            _ => return None,
+        };
+        Some(Relation { kind, key: text(&r["issue"], "identifier")? })
+    });
+    let mut all: Vec<Relation> = outward.chain(inward).collect();
+    all.sort();
+    all.dedup();
+    all
 }
 
 fn comment_event(issue: &IssueRef, comment: &Value) -> Result<Event, String> {
@@ -347,14 +430,26 @@ async fn send(token: &str, body: Vec<u8>) -> Result<Value, String> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    let decoded: Option<Value> = serde_json::from_slice(&bytes).ok();
-    match (status.is_success(), decoded) {
-        (true, Some(value)) => Ok(value),
-        (true, None) => Err("Linear returned invalid JSON".to_string()),
+    reply(status.as_u16(), serde_json::from_slice(&bytes).ok())
+}
+
+/// The decoded reply for an HTTP status. 401 and 403 are a refused token
+/// whatever the body says; other GraphQL errors pass through to the caller.
+fn reply(status: u16, decoded: Option<Value>) -> Result<Value, String> {
+    match (status, decoded) {
+        (401 | 403, _) => Err(format!("Linear returned HTTP {status}: {AUTH_REFUSED}")),
+        (200..=299, Some(value)) => Ok(value),
+        (200..=299, None) => Err("Linear returned invalid JSON".to_string()),
         // GraphQL errors arrive with 400; surface their message, not the body.
-        (false, Some(value)) if value.get("errors").is_some() => Ok(value),
-        (false, _) => Err(format!("Linear returned HTTP {}", status.as_u16())),
+        (_, Some(value)) if value.get("errors").is_some() => Ok(value),
+        (_, _) => Err(format!("Linear returned HTTP {status}")),
     }
+}
+
+/// True when a GraphQL error says the request was not authenticated.
+fn is_auth_error(error: &Value) -> bool {
+    let extensions = &error["extensions"];
+    extensions["code"].as_str() == Some("AUTHENTICATION_ERROR") || extensions["type"].as_str() == Some("authentication error")
 }
 
 #[cfg(test)]
@@ -362,7 +457,7 @@ async fn send(token: &str, body: Vec<u8>) -> Result<Value, String> {
 mod tests {
     use super::*;
     use crate::tracker::adapter::Adapter;
-    use crate::tracker::events::{Event, Priority, StateCategory};
+    use crate::tracker::events::{Event, Priority, RelationKind, StateCategory};
     use chrono::TimeZone;
     use serde_json::json;
     use std::cell::RefCell;
@@ -420,6 +515,26 @@ mod tests {
                 "creator": {"name": "John Roe"}
             }]}
         })
+    }
+
+    /// `issue` plus a parent, a branch, and relations in both directions,
+    /// including link types Wardwell has no kind for.
+    fn structured_issue(id: &str, key: &str, updated: &str) -> Value {
+        let mut node = issue(id, key, "Claims inbox shows wrong payer", updated, None);
+        node["parent"] = json!({"identifier": "COR-5"});
+        node["branchName"] = json!("jane/cor-12-claims-inbox");
+        node["relations"] = json!({"nodes": [
+            {"type": "blocks", "relatedIssue": {"identifier": "COR-14"}},
+            {"type": "duplicate", "relatedIssue": {"identifier": "COR-3"}},
+            {"type": "related", "relatedIssue": {"identifier": "COR-20"}},
+            {"type": "similar", "relatedIssue": {"identifier": "COR-21"}}
+        ]});
+        node["inverseRelations"] = json!({"nodes": [
+            {"type": "blocks", "issue": {"identifier": "COR-9"}},
+            {"type": "related", "issue": {"identifier": "COR-22"}},
+            {"type": "duplicate", "issue": {"identifier": "COR-23"}}
+        ]});
+        node
     }
 
     fn page(nodes: Vec<Value>, next: Option<&str>) -> Value {
@@ -509,6 +624,143 @@ mod tests {
         }).unwrap();
         assert_eq!(comment.1, "Seen on the March batch too.");
         assert_eq!(comment.0.raw["id"], "i1-c1");
+    }
+
+    #[test]
+    fn query_requests_parent_branch_and_both_relation_directions() {
+        for field in ["parent { identifier }", "branchName", "relations(", "relatedIssue { identifier }", "inverseRelations(", "issue { identifier }"] {
+            assert!(ISSUES_QUERY.contains(field), "{field}");
+        }
+    }
+
+    #[test]
+    fn snapshot_carries_parent_branch_and_known_relations() {
+        let transport = FakeTransport::new(vec![page(vec![structured_issue("i1", "COR-12", "2026-09-01T14:00:00.000Z")], None)]);
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
+        let Event::IssueUpserted { common, issue } = &events[0] else { panic!("snapshot first") };
+        assert_eq!(issue.parent_key.as_deref(), Some("COR-5"));
+        assert_eq!(issue.branch_name.as_deref(), Some("jane/cor-12-claims-inbox"));
+        let relations: Vec<(RelationKind, &str)> = issue.relations.iter().map(|r| (r.kind, r.key.as_str())).collect();
+        assert_eq!(relations, vec![
+            (RelationKind::Related, "COR-20"),
+            (RelationKind::Related, "COR-22"),
+            (RelationKind::Blocks, "COR-14"),
+            (RelationKind::BlockedBy, "COR-9"),
+            (RelationKind::DuplicateOf, "COR-3"),
+        ]);
+        assert_eq!(issue.labels, vec!["billing".to_string()]);
+        assert_eq!(issue.project.as_deref(), Some("Claims"));
+        assert_eq!(issue.assignee.as_deref(), Some("Jane Doe"));
+        assert_eq!(issue.priority, Priority::High);
+        assert_eq!(issue.url.as_deref(), Some("https://linear.app/corr/issue/COR-12"));
+        assert_eq!(common.title, "COR-12 Claims inbox shows wrong payer (sub-issue of COR-5): In Progress");
+        let digest = issue.structure_digest().unwrap();
+        assert_eq!(common.id, format!("linear:issue:i1:2026-09-01T14:00:00.000Z:{digest}"));
+        let raw = common.raw.to_string();
+        assert!(raw.contains("similar") && raw.contains("COR-21") && raw.contains("COR-23"), "unknown types stay in raw");
+    }
+
+    #[test]
+    fn archived_sub_issue_title_names_the_parent() {
+        let mut node = structured_issue("i1", "COR-12", "2026-09-01T14:00:00.000Z");
+        node["archivedAt"] = json!("2026-09-02T09:00:00.000Z");
+        let transport = FakeTransport::new(vec![page(vec![node], None)]);
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
+        let Event::IssueUpserted { common, issue } = &events[0] else { panic!("snapshot first") };
+        assert_eq!(common.title, "COR-12 Claims inbox shows wrong payer (sub-issue of COR-5): archived (In Progress)");
+        let digest = issue.structure_digest().unwrap();
+        assert_eq!(common.id, format!("linear:issue:i1:2026-09-01T14:00:00.000Z:2026-09-02T09:00:00.000Z:{digest}"));
+    }
+
+    #[test]
+    fn structure_change_without_an_updated_at_bump_appends_a_new_snapshot() {
+        use crate::config::TrackerBinding;
+        use crate::tracker::pull::pull_project;
+        let updated = "2026-09-01T14:00:00.000Z";
+        let first = structured_issue("i1", "COR-12", updated);
+        let mut reparented = first.clone();
+        reparented["parent"] = json!({"identifier": "COR-6"});
+        let mut related = reparented.clone();
+        related["relations"]["nodes"].as_array_mut().unwrap().push(json!({"type": "blocks", "relatedIssue": {"identifier": "COR-30"}}));
+        let transport = FakeTransport::new(vec![
+            page(vec![first], None),
+            page(vec![reparented.clone()], None),
+            page(vec![related], None),
+            page(vec![reparented], None),
+        ]);
+        let adapter = Linear::new(&transport, "COR");
+        let binding = TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "linear".into(),
+            team: "COR".into(),
+            credential: "corr-linear".into(),
+            readonly: true,
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 0).unwrap();
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 4);
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 1, "re-parent");
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 1, "new relation");
+        assert_eq!(pull_project(vault.path(), &binding, &adapter, false, now).unwrap().appended, 0, "a structure already seen dedups");
+    }
+
+    #[test]
+    fn issue_without_parent_relations_or_branch_keeps_its_legacy_id() {
+        let transport = FakeTransport::new(vec![page(vec![issue("i1", "COR-12", "T", "2026-09-01T14:00:00.000Z", None)], None)]);
+        let events = collect(&Linear::new(&transport, "COR"), None, false).unwrap();
+        assert_eq!(events[0].common().id, "linear:issue:i1:2026-09-01T14:00:00.000Z");
+        assert_eq!(events[0].common().title, "COR-12 T: In Progress");
+    }
+
+    #[test]
+    fn old_id_log_re_pulled_with_branches_appends_one_snapshot_per_issue_and_removes_nothing() {
+        use crate::config::TrackerBinding;
+        use crate::tracker::{log, pull::pull_project};
+        let updated = "2026-09-01T14:00:00.000Z";
+        let nodes = |branch: bool| -> Vec<Value> {
+            (1..=3)
+                .map(|n| {
+                    let mut node = issue(&format!("i{n}"), &format!("COR-{n}"), "T", updated, None);
+                    if branch {
+                        node["branchName"] = json!(format!("jane/cor-{n}"));
+                    }
+                    node
+                })
+                .collect()
+        };
+        let binding = TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "linear".into(),
+            team: "COR".into(),
+            credential: "corr-linear".into(),
+            readonly: true,
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let at = |h| Utc.with_ymd_and_hms(2026, 9, 2, h, 0, 0).unwrap();
+        let upserts = || {
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+                .filter(|event| matches!(event, Event::IssueUpserted { .. }))
+                .count()
+        };
+
+        // Written by the adapter before branch names: legacy ids.
+        let old = FakeTransport::new(vec![page(nodes(false), None)]);
+        pull_project(vault.path(), &binding, &Linear::new(&old, "COR"), true, at(1)).unwrap();
+        assert_eq!(upserts(), 3);
+
+        let new = FakeTransport::new(vec![page(nodes(true), None)]);
+        let outcome = pull_project(vault.path(), &binding, &Linear::new(&new, "COR"), true, at(2)).unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(upserts(), 6, "exactly one new snapshot per issue");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("issue_removed"), "{content}");
+        assert_eq!(log::read(&path).unwrap().open_issues.len(), 3);
     }
 
     #[test]
@@ -660,6 +912,32 @@ mod tests {
         let transport = FakeTransport::new(vec![json!({"errors": [{"message": "Team not found"}]})]);
         let error = collect(&Linear::new(&transport, "NOPE"), None, false).unwrap_err();
         assert!(error.contains("Team not found"), "{error}");
+    }
+
+    #[test]
+    fn an_authentication_error_fails_the_pull_as_a_refused_token() {
+        let transport = FakeTransport::new(vec![json!({"errors": [{
+            "message": "Authentication required, not authenticated",
+            "extensions": {"type": "authentication error", "code": "AUTHENTICATION_ERROR"}
+        }]})]);
+        let error = collect(&Linear::new(&transport, "COR"), None, false).unwrap_err();
+        assert!(error.contains(crate::tracker::adapter::AUTH_REFUSED), "{error}");
+        let other = FakeTransport::new(vec![json!({"errors": [{"message": "Team not found"}]})]);
+        let error = collect(&Linear::new(&other, "COR"), None, false).unwrap_err();
+        assert!(!error.contains(crate::tracker::adapter::AUTH_REFUSED), "{error}");
+    }
+
+    #[test]
+    fn http_401_and_403_are_a_refused_token_whatever_the_body() {
+        let errors = Some(json!({"errors": [{"message": "Authentication required"}]}));
+        for status in [401, 403] {
+            let error = reply(status, errors.clone()).unwrap_err();
+            assert!(error.contains(crate::tracker::adapter::AUTH_REFUSED), "{error}");
+            assert!(reply(status, None).unwrap_err().contains(crate::tracker::adapter::AUTH_REFUSED));
+        }
+        assert_eq!(reply(400, errors.clone()).unwrap(), errors.unwrap(), "other GraphQL errors pass through");
+        assert_eq!(reply(500, None).unwrap_err(), "Linear returned HTTP 500");
+        assert_eq!(reply(200, None).unwrap_err(), "Linear returned invalid JSON");
     }
 
     #[test]
