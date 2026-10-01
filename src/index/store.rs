@@ -143,7 +143,10 @@ impl IndexStore {
                 body TEXT NOT NULL,
                 body_hash TEXT NOT NULL,
                 UNIQUE(path, chunk_index)
-            );"
+            );
+            -- Explicit so a database from before the UNIQUE constraint gains
+            -- it on open: the jsonl rewrite check reads chunks by path.
+            CREATE INDEX IF NOT EXISTS idx_chunks_path_index ON vault_chunks(path, chunk_index);"
         )?;
 
         let chunk_fts_exists: bool = conn
@@ -259,6 +262,7 @@ impl IndexStore {
                 body_hash TEXT NOT NULL,
                 UNIQUE(path, chunk_index)
             );
+            CREATE INDEX idx_chunks_path_index ON vault_chunks(path, chunk_index);
 
             CREATE VIRTUAL TABLE chunk_search USING fts5(
                 chunk_id, path, heading, body,
@@ -957,6 +961,51 @@ mod tests {
         let store = IndexStore::open(&db_path);
         assert!(store.is_ok(), "{store:?}");
         assert!(db_path.exists());
+    }
+
+    fn has_chunk_path_index(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_chunks_path_index'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn an_old_database_gains_the_chunk_path_index_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index.db");
+        {
+            // The shape an older build left: vault_chunks with no index on path.
+            let old = Connection::open(&db_path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE vault_chunks (
+                    chunk_id TEXT PRIMARY KEY, path TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+                    heading TEXT, body TEXT NOT NULL, body_hash TEXT NOT NULL
+                );
+                INSERT INTO vault_chunks VALUES ('a::0', 'a', 0, NULL, 'x', 'h');",
+            )
+            .unwrap();
+            assert!(!has_chunk_path_index(&old));
+        }
+        let store = IndexStore::open(&db_path).unwrap();
+        let conn = store.lock().unwrap();
+        assert!(has_chunk_path_index(&conn));
+        let plan: String = conn
+            .query_row("EXPLAIN QUERY PLAN SELECT chunk_index, body_hash FROM vault_chunks WHERE path = 'a'", [], |row| row.get(3))
+            .unwrap();
+        assert!(plan.contains("USING INDEX"), "{plan}");
+    }
+
+    #[test]
+    fn a_new_database_has_the_chunk_path_index() {
+        let store = IndexStore::in_memory().unwrap();
+        assert!(has_chunk_path_index(&store.lock().unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        let store = IndexStore::open(&dir.path().join("index.db")).unwrap();
+        assert!(has_chunk_path_index(&store.lock().unwrap()));
     }
 
     #[test]

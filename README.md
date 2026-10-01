@@ -469,7 +469,11 @@ crontab line instead, marked approximate when cron cannot express the interval.
 read from the plist on disk, not whether launchd has the job loaded.
 
 Follow-up, not in this version: importing a tracker's CSV or JSON export from a
-file instead of pulling over the API.
+file instead of pulling over the API. Also a follow-up: a debounce in the
+watcher. Each change to a tracker log makes the indexer hash every indexed
+line to detect a rewrite; an index on `vault_chunks(path, chunk_index)`,
+added to an existing `index.db` when it opens, keeps the stored-hash lookup
+to that file's rows.
 
 ## Domain Scoping
 
