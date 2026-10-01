@@ -22,9 +22,12 @@ pub struct OpenIssue {
     pub issue_title: String,
 }
 
-/// Derived state of a tracker log.
+/// Derived state of a tracker log, for one provider or for all.
 #[derive(Debug, Default, Clone)]
 pub struct LogSummary {
+    /// The provider whose events the summary folds; None folds every event.
+    /// Event ids of every provider are kept either way, so appends dedup.
+    pub provider: Option<String>,
     /// `through` of the latest pull_completed or full_resync marker in file
     /// order. Provider events never move it, so a pull that failed part way
     /// leaves it where the last completed pull put it.
@@ -48,6 +51,9 @@ impl LogSummary {
     fn observe(&mut self, event: &Event) {
         let common = event.common();
         self.event_ids.insert(common.id.clone());
+        if self.provider.as_ref().is_some_and(|p| *p != common.provider) {
+            return;
+        }
         self.event_count += 1;
         match event {
             Event::IssueRemoved { .. } => {
@@ -92,10 +98,20 @@ pub fn path_for(vault_root: &Path, domain: &str, project: &str) -> PathBuf {
     vault_root.join(domain).join(project).join(crate::tracker::events::FILE_NAME)
 }
 
-/// Summarize the log at `path`. A missing file is an empty log; unreadable
-/// lines are counted and skipped.
+/// Summarize every provider's events in the log at `path`. A missing file
+/// is an empty log; unreadable lines are counted and skipped.
 pub fn read(path: &Path) -> Result<LogSummary, String> {
-    let mut summary = LogSummary::default();
+    read_with(path, LogSummary::default())
+}
+
+/// Summarize one provider's events in the log at `path`: its cursor, pull
+/// times, failures and open issues. Another provider's markers never move
+/// them. Event ids of every provider are kept, so appends still dedup.
+pub fn read_for(path: &Path, provider: &str) -> Result<LogSummary, String> {
+    read_with(path, LogSummary { provider: Some(provider.to_string()), ..LogSummary::default() })
+}
+
+fn read_with(path: &Path, mut summary: LogSummary) -> Result<LogSummary, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(summary),

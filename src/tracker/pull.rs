@@ -171,7 +171,7 @@ pub fn pull_binding(
 /// Whether the binding's log is due a full resync at `now`.
 fn resync_due(vault_root: &Path, binding: &TrackerBinding, now: DateTime<Utc>) -> Result<Option<ResyncDue>, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let summary = log::read_for(&path, &binding.provider).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
     Ok(ResyncDue::check(&summary, now))
 }
 
@@ -246,7 +246,7 @@ fn pull_held(
     now: DateTime<Utc>,
     _lock: &lock::ProjectLock,
 ) -> Result<PullOutcome, PullError> {
-    let mut summary = log::read(path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let mut summary = log::read_for(path, &binding.provider).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
     let result = pull_locked(path, binding, adapter, mode, now, &mut summary);
     if let Err(error) = &result {
         let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
@@ -318,13 +318,13 @@ fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode, 
         common: local_common(
             binding,
             match automatic_full {
-                true => format!("wardwell:pull_failed:{}:{}:automatic_full", binding.team, now.to_rfc3339()),
-                false => format!("wardwell:pull_failed:{}:{}", binding.team, now.to_rfc3339()),
+                true => format!("wardwell:pull_failed:{}:{}:automatic_full", binding.scope(), now.to_rfc3339()),
+                false => format!("wardwell:pull_failed:{}:{}", binding.scope(), now.to_rfc3339()),
             },
-            &binding.team,
-            &binding.team,
+            binding.scope(),
+            binding.scope(),
             now,
-            format!("{} pull from {label} failed: {}", binding.team, code.as_str()),
+            format!("{} pull from {label} failed: {}", binding.scope(), code.as_str()),
         ),
         code,
         automatic_full,
@@ -338,11 +338,11 @@ fn pull_completed(binding: &TrackerBinding, now: DateTime<Utc>, through: Option<
     Event::PullCompleted {
         common: local_common(
             binding,
-            format!("wardwell:pull_completed:{}:{}", binding.team, now.to_rfc3339()),
-            &binding.team,
-            &binding.team,
+            format!("wardwell:pull_completed:{}:{}", binding.scope(), now.to_rfc3339()),
+            binding.scope(),
+            binding.scope(),
             now,
-            format!("{} pull from {label} completed through {upto}", binding.team),
+            format!("{} pull from {label} completed through {upto}", binding.scope()),
         ),
         through,
     }
@@ -378,11 +378,11 @@ fn resync_markers(
     markers.push(Event::FullResync {
         common: local_common(
             binding,
-            format!("wardwell:full_resync:{}:{stamp}", binding.team),
-            &binding.team,
-            &binding.team,
+            format!("wardwell:full_resync:{}:{stamp}", binding.scope()),
+            binding.scope(),
+            binding.scope(),
             now,
-            format!("{} full resync from {label}: {} issues, {removed} removed", binding.team, returned.len()),
+            format!("{} full resync from {label}: {} issues, {removed} removed", binding.scope(), returned.len()),
         ),
         issues: returned.len(),
         removed,
@@ -672,6 +672,85 @@ mod tests {
         let next = fake(vec![]);
         pull_project(vault.path(), &binding(), &next, false, at(15)).unwrap();
         assert_eq!(next.calls.borrow()[0], (Some(at(10) - CURSOR_OVERLAP), false));
+    }
+
+    fn github() -> TrackerBinding {
+        TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "github".into(),
+            team: String::new(),
+            credential: "github".into(),
+            readonly: false,
+            gate: false,
+            repository: Some("acme/app".into()),
+        }
+    }
+
+    /// An event from the GitHub mirror at `hour`.
+    fn merged(number: u32, hour: u32) -> Event {
+        let mut event = snapshot(&format!("PR-{number}"), hour);
+        if let Event::IssueUpserted { common, .. } = &mut event {
+            common.id = format!("github:acme/app#{number}");
+            common.provider = "github".into();
+        }
+        event
+    }
+
+    #[test]
+    fn linear_and_github_events_interleave_and_each_cursor_advances_on_its_own() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let linear = |events| pull_project(vault.path(), &binding(), &fake(events), false, at(12)).unwrap();
+        linear(vec![snapshot("COR-1", 9)]);
+        // GitHub writes newer events and its own marker after Linear's.
+        pull_project(vault.path(), &github(), &fake(vec![merged(7, 11)]), false, at(13)).unwrap();
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(9)), "a github marker does not move the linear cursor");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(11)));
+
+        let next_linear = fake(vec![snapshot("COR-2", 14)]);
+        pull_project(vault.path(), &binding(), &next_linear, false, at(15)).unwrap();
+        assert_eq!(next_linear.calls.borrow()[0], (Some(at(9) - CURSOR_OVERLAP), false), "linear resumes from its own marker");
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(14)));
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(11)), "a linear marker does not move the github cursor");
+
+        let next_github = fake(vec![merged(7, 11), merged(8, 16)]);
+        let outcome = pull_project(vault.path(), &github(), &next_github, false, at(17)).unwrap();
+        assert_eq!(next_github.calls.borrow()[0], (Some(at(11) - CURSOR_OVERLAP), false), "github resumes from its own marker");
+        assert_eq!(outcome.appended, 1, "the overlap re-pull of #7 is deduplicated");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(16)));
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(14)));
+    }
+
+    #[test]
+    fn a_failure_of_one_provider_is_not_the_other_providers_failure() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        pull_project(vault.path(), &binding(), &fake(vec![snapshot("COR-1", 9)]), false, at(12)).unwrap();
+        let broken = FakeAdapter { pages: vec![], fail_after: Some("GitHub request failed"), calls: RefCell::new(vec![]) };
+        pull_project(vault.path(), &github(), &broken, false, at(13)).unwrap_err();
+        let linear = log::read_for(&path, "linear").unwrap();
+        assert_eq!(linear.last_failure, None);
+        assert_eq!(linear.last_pull_at, Some(at(12)));
+        let github = log::read_for(&path, "github").unwrap();
+        assert_eq!(github.last_failure, Some((at(13), FailureCode::Provider)));
+        assert_eq!(github.last_pull_at, None);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"id\":\"wardwell:pull_failed:acme/app:"), "the github marker names its repository: {content}");
+    }
+
+    #[test]
+    fn a_marker_without_a_provider_counts_as_linear() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = r#"{"kind":"pull_completed","id":"p1","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T10:00:00Z","title":"COR pull","through":"2026-09-01T09:00:00Z"}"#;
+        std::fs::write(&path, format!("{}\n{old}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(9)));
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, None);
+        let next = fake(vec![]);
+        pull_project(vault.path(), &binding(), &next, false, at(12)).unwrap();
+        assert_eq!(next.calls.borrow()[0], (Some(at(9) - CURSOR_OVERLAP), false));
     }
 
     #[test]

@@ -28,6 +28,9 @@ pub const RAW_SCHEMA_HEADER: &str = r#"{"_schema":"tracker_raw","_version":"1.0"
 pub struct Common {
     /// Stable dedup key: provider + entity id + the entity's update time.
     pub id: String,
+    /// Rows written before a second provider existed may lack it; they are
+    /// Linear's.
+    #[serde(default = "default_provider")]
     pub provider: String,
     /// Human key, e.g. `COR-12`.
     pub external_key: String,
@@ -42,6 +45,10 @@ pub struct Common {
     /// sidecar); rows written before the sidecar may still carry it inline.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub raw: Value,
+}
+
+fn default_provider() -> String {
+    "linear".to_string()
 }
 
 /// One entry in the tracker log.
