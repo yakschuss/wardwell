@@ -41,6 +41,7 @@ fn a_staging_failure_prints_no_outcome_before_nothing_was_written() {
         .env("HOME", &home)
         .env("WARDWELL_CONFIG_DIR", &cfg)
         .env("PATH", &stub)
+        .env("WARDWELL_GH_CANDIDATES", "")
         .output()
         .unwrap();
     std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -52,4 +53,59 @@ fn a_staging_failure_prints_no_outcome_before_nothing_was_written() {
     assert_eq!(std::fs::read_to_string(&desktop).unwrap(), "{}");
     assert_eq!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(), "{}");
     assert!(!root.join("launchctl.log").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_github_binding_without_gh_or_a_token_sets_up_and_doctor_names_the_connect_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let cfg = root.join("cfg");
+    let stub = root.join("stub");
+    for dir in [home.join(".claude"), cfg.clone(), stub.clone(), root.join("vault/work/claims")] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    script(&stub.join("launchctl"), &format!("#!/bin/sh\necho \"$*\" >> '{}'\n", root.join("launchctl.log").display()));
+    script(&stub.join("id"), "#!/bin/sh\necho 501\n");
+    std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+    std::fs::write(cfg.join("config.yml"), format!(
+        "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: github\n      repository: acme/app\n",
+        root.join("vault").display()
+    )).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wardwell"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("WARDWELL_CONFIG_DIR", &cfg)
+            .env("PATH", &stub)
+            .env("WARDWELL_GH_CANDIDATES", "")
+            .output()
+            .unwrap()
+    };
+    let setup = run(&["setup", "--yes"]);
+    let text = format!("{}{}", String::from_utf8_lossy(&setup.stdout), String::from_utf8_lossy(&setup.stderr));
+    assert!(setup.status.success(), "{text}");
+    assert!(!stub.join("gh").exists());
+
+    let doctor = run(&["doctor"]);
+    let text = format!("{}{}", String::from_utf8_lossy(&doctor.stdout), String::from_utf8_lossy(&doctor.stderr));
+    assert!(text.contains("github: unreachable, run `wardwell tracker connect github`"), "{text}");
+
+    // A gh at a fixed candidate path is found though PATH lacks it.
+    let candidate = root.join("homebrew/gh");
+    std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+    script(&candidate, "#!/bin/sh\nexit 1\n");
+    let doctor = Command::new(env!("CARGO_BIN_EXE_wardwell"))
+        .arg("doctor")
+        .env_clear()
+        .env("HOME", &home)
+        .env("WARDWELL_CONFIG_DIR", &cfg)
+        .env("PATH", &stub)
+        .env("WARDWELL_GH_CANDIDATES", &candidate)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&doctor.stdout).to_string();
+    assert!(text.contains("Tracker work/claims github             \u{2713} gh found or a token stored"), "{text}");
 }

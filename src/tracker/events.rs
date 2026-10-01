@@ -28,6 +28,9 @@ pub const RAW_SCHEMA_HEADER: &str = r#"{"_schema":"tracker_raw","_version":"1.0"
 pub struct Common {
     /// Stable dedup key: provider + entity id + the entity's update time.
     pub id: String,
+    /// Rows written before a second provider existed may lack it; they are
+    /// Linear's.
+    #[serde(default = "default_provider")]
     pub provider: String,
     /// Human key, e.g. `COR-12`.
     pub external_key: String,
@@ -42,6 +45,10 @@ pub struct Common {
     /// sidecar); rows written before the sidecar may still carry it inline.
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub raw: Value,
+}
+
+fn default_provider() -> String {
+    "linear".to_string()
 }
 
 /// One entry in the tracker log.
@@ -71,6 +78,12 @@ pub enum Event {
         url: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         link_title: Option<String>,
+    },
+    /// A change merged into a repository, such as a merged pull request.
+    ChangeMerged {
+        #[serde(flatten)]
+        common: Common,
+        change: Box<MergedChange>,
     },
     /// Emitted by a full resync for an issue the tracker no longer returns.
     IssueRemoved {
@@ -164,11 +177,48 @@ impl Event {
             | Event::CommentUpserted { common, .. }
             | Event::StateChanged { common, .. }
             | Event::LinkAdded { common, .. }
+            | Event::ChangeMerged { common, .. }
             | Event::IssueRemoved { common }
             | Event::FullResync { common, .. }
             | Event::PullCompleted { common, .. }
             | Event::PullFailed { common, .. } => common,
         }
+    }
+}
+
+/// A merged change as Wardwell holds it. The event's `occurred_at` is the
+/// pull request's update time when it was read, for the first event and for
+/// every revision alike; `merged_at` holds the merge time. The update time
+/// is never earlier than the merge time.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MergedChange {
+    /// The change's number in its repository.
+    pub number: u64,
+    /// The change's own title.
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub merged_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The branch the change merged into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Ticket keys in the title, in the pattern search quotes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+}
+
+impl MergedChange {
+    /// Short stable fingerprint of what a reader of the change sees: the
+    /// title, the body and the keys. An update that leaves them alone, such
+    /// as a new comment, keeps it.
+    pub fn content_digest(&self) -> String {
+        let canonical = serde_json::json!([self.title, self.body, self.keys]);
+        let digest = sha2::Sha256::digest(canonical.to_string().as_bytes());
+        digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
     }
 }
 
@@ -362,6 +412,19 @@ mod tests {
             Event::CommentUpserted { common: common("b"), body: "looks wrong".into() },
             Event::StateChanged { common: common("c"), from: None, to: "Todo".into() },
             Event::LinkAdded { common: common("d"), url: "https://example.com".into(), link_title: Some("PR".into()) },
+            Event::ChangeMerged {
+                common: common("m"),
+                change: Box::new(MergedChange {
+                    number: 42,
+                    title: "COR-12 Fix the claims inbox".into(),
+                    body: Some("Body".into()),
+                    author: Some("jdoe".into()),
+                    merged_at: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap(),
+                    url: Some("https://github.com/acme/app/pull/42".into()),
+                    base_branch: Some("main".into()),
+                    keys: vec!["COR-12".into()],
+                }),
+            },
             Event::IssueRemoved { common: common("e") },
             Event::FullResync { common: common("f"), issues: 3, removed: 1, through: None },
             Event::PullCompleted { common: common("g"), through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },

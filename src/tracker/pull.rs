@@ -9,8 +9,9 @@ use crate::config::loader::TrackerBinding;
 use crate::tracker::adapter::Adapter;
 use crate::tracker::credential::{self, Credential};
 use crate::tracker::events::{Common, Event, FailureCode};
+use crate::tracker::github::{GhRunner, GitHub, HttpRest, Rest, SystemGh};
 use crate::tracker::linear::{HttpTransport, Linear};
-use crate::tracker::{lock, log, provider_label};
+use crate::tracker::{GITHUB, lock, log, provider_label};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::collections::HashSet;
 use std::path::Path;
@@ -101,17 +102,41 @@ pub struct PullOutcome {
     pub failed_full: Option<PullError>,
 }
 
-/// Builds the adapter for a binding. Injected so tests never reach a network.
-pub type Connect<'a> = dyn Fn(&TrackerBinding, &Credential) -> Result<Box<dyn Adapter>, String> + 'a;
+/// Builds the adapter for a binding from its credential, None when the
+/// binding's provider can read without one and none is stored. Injected so
+/// tests never reach a network or start a process.
+pub type Connect<'a> = dyn Fn(&TrackerBinding, Option<&Credential>) -> Result<Box<dyn Adapter>, String> + 'a;
 
 /// The production adapter for a binding's provider.
-pub fn connect_provider(binding: &TrackerBinding, credential: &Credential) -> Result<Box<dyn Adapter>, String> {
-    match binding.provider.as_str() {
-        "linear" => Ok(Box::new(Linear::new(
+pub fn connect_provider(binding: &TrackerBinding, credential: Option<&Credential>) -> Result<Box<dyn Adapter>, String> {
+    match (binding.provider.as_str(), credential) {
+        ("linear", Some(credential)) => Ok(Box::new(Linear::new(
             HttpTransport::new(credential.token().to_string()),
             &binding.team,
         ))),
-        other => Err(format!("unsupported tracker provider '{other}'")),
+        ("linear", None) => Err("a linear binding needs its credential".to_string()),
+        (GITHUB, credential) => Ok(Box::new(github_for(binding, credential, Box::new(SystemGh::located())))),
+        (other, _) => Err(format!("unsupported tracker provider '{other}'")),
+    }
+}
+
+/// The GitHub adapter for a binding: it reads through `gh`, and through the REST API
+/// when a token is stored.
+pub fn github_for(binding: &TrackerBinding, credential: Option<&Credential>, gh: Box<dyn GhRunner>) -> GitHub {
+    let rest = credential.map(|c| Box::new(HttpRest::new(c.token().to_string())) as Box<dyn Rest>);
+    GitHub::new(binding.scope(), &binding.credential, gh, rest)
+}
+
+/// The binding's credential. An issue tracker cannot pull without one; a
+/// provider that can read through another route gets None when none is
+/// stored. A stored credential that fails its checks fails either way.
+pub fn load_credential(config_dir: &Path, binding: &TrackerBinding) -> Result<Option<Credential>, PullError> {
+    let failed = |message| PullError::new(FailureCode::Credential, message);
+    let path = credential::path_in(config_dir, &binding.credential).map_err(failed)?;
+    let optional = !crate::tracker::mirrors_issues(&binding.provider);
+    match (optional, std::fs::symlink_metadata(&path).is_err()) {
+        (true, true) => Ok(None),
+        _ => credential::load(&path).map(Some).map_err(failed),
     }
 }
 
@@ -146,12 +171,11 @@ pub fn pull_binding(
     connect: &Connect<'_>,
 ) -> Result<PullOutcome, PullError> {
     let wait = lock::DEFAULT_WAIT;
-    let credential = credential::path_in(config_dir, &binding.credential)
-        .and_then(|path| credential::load(&path))
-        .map_err(|message| PullError::new(FailureCode::Credential, message))?;
-    let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
-    let resync_due = match mode {
-        Mode::Incremental => resync_due(vault_root, binding, now)?,
+    let credential = load_credential(config_dir, binding)?;
+    let adapter = connect(binding, credential.as_ref()).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
+    // Merged changes are never removed, so their mirror needs no resync.
+    let resync_due = match (mode, crate::tracker::mirrors_issues(&binding.provider)) {
+        (Mode::Incremental, true) => resync_due(vault_root, binding, now)?,
         _ => None,
     };
     let Some(due) = resync_due else {
@@ -171,7 +195,7 @@ pub fn pull_binding(
 /// Whether the binding's log is due a full resync at `now`.
 fn resync_due(vault_root: &Path, binding: &TrackerBinding, now: DateTime<Utc>) -> Result<Option<ResyncDue>, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let summary = log::read_for(&path, &binding.provider).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
     Ok(ResyncDue::check(&summary, now))
 }
 
@@ -228,10 +252,8 @@ pub fn pull_binding_held(
     connect: &Connect<'_>,
     lock: &lock::ProjectLock,
 ) -> Result<PullOutcome, PullError> {
-    let credential = credential::path_in(config_dir, &binding.credential)
-        .and_then(|path| credential::load(&path))
-        .map_err(|message| PullError::new(FailureCode::Credential, message))?;
-    let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
+    let credential = load_credential(config_dir, binding)?;
+    let adapter = connect(binding, credential.as_ref()).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock)
 }
@@ -246,7 +268,7 @@ fn pull_held(
     now: DateTime<Utc>,
     _lock: &lock::ProjectLock,
 ) -> Result<PullOutcome, PullError> {
-    let mut summary = log::read(path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let mut summary = log::read_for(path, &binding.provider).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
     let result = pull_locked(path, binding, adapter, mode, now, &mut summary);
     if let Err(error) = &result {
         let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
@@ -282,10 +304,11 @@ fn pull_locked(
         Ok(())
     });
     pulled.map_err(|message| {
-        let code = match (write_failed, message.contains(crate::tracker::adapter::AUTH_REFUSED)) {
-            (true, _) => FailureCode::LogWrite,
-            (false, true) => FailureCode::Auth,
-            (false, false) => FailureCode::Provider,
+        let code = match (write_failed, message.contains(crate::tracker::adapter::AUTH_REFUSED), message.contains(crate::tracker::adapter::UNREACHABLE)) {
+            (true, _, _) => FailureCode::LogWrite,
+            (false, true, _) => FailureCode::Auth,
+            (false, false, true) => FailureCode::Credential,
+            (false, false, false) => FailureCode::Provider,
         };
         PullError::new(code, message)
     })?;
@@ -318,13 +341,13 @@ fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode, 
         common: local_common(
             binding,
             match automatic_full {
-                true => format!("wardwell:pull_failed:{}:{}:automatic_full", binding.team, now.to_rfc3339()),
-                false => format!("wardwell:pull_failed:{}:{}", binding.team, now.to_rfc3339()),
+                true => format!("wardwell:pull_failed:{}:{}:automatic_full", binding.scope(), now.to_rfc3339()),
+                false => format!("wardwell:pull_failed:{}:{}", binding.scope(), now.to_rfc3339()),
             },
-            &binding.team,
-            &binding.team,
+            binding.scope(),
+            binding.scope(),
             now,
-            format!("{} pull from {label} failed: {}", binding.team, code.as_str()),
+            format!("{} pull from {label} failed: {}", binding.scope(), code.as_str()),
         ),
         code,
         automatic_full,
@@ -338,11 +361,11 @@ fn pull_completed(binding: &TrackerBinding, now: DateTime<Utc>, through: Option<
     Event::PullCompleted {
         common: local_common(
             binding,
-            format!("wardwell:pull_completed:{}:{}", binding.team, now.to_rfc3339()),
-            &binding.team,
-            &binding.team,
+            format!("wardwell:pull_completed:{}:{}", binding.scope(), now.to_rfc3339()),
+            binding.scope(),
+            binding.scope(),
             now,
-            format!("{} pull from {label} completed through {upto}", binding.team),
+            format!("{} pull from {label} completed through {upto}", binding.scope()),
         ),
         through,
     }
@@ -378,11 +401,14 @@ fn resync_markers(
     markers.push(Event::FullResync {
         common: local_common(
             binding,
-            format!("wardwell:full_resync:{}:{stamp}", binding.team),
-            &binding.team,
-            &binding.team,
+            format!("wardwell:full_resync:{}:{stamp}", binding.scope()),
+            binding.scope(),
+            binding.scope(),
             now,
-            format!("{} full resync from {label}: {} issues, {removed} removed", binding.team, returned.len()),
+            format!("{} full resync from {label}: {} {}, {removed} removed", binding.scope(), returned.len(), match crate::tracker::mirrors_issues(&binding.provider) {
+                true => "issues",
+                false => "changes",
+            }),
         ),
         issues: returned.len(),
         removed,
@@ -404,10 +430,12 @@ fn local_common(binding: &TrackerBinding, id: String, key: &str, external_id: &s
     }
 }
 
+/// Keys of the issues and changes a page returned. Only issue keys can be
+/// open, so only they can be removed.
 fn upserted_keys(events: &[Event]) -> impl Iterator<Item = String> + '_ {
     events
         .iter()
-        .filter(|e| matches!(e, Event::IssueUpserted { .. }))
+        .filter(|e| matches!(e, Event::IssueUpserted { .. } | Event::ChangeMerged { .. }))
         .map(|e| e.common().external_key.clone())
 }
 
@@ -481,6 +509,7 @@ mod tests {
             credential: "corr-linear".into(),
             readonly: true,
             gate: false,
+            repository: None,
         }
     }
 
@@ -673,6 +702,470 @@ mod tests {
         assert_eq!(next.calls.borrow()[0], (Some(at(10) - CURSOR_OVERLAP), false));
     }
 
+    fn github() -> TrackerBinding {
+        TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "github".into(),
+            team: String::new(),
+            credential: "github".into(),
+            readonly: false,
+            gate: false,
+            repository: Some("acme/app".into()),
+        }
+    }
+
+    /// A change the GitHub mirror saw merged at `hour`.
+    fn merged(number: u64, hour: u32) -> Event {
+        Event::ChangeMerged {
+            common: Common {
+                id: format!("github:acme/app#{number}"),
+                provider: "github".into(),
+                external_key: format!("acme/app#{number}"),
+                external_id: format!("PR_{number}"),
+                actor: Some("jdoe".into()),
+                occurred_at: at(hour),
+                title: format!("acme/app#{number} merged into main: COR-{number} change"),
+                raw: serde_json::Value::Null,
+            },
+            change: Box::new(crate::tracker::events::MergedChange { number, merged_at: at(hour), ..Default::default() }),
+        }
+    }
+
+    #[test]
+    fn linear_and_github_events_interleave_and_each_cursor_advances_on_its_own() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let linear = |events| pull_project(vault.path(), &binding(), &fake(events), false, at(12)).unwrap();
+        linear(vec![snapshot("COR-1", 9)]);
+        // GitHub writes newer events and its own marker after Linear's.
+        pull_project(vault.path(), &github(), &fake(vec![merged(7, 11)]), false, at(13)).unwrap();
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(9)), "a github marker does not move the linear cursor");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(11)));
+
+        let next_linear = fake(vec![snapshot("COR-2", 14)]);
+        pull_project(vault.path(), &binding(), &next_linear, false, at(15)).unwrap();
+        assert_eq!(next_linear.calls.borrow()[0], (Some(at(9) - CURSOR_OVERLAP), false), "linear resumes from its own marker");
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(14)));
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(11)), "a linear marker does not move the github cursor");
+
+        let next_github = fake(vec![merged(7, 11), merged(8, 16)]);
+        let outcome = pull_project(vault.path(), &github(), &next_github, false, at(17)).unwrap();
+        assert_eq!(next_github.calls.borrow()[0], (Some(at(11) - CURSOR_OVERLAP), false), "github resumes from its own marker");
+        assert_eq!(outcome.appended, 1, "the overlap re-pull of #7 is deduplicated");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(16)));
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(14)));
+    }
+
+    fn github_adapter(outcome: crate::tracker::github::GhOutcome) -> GitHub {
+        let (gh, _) = crate::tracker::github::tests::gh_with(outcome);
+        github_for(&github(), None, gh)
+    }
+
+    fn gh_output(nodes: Vec<serde_json::Value>) -> crate::tracker::github::GhOutcome {
+        crate::tracker::github::GhOutcome::Output(serde_json::to_vec(&nodes).unwrap())
+    }
+
+    #[test]
+    fn a_re_pull_of_an_unchanged_pull_request_appends_nothing_and_raw_goes_to_the_sidecar() {
+        use crate::tracker::github::tests::gh_node;
+        let vault = tempfile::tempdir().unwrap();
+        let nodes = || gh_output(vec![gh_node(42, "COR-12 Fix the inbox", 10), gh_node(41, "Bump deps", 9)]);
+        let first = pull_project(vault.path(), &github(), &github_adapter(nodes()), false, at(12)).unwrap();
+        assert_eq!(first.appended, 2);
+        let again = pull_project(vault.path(), &github(), &github_adapter(nodes()), false, at(13)).unwrap();
+        assert_eq!(again.appended, 0, "same pull requests, same ids");
+        let again = pull_project(vault.path(), &github(), &github_adapter(nodes()), true, at(14)).unwrap();
+        assert_eq!((again.appended, again.removed), (0, 0), "a full re-pull appends only its marker");
+
+        let path = log::path_for(vault.path(), "work", "claims");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("\"raw\""), "{content}");
+        assert_eq!(content.matches("\"kind\":\"change_merged\"").count(), 2, "{content}");
+        assert!(content.contains("acme/app full resync from GitHub: 2 changes, 0 removed"), "{content}");
+        let raws = log::read_raw(&log::raw_path_for(&path)).unwrap();
+        assert_eq!(raws["github:acme/app#42"]["title"], "COR-12 Fix the inbox");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(at(10)));
+    }
+
+    /// Minute `m` after 2026-09-01T00:00:00Z.
+    fn minute(m: i64) -> DateTime<Utc> {
+        at(0) + TimeDelta::minutes(m)
+    }
+
+    fn dataset_adapter(gh: crate::tracker::github::tests::DatasetGh) -> GitHub {
+        github_for(&github(), None, Box::new(gh))
+    }
+
+    /// Chunk headings the real index returns for `query` over the vault.
+    fn search(vault: &Path, query: &str) -> Vec<String> {
+        let store = crate::index::store::IndexStore::in_memory().unwrap();
+        crate::index::builder::IndexBuilder::full_build(&store, vault, None).unwrap();
+        store.chunk_fts_search(query, 20, None).unwrap().into_iter().filter_map(|(id, _)| store.get_chunk(&id).ok().and_then(|c| c.2)).collect()
+    }
+
+    #[test]
+    fn a_pull_request_retitled_after_merge_gains_its_new_key_and_search_finds_it() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let (gh, nodes, replies) = DatasetGh::new(vec![pr(42, "Fix the claims inbox", "Body", minute(10), minute(10))]);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(minute(10)));
+
+        nodes.borrow_mut()[0] = pr(42, "COR-77 Fix the claims inbox", "Body", minute(10), minute(90));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: replies.clone(), ..Default::default() };
+        let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(100)).unwrap();
+        assert_eq!(outcome.appended, 1, "the retitle is a new revision");
+        assert!(replies.borrow().last().unwrap().0.join(" ").contains("--search is:merged updated:>=2026-08-31T23:10:00Z sort:updated-desc"), "{:?}", replies.borrow());
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.cursor, Some(minute(90)), "the cursor is the newest update time");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"id\":\"github:acme/app#42:rev:"), "{content}");
+        assert!(content.contains("\"keys\":[\"COR-77\"]"), "{content}");
+        let found = search(vault.path(), "COR-77");
+        assert_eq!(found, vec!["acme/app#42 merged into main: COR-77 Fix the claims inbox; revision updated 2026-09-01T01:30:00Z"]);
+    }
+
+    #[test]
+    fn search_returns_every_revision_and_each_heading_shows_its_update_time() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let titles = [("COR-12 Fix the claims inbox", 10), ("COR-77 Fix the claims inbox", 90), ("COR-12 Fix the claims inbox", 200)];
+        for (title, updated) in titles {
+            let (gh, _, _) = DatasetGh::new(vec![pr(42, title, "Body", minute(10), minute(updated))]);
+            pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(updated + 5)).unwrap();
+        }
+        assert_eq!(
+            search(vault.path(), "COR-77"),
+            vec!["acme/app#42 merged into main: COR-77 Fix the claims inbox; revision updated 2026-09-01T01:30:00Z"],
+            "an earlier revision, older than the current one at 03:20"
+        );
+        let mut current = search(vault.path(), "COR-12");
+        current.sort();
+        assert_eq!(current, vec![
+            "acme/app#42 merged into main: COR-12 Fix the claims inbox",
+            "acme/app#42 merged into main: COR-12 Fix the claims inbox; revision updated 2026-09-01T03:20:00Z",
+        ]);
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12"]);
+    }
+
+    #[test]
+    fn a_comment_only_update_appends_nothing_and_full_repairs_keys() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let (gh, nodes, _) = DatasetGh::new(vec![pr(42, "COR-12 Fix", "Body", minute(10), minute(10))]);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
+        nodes.borrow_mut()[0] = pr(42, "COR-12 Fix", "Body", minute(10), minute(50));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(60)).unwrap();
+        assert_eq!(outcome.appended, 0, "a comment moves the update time, not the content");
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, Some(minute(50)));
+
+        // Keys behind the cursor, as an earlier build parsed them, are out
+        // of reach of an incremental pull; --full repairs them.
+        nodes.borrow_mut().push(pr(43, "Later", "Body", minute(300), minute(300)));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(310)).unwrap();
+        nodes.borrow_mut()[0] = pr(42, "COR-12 COR-13 Fix", "Body", minute(10), minute(50));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        let missed = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(320)).unwrap();
+        assert_eq!(missed.appended, 0);
+        assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12"]);
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        let full = pull_project(vault.path(), &github(), &dataset_adapter(gh), true, minute(330)).unwrap();
+        assert_eq!(full.appended, 1);
+        assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12", "COR-13"]);
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        assert_eq!(pull_project(vault.path(), &github(), &dataset_adapter(gh), true, minute(340)).unwrap().appended, 0);
+    }
+
+    #[test]
+    fn the_first_pull_of_200_then_an_incremental_pull_leaves_nothing_after_its_oldest_row_unmirrored() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let rows: Vec<serde_json::Value> = (1..=300).map(|n| pr(n, &format!("Change {n}"), "Body", minute(n as i64), minute(n as i64))).collect();
+        let (gh, nodes, _) = DatasetGh::new(rows);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(400)).unwrap();
+        let oldest = minute(101);
+        assert_eq!(log::read_for(&path, "github").unwrap().changes.len(), 200);
+
+        // After the first pull: an old one is edited, a mirrored one is edited, a new one merges.
+        nodes.borrow_mut()[49] = pr(50, "COR-50 Change 50", "Body", minute(50), minute(500));
+        nodes.borrow_mut()[199] = pr(200, "Change 200", "New body", minute(200), minute(501));
+        nodes.borrow_mut().push(pr(301, "Change 301", "Body", minute(502), minute(502)));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(600)).unwrap();
+
+        let mirrored = log::read_for(&path, "github").unwrap().changes;
+        for node in nodes.borrow().iter() {
+            let updated = DateTime::parse_from_rfc3339(node["updatedAt"].as_str().unwrap()).unwrap().with_timezone(&Utc);
+            let key = format!("acme/app#{}", node["number"]);
+            if updated >= oldest {
+                let latest = &mirrored.get(&key).unwrap_or_else(|| panic!("{key} is not mirrored"));
+                assert_eq!(latest.title, node["title"].as_str().unwrap(), "{key}");
+                assert_eq!(latest.body.as_deref(), node["body"].as_str(), "{key}");
+            }
+        }
+    }
+
+    /// A log with #1 pulled at minute 10, and 400 more merged pull requests
+    /// updated one a minute from minute 20.
+    fn cursor_then_400(vault: &Path) -> std::rc::Rc<RefCell<Vec<serde_json::Value>>> {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let (gh, nodes, _) = DatasetGh::new(vec![pr(1, "One", "Body", minute(10), minute(10))]);
+        pull_project(vault, &github(), &dataset_adapter(gh), false, minute(15)).unwrap();
+        nodes.borrow_mut().extend((2..=401).map(|n| pr(n, "Change", "Body", minute(n as i64 + 18), minute(n as i64 + 18))));
+        nodes
+    }
+
+    #[test]
+    fn a_failure_on_the_fifth_window_keeps_four_windows_of_rows_and_the_next_pull_appends_the_rest() {
+        use crate::tracker::github::tests::DatasetGh;
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let nodes = cursor_then_400(vault.path());
+        let replies = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let failing = DatasetGh { nodes: nodes.clone(), replies: replies.clone(), fail_window: Some(5), ..Default::default() };
+        let error = pull_project(vault.path(), &github(), &dataset_adapter(failing), false, minute(500)).unwrap_err();
+        assert_eq!((error.message.as_str(), error.code), ("gh exited with status 1", FailureCode::Provider));
+        let windows: Vec<usize> = replies.borrow().iter().map(|(_, rows, _)| *rows).filter(|rows| (1..100).contains(rows)).collect();
+        assert_eq!(windows.len(), 4, "{:?}", replies.borrow().iter().map(|r| r.1).collect::<Vec<_>>());
+        let kept: usize = windows.iter().sum();
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.changes.len(), 1 + kept, "the first four windows' rows are in the log");
+        assert_eq!((summary.cursor, summary.last_pull_at), (Some(minute(10)), Some(minute(15))), "no marker");
+
+        let gh = DatasetGh { nodes: nodes.clone(), ..Default::default() };
+        let outcome = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(510)).unwrap();
+        assert_eq!(outcome.appended, 400 - kept, "only the rest");
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.changes.len(), 401);
+        assert_eq!(summary.last_pull_at, Some(minute(510)));
+    }
+
+    #[test]
+    fn the_budget_stops_a_slow_read_keeps_its_rows_and_releases_the_lock() {
+        use crate::tracker::github::tests::DatasetGh;
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let nodes = cursor_then_400(vault.path());
+        let slow = DatasetGh { nodes: nodes.clone(), delay: Duration::from_millis(250), ..Default::default() };
+        let adapter = dataset_adapter(slow).with_budget(Duration::from_secs(2));
+        let started = std::time::Instant::now();
+        let error = pull_project(vault.path(), &github(), &adapter, false, minute(500)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        assert_eq!(
+            (error.message.as_str(), error.code),
+            ("the read did not finish in 2 seconds; rows read so far are kept; run the pull again", FailureCode::Provider)
+        );
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.last_pull_at, Some(minute(15)), "no marker");
+        assert_eq!(summary.last_failure.map(|(_, c)| c), Some(FailureCode::Provider));
+        lock::acquire(&path, lock::TEST_FREE_WAIT).unwrap();
+    }
+
+    #[test]
+    fn a_gh_reply_at_the_limit_in_one_second_writes_no_pull_completed() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let (gh, nodes, _) = DatasetGh::new(vec![pr(1, "One", "Body", minute(10), minute(10))]);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
+        nodes.borrow_mut().extend((2..=101).map(|n| pr(n, "Same second", "Body", minute(30), minute(40))));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default(), ..Default::default() };
+        let error = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(50)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Provider, "{error}");
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!((summary.cursor, summary.last_pull_at), (Some(minute(10)), Some(minute(20))), "no pull_completed");
+    }
+
+    #[test]
+    fn a_full_github_pull_never_removes_linear_issues_in_the_same_log() {
+        let vault = tempfile::tempdir().unwrap();
+        pull_project(vault.path(), &binding(), &fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9)]), true, at(10)).unwrap();
+        let outcome = pull_project(vault.path(), &github(), &github_adapter(gh_output(vec![])), true, at(11)).unwrap();
+        assert_eq!(outcome.removed, 0);
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "linear").unwrap().open_issues.len(), 2);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("issue_removed"));
+    }
+
+    #[test]
+    fn a_github_binding_pulls_without_a_stored_token_and_never_runs_an_automatic_full() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let seen = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let adapter = std::rc::Rc::new(fake(vec![merged(7, 9)]));
+        struct Shared(std::rc::Rc<FakeAdapter>);
+        impl Adapter for Shared {
+            fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
+                self.0.pull(since, full, sink)
+            }
+        }
+        let (record, shared) = (seen.clone(), adapter.clone());
+        let connect = move |_: &TrackerBinding, credential: Option<&Credential>| -> Result<Box<dyn Adapter>, String> {
+            record.borrow_mut().push(credential.is_some());
+            Ok(Box::new(Shared(shared.clone())))
+        };
+        let outcome = pull_binding(vault.path(), config.path(), &github(), Mode::Incremental, at(12), &connect).unwrap();
+        assert_eq!((outcome.full, outcome.resync_due), (false, None));
+        let later = at(12) + FULL_RESYNC_MAX_AGE + TimeDelta::hours(1);
+        pull_binding(vault.path(), config.path(), &github(), Mode::Incremental, later, &connect).unwrap();
+        assert_eq!(*adapter.calls.borrow(), vec![(None, false), (Some(at(9) - CURSOR_OVERLAP), false)], "the first pull is the bounded one, then the cursor");
+        assert_eq!(*seen.borrow(), vec![false, false]);
+
+        let path = crate::tracker::credential::path_in(config.path(), "github").unwrap();
+        crate::tracker::credential::save(&path, "ghp_test").unwrap();
+        pull_binding(vault.path(), config.path(), &github(), Mode::Incremental, later, &connect).unwrap();
+        assert_eq!(seen.borrow().last(), Some(&true), "a stored token reaches the adapter");
+    }
+
+    #[test]
+    fn a_token_saved_by_connect_github_reaches_a_github_binding_without_a_credential_field() {
+        let config = tempfile::tempdir().unwrap();
+        assert!(load_credential(config.path(), &github()).unwrap().is_none());
+        let message = crate::tracker::cli::connect(config.path(), "github", "ghp_secret\n").unwrap();
+        assert!(!message.contains("ghp_secret"), "{message}");
+        let stored = load_credential(config.path(), &github()).unwrap().unwrap();
+        assert_eq!(stored.token(), "ghp_secret");
+        assert!(!format!("{stored:?}").contains("ghp_secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_github_token_with_loose_permissions_fails_before_the_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let path = crate::tracker::credential::path_in(config.path(), "github").unwrap();
+        crate::tracker::credential::save(&path, "ghp_test").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let connect = |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
+        let error = pull_binding(vault.path(), config.path(), &github(), Mode::Incremental, at(12), &connect).unwrap_err();
+        assert_eq!(error.code, FailureCode::Credential, "{error}");
+        assert!(!log::path_for(vault.path(), "work", "claims").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_gh_timeout_records_its_failure_and_releases_the_project_lock() {
+        use crate::tracker::github::{SystemGh, tests::stub_gh};
+        let dir = tempfile::tempdir().unwrap();
+        let stub = stub_gh(dir.path(), "sleep 30 &\nsleep 30");
+        let runner = SystemGh::at(Some(stub)).with_limits(Duration::from_secs(1), 1024);
+        let vault = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let error = pull_project(vault.path(), &github(), &github_for(&github(), None, Box::new(runner)), false, at(12)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+        assert_eq!((error.message.as_str(), error.code), ("gh did not finish within 1 seconds", FailureCode::Provider));
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "github").unwrap().last_failure.map(|(_, c)| c), Some(FailureCode::Provider));
+        lock::acquire(&path, lock::TEST_FREE_WAIT).unwrap();
+    }
+
+    #[test]
+    fn a_failing_gh_without_a_token_is_a_provider_failure_with_its_sentence() {
+        use crate::tracker::github::GhOutcome;
+        let cases = [
+            (GhOutcome::Exited(Some(1)), "gh exited with status 1", FailureCode::Provider),
+            (GhOutcome::TimedOut(Duration::from_secs(120)), "gh did not finish within 120 seconds", FailureCode::Provider),
+            (GhOutcome::Oversize(16), "gh output exceeded 16 bytes", FailureCode::Provider),
+            (GhOutcome::Output(b"{}".to_vec()), "gh returned output that is not a list of pull requests", FailureCode::Provider),
+            (GhOutcome::SignedOut, "gh is not signed in; github: unreachable, run `wardwell tracker connect github`", FailureCode::Credential),
+        ];
+        for (outcome, sentence, code) in cases {
+            let vault = tempfile::tempdir().unwrap();
+            let error = pull_project(vault.path(), &github(), &github_adapter(outcome), false, at(12)).unwrap_err();
+            assert_eq!((error.message.as_str(), error.code), (sentence, code));
+            let summary = log::read_for(&log::path_for(vault.path(), "work", "claims"), "github").unwrap();
+            assert_eq!(summary.last_failure, Some((at(12), code)));
+            assert_eq!(summary.last_pull_at, None, "no pull_completed");
+        }
+    }
+
+    #[test]
+    fn neither_gh_nor_a_token_appends_a_credential_marker_without_secrets() {
+        let vault = tempfile::tempdir().unwrap();
+        let error = pull_project(vault.path(), &github(), &github_adapter(crate::tracker::github::GhOutcome::Missing), false, at(12)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Credential);
+        assert_eq!(error.to_string(), "github: unreachable, run `wardwell tracker connect github` (credential)");
+        let path = log::path_for(vault.path(), "work", "claims");
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!(summary.last_failure, Some((at(12), FailureCode::Credential)));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("acme/app pull from GitHub failed: credential"), "{content}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_a_bare_path_the_pull_and_doctor_use_gh_at_a_candidate_path() {
+        use crate::tracker::github::{SystemGh, locate_gh, tests::stub_gh};
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::tracker::github::tests::gh_node(42, "COR-12 Fix the inbox", 10);
+        let stub = stub_gh(&dir.path().join("homebrew"), &format!(
+            "if [ \"$1\" = repo ]; then echo '{{\"nameWithOwner\":\"acme/app\"}}'; exit 0; fi\necho '[{node}]'"
+        ));
+        // PATH is an empty folder made here, never a system folder.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let found = locate_gh(Some(empty.as_os_str()), std::slice::from_ref(&stub));
+        assert_eq!(found.as_deref(), Some(stub.as_path()));
+
+        let vault = tempfile::tempdir().unwrap();
+        let adapter = github_for(&github(), None, Box::new(SystemGh::at(found.clone())));
+        let outcome = pull_project(vault.path(), &github(), &adapter, false, at(12)).unwrap();
+        assert_eq!(outcome.appended, 1);
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "github").unwrap().last_failure, None);
+
+        let config = crate::config::loader::parse(&format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
+            vault.path().display()
+        ))
+        .unwrap();
+        let probe = |b: &TrackerBinding, c: Option<&Credential>| github_for(b, c, Box::new(SystemGh::at(found.clone())));
+        let linear = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn crate::tracker::linear::Transport>, String> { Err("unused".into()) };
+        let (lines, healthy) = crate::tracker::doctor::run_with(&config, dir.path(), &linear, &probe, &Default::default());
+        assert!(healthy, "{lines:?}");
+        assert_eq!(lines[1], "work/claims: github repository acme/app ok through gh");
+        assert_eq!(crate::tracker::doctor::check_offline_with(dir.path(), &config.trackers[0], found.is_some()), Ok(()));
+    }
+
+    #[test]
+    fn a_failure_of_one_provider_is_not_the_other_providers_failure() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        pull_project(vault.path(), &binding(), &fake(vec![snapshot("COR-1", 9)]), false, at(12)).unwrap();
+        let broken = FakeAdapter { pages: vec![], fail_after: Some("GitHub request failed"), calls: RefCell::new(vec![]) };
+        pull_project(vault.path(), &github(), &broken, false, at(13)).unwrap_err();
+        let linear = log::read_for(&path, "linear").unwrap();
+        assert_eq!(linear.last_failure, None);
+        assert_eq!(linear.last_pull_at, Some(at(12)));
+        let github = log::read_for(&path, "github").unwrap();
+        assert_eq!(github.last_failure, Some((at(13), FailureCode::Provider)));
+        assert_eq!(github.last_pull_at, None);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"id\":\"wardwell:pull_failed:acme/app:"), "the github marker names its repository: {content}");
+    }
+
+    #[test]
+    fn a_marker_without_a_provider_counts_as_linear() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = r#"{"kind":"pull_completed","id":"p1","external_key":"COR","external_id":"COR","occurred_at":"2026-09-01T10:00:00Z","title":"COR pull","through":"2026-09-01T09:00:00Z"}"#;
+        std::fs::write(&path, format!("{}\n{old}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+        assert_eq!(log::read_for(&path, "linear").unwrap().cursor, Some(at(9)));
+        assert_eq!(log::read_for(&path, "github").unwrap().cursor, None);
+        let next = fake(vec![]);
+        pull_project(vault.path(), &binding(), &next, false, at(12)).unwrap();
+        assert_eq!(next.calls.borrow()[0], (Some(at(9) - CURSOR_OVERLAP), false));
+    }
+
     #[test]
     fn pull_during_a_held_lock_fails_with_the_closed_code_after_the_wait() {
         let vault = tempfile::tempdir().unwrap();
@@ -731,7 +1224,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
 
         let called = RefCell::new(false);
-        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> {
+        let connect = |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> {
             *called.borrow_mut() = true;
             Ok(Box::new(fake(vec![snapshot("COR-1", 9)])))
         };
@@ -752,7 +1245,7 @@ mod tests {
 
     /// Pull an empty fake through `pull_binding` at `now`.
     fn scheduled_pull(vault: &Path, config: &Path, full: bool, now: DateTime<Utc>) -> PullOutcome {
-        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
+        let connect = |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
         pull_binding(vault, config, &binding(), if full { Mode::Full } else { Mode::Incremental }, now, &connect).unwrap()
     }
 
@@ -789,7 +1282,7 @@ mod tests {
     fn an_incremental_only_pull_never_runs_full_even_when_a_resync_is_due() {
         let vault = tempfile::tempdir().unwrap();
         let config = credential_dir();
-        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![snapshot("COR-1", 9)]))) };
+        let connect = |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![snapshot("COR-1", 9)]))) };
         let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::IncrementalOnly, at(12), &connect).unwrap();
         assert!(!outcome.full);
         assert_eq!(outcome.resync_due, None);
@@ -820,7 +1313,7 @@ mod tests {
                 self.0.pull(since, full, sink)
             }
         }
-        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Shared(shared.clone()))) };
+        let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Shared(shared.clone()))) };
         pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, at(1), &connect).unwrap();
         assert_eq!(adapter.calls.borrow()[0], (None, true));
     }
@@ -861,10 +1354,10 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         let config = credential_dir();
         let three = || fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
-        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(three())) };
+        let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(three())) };
         pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, at(10), &connect).unwrap();
 
-        let empty = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
+        let empty = |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
         let later = at(10) + FULL_RESYNC_MAX_AGE + TimeDelta::hours(1);
         let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, later, &empty).unwrap();
         assert_eq!(outcome.failed_full.map(|e| e.code), Some(FailureCode::EmptyFullResult));
@@ -939,7 +1432,7 @@ mod tests {
 
         let calls = std::rc::Rc::new(RefCell::new(vec![]));
         let shared = calls.clone();
-        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails(shared.clone()))) };
+        let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails(shared.clone()))) };
         let failed = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, hour(25), &connect).unwrap();
         assert_eq!(failed.resync_due, Some(ResyncDue::Stale));
         assert!(!failed.full, "the outcome is the incremental pull's");
@@ -974,7 +1467,7 @@ mod tests {
         let path = crate::tracker::credential::path_in(credential_dir.path(), "x").unwrap();
         crate::tracker::credential::save(&path, "t").unwrap();
         let credential = crate::tracker::credential::load(&path).unwrap();
-        let error = connect_provider(&b, &credential).err().unwrap();
+        let error = connect_provider(&b, Some(&credential)).err().unwrap();
         assert!(error.contains("jira"), "{error}");
     }
 }

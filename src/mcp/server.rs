@@ -39,7 +39,7 @@ pub struct WardwellServer {
 }
 
 /// `pull::Connect`, shareable across the server's clones.
-type TrackerConnect = dyn Fn(&crate::config::loader::TrackerBinding, &crate::tracker::credential::Credential) -> Result<Box<dyn crate::tracker::adapter::Adapter>, String> + Send + Sync;
+type TrackerConnect = dyn Fn(&crate::config::loader::TrackerBinding, Option<&crate::tracker::credential::Credential>) -> Result<Box<dyn crate::tracker::adapter::Adapter>, String> + Send + Sync;
 
 // -- Tool parameter types --
 
@@ -3666,8 +3666,7 @@ impl WardwellServer {
 
     fn named_bindings(&self, p: &KanbanParams) -> Vec<&crate::config::loader::TrackerBinding> {
         self.config
-            .trackers
-            .values()
+            .issue_bindings()
             .filter(|b| p.project.as_deref().is_none_or(|name| b.project == name))
             .filter(|b| p.domain.as_deref().is_none_or(|domain| b.domain == domain))
             .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
@@ -3769,7 +3768,7 @@ impl WardwellServer {
         }
         let now = chrono::Utc::now();
         crate::tracker::refresh::check(&view, now)?;
-        let connect = |b: &crate::config::loader::TrackerBinding, c: &crate::tracker::credential::Credential| (self.tracker_connect)(b, c);
+        let connect = |b: &crate::config::loader::TrackerBinding, c: Option<&crate::tracker::credential::Credential>| (self.tracker_connect)(b, c);
         crate::tracker::pull::pull_binding_held(&self.vault_root, &self.tracker_config_dir, binding, now, &connect, &lock)
             .map(|_| ())
             .map_err(|error| Reason::PullFailed(error.code))
@@ -3777,7 +3776,7 @@ impl WardwellServer {
 
     fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {
         let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
-        crate::tracker::view::MirrorView::read(&path).ok()
+        crate::tracker::view::MirrorView::read_for(&path, &binding.provider).ok()
     }
 
     /// Refusal when a ticket the action names is not a native ticket but an
@@ -3789,8 +3788,7 @@ impl WardwellServer {
             .filter(|key| self.lookup_item_domain(kanban, key).is_none())
             .find_map(|key| {
                 self.config
-                    .trackers
-                    .values()
+                    .issue_bindings()
                     .filter(|b| self.allowed_domains.is_empty() || self.allowed_domains.contains(&b.domain))
                     .filter(|b| self.prefix_collision(b).is_none())
                     .find_map(|b| self.mirror_view(b)?.get(key).map(|issue| crate::tracker::mirrored_key_refusal(&issue.key, b)))

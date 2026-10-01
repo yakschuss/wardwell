@@ -215,6 +215,20 @@ fn is_operator(token: &str) -> bool {
     matches!(token, "OR" | "AND" | "NOT")
 }
 
+/// The ticket keys in `text`, upper-cased, in first-seen order, each once.
+/// The same pattern `match_expression` quotes, so a key found here is a
+/// key a search finds.
+pub fn ticket_keys(text: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')).map(|t| t.trim_matches('-')) {
+        let key = token.to_ascii_uppercase();
+        if is_ticket_key(token) && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
 /// Letters, optional digits, a hyphen, digits: COR-12, CM-317, PROJ2-9.
 fn is_ticket_key(token: &str) -> bool {
     let Some((prefix, number)) = token.split_once('-') else {
@@ -490,6 +504,36 @@ mod tests {
         assert_eq!(match_expression("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(file_hits(&store, "claims inbox").len(), 2, "phrase matches the note and the log");
         assert!(file_hits(&store, "inbox claims").is_empty(), "word order still matters");
+    }
+
+    #[test]
+    fn a_merged_change_is_found_by_its_ticket_key_and_its_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("work").join("claims");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("tracker.jsonl"), crate::tracker::view::two_provider_log()).unwrap();
+        let store = IndexStore::in_memory().unwrap();
+        IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+
+        let by_key = chunk_headings(&store, "COR-1");
+        assert!(by_key.iter().any(|h| h == "acme/app#42 merged into main: COR-1 Fix the claims inbox"), "{by_key:?}");
+        assert!(by_key.iter().any(|h| h.starts_with("COR-1 Claims inbox")), "the issue row too: {by_key:?}");
+        assert_eq!(file_hits(&store, "COR-1")[0].path, "work/claims/tracker.jsonl");
+        for number in ["acme/app#42", "#42"] {
+            let by_number = chunk_headings(&store, number);
+            assert_eq!(by_number, vec!["acme/app#42 merged into main: COR-1 Fix the claims inbox"], "{number}");
+        }
+        assert!(chunk_headings(&store, "acme/app#43").is_empty());
+    }
+
+    #[test]
+    fn ticket_keys_reads_the_keys_a_search_quotes() {
+        assert_eq!(ticket_keys("COR-12: fix inbox (cm-317, COR-12) for PROJ2-9"), vec!["COR-12", "CM-317", "PROJ2-9"]);
+        assert_eq!(ticket_keys("[COR-5] Fix -COR-6- and COR-7-fix"), vec!["COR-5", "COR-6"]);
+        assert!(ticket_keys("Bump serde to 1.0.200").is_empty());
+        for key in ticket_keys("COR-12 and CM-3") {
+            assert_eq!(match_expression(&key), format!("\"{key}\""));
+        }
     }
 
     #[test]

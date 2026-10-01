@@ -14,9 +14,13 @@ const PLAN: &str = "1c7218d7-b953-40a5-b1f0-7ac925adc532";
 const ANSWER: &str = "5a1d29c6-ed59-4694-94b5-0c8d1627b17a";
 
 fn run(dir: &Path, args: &[&str], input: Value) -> Value {
+    let path = dir.join("empty-path");
+    fs::create_dir_all(&path).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_wardwell"))
         .args(args)
         .env("WARDWELL_CONFIG_DIR", dir)
+        .env("PATH", &path)
+        .env("WARDWELL_GH_CANDIDATES", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

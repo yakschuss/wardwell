@@ -23,6 +23,7 @@ pub(super) fn binding(readonly: bool) -> TrackerBinding {
         credential: "corr-linear".into(),
         readonly,
         gate: false,
+        repository: None,
     }
 }
 
@@ -38,8 +39,7 @@ pub(super) fn fixture(events: &[Event], readonly: bool) -> Fixture {
         .unwrap();
     write_mirror(&vault, events);
     let index = Arc::new(crate::index::store::IndexStore::open(&dir.path().join("index.db")).unwrap());
-    let mut trackers = std::collections::BTreeMap::new();
-    trackers.insert("work/claims".to_string(), binding(readonly));
+    let trackers = vec![binding(readonly)];
     let config = crate::config::loader::WardwellConfig {
         vault_path: vault,
         registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
@@ -433,7 +433,7 @@ fn domain_picks_between_two_projects_of_the_same_name() {
     crate::tracker::log::append_new(&personal, &[snapshot("COR-50", "Personal only", "Todo", StateCategory::Unstarted, now), pulled(now - chrono::TimeDelta::hours(1))], &mut summary).unwrap();
     let mut other = binding(true);
     other.domain = "personal".into();
-    Arc::get_mut(&mut f.server.config).unwrap().trackers.insert("personal/claims".into(), other);
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.push(other);
 
     let work_only = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-50", "project": "claims", "domain": "work"}));
     assert_eq!(work_only["refresh_reason"], "still_missing", "{work_only}");
@@ -450,8 +450,7 @@ fn domain_picks_between_two_projects_of_the_same_name() {
 #[test]
 fn two_servers_on_one_vault_share_the_cooldown_through_the_log() {
     let (first, calls) = refresh_fixture(vec![], None);
-    let mut trackers = std::collections::BTreeMap::new();
-    trackers.insert("work/claims".to_string(), binding(true));
+    let trackers = vec![binding(true)];
     let config = crate::config::loader::WardwellConfig {
         vault_path: first.server.vault_root.clone(),
         registry: crate::domain::registry::DomainRegistry::from_domains(vec![]),
@@ -666,7 +665,7 @@ fn a_mirror_only_project_keeps_its_mirror_when_the_team_key_is_the_prefix_it_wou
     let mut intake = binding(true);
     intake.project = "intake".into();
     intake.team = derived.clone();
-    Arc::get_mut(&mut f.server.config).unwrap().trackers.insert("work/intake".to_string(), intake);
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.push(intake);
     std::fs::create_dir_all(f.server.vault_root.join("work/intake")).unwrap();
     let path = crate::tracker::log::path_for(&f.server.vault_root, "work", "intake");
     let mut summary = crate::tracker::log::read(&path).unwrap();
@@ -684,7 +683,7 @@ fn a_mirror_only_project_keeps_its_mirror_when_the_team_key_is_the_prefix_it_wou
 fn a_team_key_equal_to_the_derived_native_prefix_leaves_the_mirror_out_with_a_note() {
     let now = chrono::Utc::now();
     let mut f = fixture(&[], false);
-    Arc::get_mut(&mut f.server.config).unwrap().trackers.get_mut("work/claims").unwrap().team = "CL".into();
+    Arc::get_mut(&mut f.server.config).unwrap().trackers[0].team = "CL".into();
     write_mirror(&f.server.vault_root, &[snapshot("CL-5", "Mirrored five", "In Progress", StateCategory::Started, now), pulled(now)]);
     let sentence = "Tracker team key CL of work/claims equals the native kanban prefix CL of project claims. Set a different native prefix for claims in kanban.prefixes.";
     for args in [
@@ -701,4 +700,44 @@ fn a_team_key_equal_to_the_derived_native_prefix_leaves_the_mirror_out_with_a_no
     assert_eq!(native["item"]["origin"], "kanban");
     let p: KanbanParams = serde_json::from_value(json!({"action": "move", "ticket_id": "CL-1", "status": "done"})).unwrap();
     assert!(f.server.tracker_refusal(f.server.kanban.as_ref().unwrap(), &p).is_none(), "the native ticket stays writable");
+}
+
+/// A change the GitHub mirror of `acme/app` saw merged at `at`, naming COR-12.
+fn merged_change(at: chrono::DateTime<chrono::Utc>) -> Event {
+    let mut common = common("github:acme/app#42", "acme/app#42", at);
+    common.provider = "github".into();
+    common.title = "acme/app#42 merged into main: COR-12 Fix the claims inbox".into();
+    Event::ChangeMerged {
+        common,
+        change: Box::new(crate::tracker::events::MergedChange { number: 42, title: "COR-12 Fix the claims inbox".into(), merged_at: at, keys: vec!["COR-12".into()], ..Default::default() }),
+    }
+}
+
+#[test]
+fn the_kanban_read_path_ignores_merged_changes_and_github_markers() {
+    let now = chrono::Utc::now();
+    let (mut f, calls) = refresh_fixture(vec![], None);
+    let mut github = binding(false);
+    github.provider = "github".into();
+    github.team = String::new();
+    github.repository = Some("acme/app".into());
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.push(github);
+    let mut github_pull = pulled(now);
+    if let Event::PullCompleted { common, .. } = &mut github_pull {
+        common.provider = "github".into();
+        common.id = format!("wardwell:pull_completed:acme/app:{now}");
+    }
+    write_mirror(&f.server.vault_root, &[merged_change(now), github_pull]);
+
+    let listed = kanban(&f.server, json!({"action": "list", "project": "claims"}));
+    assert_eq!(keys(&listed), vec!["CL-1", "COR-12", "COR-14"], "{listed}");
+    assert_eq!(listed["items"][1]["last_pulled_age"], "1 hour ago", "the github marker is not the issue mirror's pull: {listed}");
+    let searched = kanban(&f.server, json!({"action": "search", "query": "claims inbox"}));
+    assert!(!searched.to_string().contains("acme/app#42"), "{searched}");
+    let queried = kanban(&f.server, json!({"action": "query", "question": "in_progress", "project": "claims"}));
+    assert!(!queried.to_string().contains("acme/app#42"), "{queried}");
+
+    let got = kanban(&f.server, json!({"action": "get", "ticket_id": "acme/app#42"}));
+    assert!(got["item"].is_null(), "{got}");
+    assert!(calls.lock().unwrap().is_empty(), "no refresh for a merged change: {got}");
 }

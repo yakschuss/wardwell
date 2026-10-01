@@ -57,6 +57,7 @@ fn uninstall(e: &Env) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_wardwell"))
         .arg("uninstall")
         .env_clear()
+        .env("WARDWELL_GH_CANDIDATES", "")
         .env("HOME", &e.home)
         .env("WARDWELL_CONFIG_DIR", &e.cfg)
         .env("PATH", &e.stub)

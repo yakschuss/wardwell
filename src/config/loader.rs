@@ -43,16 +43,29 @@ pub struct WardwellConfig {
     pub kanban_prefixes: HashMap<String, String>,
     /// Feature flags for optional MCP capabilities.
     pub features: FeatureFlags,
-    /// Tracker mirrors keyed by `<domain>/<project>`.
-    pub trackers: BTreeMap<String, TrackerBinding>,
+    /// Tracker bindings in `<domain>/<project>` order, then in file order
+    /// within a project. At most one per provider per project.
+    pub trackers: Vec<TrackerBinding>,
     /// Working directories mapped to vault projects, keyed by `<domain>/<project>`.
     pub projects: BTreeMap<String, ProjectMapping>,
 }
 
 impl WardwellConfig {
-    /// The tracker binding for a vault project, if one is configured.
+    /// The issue tracker binding of a vault project, if one is configured.
+    /// A binding that mirrors merged changes is not an issue tracker, so the
+    /// kanban read path, the read-only lock, and session start never see it.
     pub fn tracker_for(&self, domain: &str, project: &str) -> Option<&TrackerBinding> {
-        self.trackers.get(&format!("{domain}/{project}"))
+        self.bindings_for(domain, project).into_iter().find(|b| crate::tracker::mirrors_issues(&b.provider))
+    }
+
+    /// Every binding of a vault project, in file order.
+    pub fn bindings_for(&self, domain: &str, project: &str) -> Vec<&TrackerBinding> {
+        self.trackers.iter().filter(|b| b.domain == domain && b.project == project).collect()
+    }
+
+    /// The bindings that mirror issues, the ones kanban and session start read.
+    pub fn issue_bindings(&self) -> impl Iterator<Item = &TrackerBinding> {
+        self.trackers.iter().filter(|b| crate::tracker::mirrors_issues(&b.provider))
     }
 }
 
@@ -63,7 +76,8 @@ pub struct TrackerBinding {
     pub project: String,
     /// Adapter name, e.g. `linear`.
     pub provider: String,
-    /// Provider team key the project mirrors, e.g. `COR`.
+    /// Provider team key the project mirrors, e.g. `COR`. Empty for a
+    /// provider that mirrors a repository.
     pub team: String,
     /// Name of the credential file under `~/.wardwell/trackers/`.
     pub credential: String,
@@ -72,6 +86,21 @@ pub struct TrackerBinding {
     /// When true, `wardwell setup` installs the tracker policy for this
     /// provider: the write gate and the deny list. Optional, off by default.
     pub gate: bool,
+    /// `<owner>/<name>` of the repository a `github` binding mirrors.
+    pub repository: Option<String>,
+}
+
+impl TrackerBinding {
+    /// `<domain>/<project>`, the config key the binding sits under.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.domain, self.project)
+    }
+
+    /// What the binding mirrors at its provider: the repository when it has
+    /// one, else the team key. Names the binding in markers and status lines.
+    pub fn scope(&self) -> &str {
+        self.repository.as_deref().unwrap_or(&self.team)
+    }
 }
 
 /// Maps working directories to one vault project, so a session started in
@@ -130,7 +159,7 @@ struct RawConfig {
     #[serde(default)]
     features: Option<RawFeatureFlags>,
     #[serde(default)]
-    trackers: HashMap<String, RawTrackerBinding>,
+    trackers: BTreeMap<String, serde_yaml::Value>,
     #[serde(default)]
     projects: ProjectEntries,
 }
@@ -169,8 +198,12 @@ struct RawProjectEntry {
 #[derive(Debug, Deserialize)]
 struct RawTrackerBinding {
     provider: String,
-    team: String,
-    credential: String,
+    #[serde(default)]
+    team: Option<String>,
+    #[serde(default)]
+    credential: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
     #[serde(default)]
     readonly: bool,
     #[serde(default)]
@@ -359,43 +392,93 @@ fn project_path(key: &str, raw: &str) -> Result<PathBuf, ConfigError> {
     Ok(path.components().collect())
 }
 
-fn tracker_bindings(
-    raw: HashMap<String, RawTrackerBinding>,
-) -> Result<BTreeMap<String, TrackerBinding>, ConfigError> {
-    let mut bindings = BTreeMap::new();
-    for (key, entry) in raw {
+fn tracker_bindings(raw: BTreeMap<String, serde_yaml::Value>) -> Result<Vec<TrackerBinding>, ConfigError> {
+    let mut bindings = Vec::new();
+    for (key, value) in raw {
         let (domain, project) = split_project_key(&key)?;
-        if !crate::tracker::SUPPORTED_PROVIDERS.contains(&entry.provider.as_str()) {
-            return Err(ConfigError::InvalidTrackerBinding {
-                key: key.clone(),
-                reason: format!(
-                    "provider '{}' is not supported; supported: {}",
-                    entry.provider,
-                    crate::tracker::SUPPORTED_PROVIDERS.join(", ")
-                ),
-            });
+        let invalid = |reason: String| ConfigError::InvalidTrackerBinding { key: key.clone(), reason };
+        let entries = match value {
+            serde_yaml::Value::Sequence(entries) => entries,
+            mapping @ serde_yaml::Value::Mapping(_) => vec![mapping],
+            _ => return Err(invalid("the entry must be a mapping or a list of mappings".into())),
+        };
+        let mut providers: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry: RawTrackerBinding = serde_yaml::from_value(entry).map_err(|e| invalid(e.to_string()))?;
+            if providers.contains(&entry.provider) {
+                return Err(invalid(format!(
+                    "provider {} appears twice; a project takes at most one binding per provider",
+                    entry.provider
+                )));
+            }
+            providers.push(entry.provider.clone());
+            bindings.push(tracker_binding(&domain, &project, entry).map_err(invalid)?);
         }
-        bindings.insert(key.clone(), TrackerBinding {
-            domain,
-            project,
-            provider: entry.provider,
-            team: entry.team,
-            credential: entry.credential,
-            readonly: entry.readonly,
-            gate: entry.gate,
-        });
     }
     Ok(bindings)
+}
+
+/// One binding from its raw entry, with the fields its provider takes.
+fn tracker_binding(domain: &str, project: &str, entry: RawTrackerBinding) -> Result<TrackerBinding, String> {
+    let supported = crate::tracker::SUPPORTED_PROVIDERS;
+    if !supported.contains(&entry.provider.as_str()) {
+        return Err(format!("provider '{}' is not supported; supported: {}", entry.provider, supported.join(", ")));
+    }
+    let provider = entry.provider.as_str();
+    let refuse = |field: &str| format!("provider {provider} does not take `{field}`");
+    let (team, repository) = match crate::tracker::mirrors_issues(provider) {
+        true => {
+            if entry.repository.is_some() {
+                return Err(refuse("repository"));
+            }
+            (entry.team.ok_or_else(|| format!("provider {provider} needs `team`"))?, None)
+        }
+        false => {
+            match (entry.team.is_some(), entry.readonly, entry.gate) {
+                (true, _, _) => return Err(refuse("team")),
+                (_, true, _) => return Err(refuse("readonly")),
+                (_, _, true) => return Err(refuse("gate")),
+                _ => {}
+            }
+            let repository = entry.repository.ok_or_else(|| format!("provider {provider} needs `repository`"))?;
+            (String::new(), Some(repository_name(&repository)?))
+        }
+    };
+    let credential = match (entry.credential, repository.is_some()) {
+        (Some(credential), _) => credential,
+        (None, true) => provider.to_string(),
+        (None, false) => return Err(format!("provider {provider} needs `credential`")),
+    };
+    Ok(TrackerBinding {
+        domain: domain.to_string(),
+        project: project.to_string(),
+        provider: entry.provider,
+        team,
+        credential,
+        readonly: entry.readonly,
+        gate: entry.gate,
+        repository,
+    })
+}
+
+/// `<owner>/<name>` with two non-empty segments of letters, digits, `-`, `_` or `.`.
+fn repository_name(raw: &str) -> Result<String, String> {
+    let segment = |s: &str| !s.is_empty() && s != "." && s != ".." && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    match raw.trim().split_once('/') {
+        Some((owner, name)) if segment(owner) && segment(name) => Ok(raw.trim().to_string()),
+        _ => Err(format!("repository '{raw}' must be <owner>/<name>")),
+    }
 }
 
 /// A tracker key and a native kanban ticket id must never share a prefix,
 /// or a lookup could not tell them apart. `prefixes` maps project to prefix.
 fn reject_prefix_collisions(
-    trackers: &BTreeMap<String, TrackerBinding>,
+    trackers: &[TrackerBinding],
     prefixes: &HashMap<String, String>,
 ) -> Result<(), ConfigError> {
     let normal = |prefix: &str| prefix.trim_end_matches('-').to_ascii_uppercase();
-    for (key, binding) in trackers {
+    for binding in trackers.iter().filter(|b| crate::tracker::mirrors_issues(&b.provider)) {
+        let key = binding.key();
         let mut clashes: Vec<(&String, &String)> =
             prefixes.iter().filter(|(_, prefix)| normal(prefix) == normal(&binding.team)).collect();
         clashes.sort();
@@ -635,14 +718,14 @@ trackers:
 "#;
         let f = write_config(yaml).unwrap();
         let config = load(Some(f.path())).unwrap();
-        let claims = config.trackers.get("work/claims").unwrap();
+        let claims = config.tracker_for("work", "claims").unwrap();
         assert_eq!(claims.domain, "work");
         assert_eq!(claims.project, "claims");
         assert_eq!(claims.provider, "linear");
         assert_eq!(claims.team, "COR");
         assert_eq!(claims.credential, "corr-linear");
         assert!(claims.readonly);
-        assert!(!config.trackers.get("work/other").unwrap().readonly);
+        assert!(!config.tracker_for("work", "other").unwrap().readonly);
         assert_eq!(config.tracker_for("work", "claims").map(|b| b.team.as_str()), Some("COR"));
         assert!(config.tracker_for("work", "missing").is_none());
     }
@@ -652,8 +735,113 @@ trackers:
         let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n    gate: true\n  work/other:\n    provider: linear\n    team: OTH\n    credential: c\n";
         let f = write_config(yaml).unwrap();
         let config = load(Some(f.path())).unwrap();
-        assert!(config.trackers.get("work/claims").unwrap().gate);
-        assert!(!config.trackers.get("work/other").unwrap().gate);
+        assert!(config.tracker_for("work", "claims").unwrap().gate);
+        assert!(!config.tracker_for("work", "other").unwrap().gate);
+    }
+
+    #[test]
+    fn a_scalar_tracker_entry_is_a_list_of_one() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n";
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert_eq!(config.trackers.len(), 1);
+        assert_eq!(config.bindings_for("work", "claims").len(), 1);
+        assert_eq!(config.trackers[0].key(), "work/claims");
+        assert_eq!(config.trackers[0].repository, None);
+    }
+
+    #[test]
+    fn a_tracker_entry_may_list_one_binding_per_provider() {
+        let yaml = r#"
+vault_path: /tmp/v
+session_sources: []
+trackers:
+  work/claims:
+    - provider: linear
+      team: COR
+      credential: corr-linear
+      readonly: true
+      gate: true
+    - provider: github
+      repository: acme/claims-app
+  work/other:
+    provider: linear
+    team: OTH
+    credential: corr-linear
+"#;
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert_eq!(config.trackers.len(), 3);
+        let claims = config.bindings_for("work", "claims");
+        let providers: Vec<&str> = claims.iter().map(|b| b.provider.as_str()).collect();
+        assert_eq!(providers, vec!["linear", "github"], "file order within a project");
+        let github = claims[1];
+        assert_eq!(github.repository.as_deref(), Some("acme/claims-app"));
+        assert_eq!(github.credential, "github", "the credential defaults to the provider name");
+        assert_eq!(github.scope(), "acme/claims-app");
+        assert!(!github.readonly && !github.gate);
+        let issues = config.tracker_for("work", "claims").unwrap();
+        assert_eq!((issues.provider.as_str(), issues.team.as_str(), issues.scope()), ("linear", "COR", "COR"));
+        assert!(issues.gate && issues.readonly);
+        let keys: Vec<String> = config.trackers.iter().map(|b| b.key()).collect();
+        assert_eq!(keys, vec!["work/claims", "work/claims", "work/other"]);
+    }
+
+    #[test]
+    fn a_project_with_only_a_github_binding_has_no_issue_tracker() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n    credential: gh-work\n";
+        let f = write_config(yaml).unwrap();
+        let config = load(Some(f.path())).unwrap();
+        assert!(config.tracker_for("work", "claims").is_none(), "kanban, inject and the gate read issue trackers only");
+        assert_eq!(config.bindings_for("work", "claims")[0].credential, "gh-work");
+    }
+
+    #[test]
+    fn a_second_binding_for_one_provider_is_a_load_error_naming_project_and_provider() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: github\n      repository: acme/a\n    - provider: linear\n      team: COR\n      credential: c\n    - provider: github\n      repository: acme/b\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("duplicate provider").to_string();
+        assert!(error.contains("work/claims"), "{error}");
+        assert!(error.contains("provider github appears twice"), "{error}");
+    }
+
+    #[test]
+    fn a_github_binding_needs_an_owner_and_name_repository() {
+        for repository in ["", "acme", "acme/", "/app", "acme/app/extra", "acme app/x"] {
+            let yaml = format!("vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n    repository: \"{repository}\"\n");
+            let f = write_config(&yaml).unwrap();
+            let error = load(Some(f.path())).err().expect("bad repository").to_string();
+            assert!(error.contains("work/claims") && error.contains("<owner>/<name>"), "{repository}: {error}");
+        }
+        let missing = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n";
+        let f = write_config(missing).unwrap();
+        assert!(load(Some(f.path())).err().expect("no repository").to_string().contains("needs `repository`"));
+    }
+
+    #[test]
+    fn fields_of_the_other_provider_are_load_errors() {
+        let cases = [
+            ("provider: github\n    repository: acme/app\n    team: COR\n", "`team`"),
+            ("provider: github\n    repository: acme/app\n    gate: true\n", "`gate`"),
+            ("provider: github\n    repository: acme/app\n    readonly: true\n", "`readonly`"),
+            ("provider: linear\n    team: COR\n    credential: c\n    repository: acme/app\n", "`repository`"),
+            ("provider: linear\n    credential: c\n", "needs `team`"),
+            ("provider: linear\n    team: COR\n", "needs `credential`"),
+        ];
+        for (entry, named) in cases {
+            let yaml = format!("vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims:\n    {entry}");
+            let f = write_config(&yaml).unwrap();
+            let error = load(Some(f.path())).err().expect(entry).to_string();
+            assert!(error.contains("work/claims") && error.contains(named), "{entry}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_tracker_entry_that_is_neither_a_mapping_nor_a_list_is_a_load_error() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\ntrackers:\n  work/claims: linear\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("scalar").to_string();
+        assert!(error.contains("work/claims") && error.contains("a mapping or a list of mappings"), "{error}");
     }
 
     #[test]
@@ -673,7 +861,7 @@ trackers:
         let error = load(Some(f.path())).err().expect("unknown provider").to_string();
         assert!(error.contains("work/claims"), "{error}");
         assert!(error.contains("'jira'"), "{error}");
-        assert!(error.contains("supported: linear"), "{error}");
+        assert!(error.contains("supported: linear, github"), "{error}");
     }
 
     #[test]

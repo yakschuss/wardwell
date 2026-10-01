@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn rebuild_from_jsonl_restores_state() {
-        let (dir, store) = make_store();
+        let (_dir, store) = make_store();
         let p = HashMap::new();
         store.create_item("Task", "shulops", "work", None, None, None, None, None, None, None, None, None, &p).unwrap();
         store.move_item("SH-1", "todo").unwrap();

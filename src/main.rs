@@ -103,7 +103,7 @@ enum ProjectCommand {
 enum TrackerCommand {
     /// Store a tracker API token from standard input, never a command-line argument
     Connect {
-        /// Credential name referenced by `credential:` in config.yml
+        /// Credential name referenced by `credential:` in config.yml; `github` for a github binding without one
         name: String,
         /// Read the token from stdin
         #[arg(long, required = true)]
@@ -289,7 +289,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         }
         TrackerCommand::Doctor => {
             let config = wardwell::config::loader::load(None)?;
-            cli::doctor(&config, &config_dir, &wardwell::tracker::doctor::connect_transport)?
+            cli::doctor(&config, &config_dir, &wardwell::tracker::doctor::connect_transport, &wardwell::tracker::doctor::connect_github)?
         }
         TrackerCommand::Compact { project, force } => {
             let config = wardwell::config::loader::load(None)?;

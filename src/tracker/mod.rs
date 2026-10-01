@@ -10,6 +10,7 @@ pub mod compact;
 pub mod credential;
 pub mod doctor;
 pub mod events;
+pub mod github;
 pub mod items;
 pub mod linear;
 pub mod lock;
@@ -20,14 +21,25 @@ pub mod schedule;
 pub mod view;
 
 /// Provider ids Wardwell has an adapter for.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["linear"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &["linear", "github"];
+
+/// The provider id of the merged-change mirror.
+pub const GITHUB: &str = "github";
 
 /// Display name for a provider id, for messages a person reads.
 pub fn provider_label(provider: &str) -> String {
     match provider {
         "linear" => "Linear".to_string(),
+        GITHUB => "GitHub".to_string(),
         other => other.to_string(),
     }
+}
+
+/// True for a provider whose mirror holds issues. The merged-change mirror
+/// holds no issues, so kanban, session start, the read-only lock, and the
+/// gate never read it.
+pub fn mirrors_issues(provider: &str) -> bool {
+    provider != GITHUB
 }
 
 /// Kanban actions that append to any file under the project's folder or its
@@ -91,6 +103,7 @@ mod tests {
             credential: "c".into(),
             readonly,
             gate: false,
+            repository: None,
         }
     }
 

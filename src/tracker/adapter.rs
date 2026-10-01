@@ -10,6 +10,11 @@ use chrono::{DateTime, Utc};
 /// so the pull records `auth` rather than `provider`.
 pub const AUTH_REFUSED: &str = "the provider refused the token";
 
+/// Text an adapter puts in its error when no reader can reach the provider
+/// and no token is stored, so the pull records `credential`. The error then
+/// ends with the credential name and a backtick.
+pub const UNREACHABLE: &str = "unreachable, run `wardwell tracker connect";
+
 /// Receives one page of events as the adapter reads it. An error stops the pull.
 pub type Sink<'a> = dyn FnMut(Vec<Event>) -> Result<(), String> + 'a;
 

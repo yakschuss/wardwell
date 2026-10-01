@@ -16,7 +16,6 @@ use crate::install::json_doc;
 use crate::install::manifest::{self, Manifest};
 use crate::tracker::schedule::{self, LaunchctlRunner};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The label every tier-two plan line starts with.
@@ -84,7 +83,7 @@ pub struct Inputs<'a> {
     pub home: &'a Path,
     pub config_dir: &'a Path,
     pub binary: &'a Path,
-    pub trackers: &'a BTreeMap<String, TrackerBinding>,
+    pub trackers: &'a [TrackerBinding],
     /// Edit Claude Code's settings; false when Claude Code is not installed.
     pub claude_code: bool,
     /// Install the pull as a launchd agent; false prints a cron line instead.
@@ -185,8 +184,8 @@ pub fn settings_path(home: &Path) -> PathBuf {
 }
 
 /// True when a linear binding opts into the tracker policy.
-pub fn policy_enabled(trackers: &BTreeMap<String, TrackerBinding>) -> bool {
-    trackers.values().any(|binding| binding.provider == "linear" && binding.gate)
+pub fn policy_enabled(trackers: &[TrackerBinding]) -> bool {
+    trackers.iter().any(|binding| binding.provider == "linear" && binding.gate)
 }
 
 /// Claude settings being edited in memory, one planned step at a time.
@@ -733,7 +732,7 @@ mod tests {
         Home { _dir: dir, home, cfg }
     }
 
-    fn binding(provider: &str, gate: bool) -> BTreeMap<String, TrackerBinding> {
+    fn binding(provider: &str, gate: bool) -> Vec<TrackerBinding> {
         let binding = TrackerBinding {
             domain: "personal".into(),
             project: "corr".into(),
@@ -742,15 +741,16 @@ mod tests {
             credential: "c".into(),
             readonly: true,
             gate,
+            repository: None,
         };
-        BTreeMap::from([("personal/corr".to_string(), binding)])
+        vec![binding]
     }
 
-    fn plan_for(h: &Home, trackers: &BTreeMap<String, TrackerBinding>, launchd: bool) -> Plan {
+    fn plan_for(h: &Home, trackers: &[TrackerBinding], launchd: bool) -> Plan {
         plan(&Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers, claude_code: true, launchd }).unwrap()
     }
 
-    fn run(h: &Home, trackers: &BTreeMap<String, TrackerBinding>) -> Plan {
+    fn run(h: &Home, trackers: &[TrackerBinding]) -> Plan {
         let plan = plan_for(h, trackers, false);
         apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
         plan
@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn tier_one_is_always_planned_created_then_unchanged() {
         let h = home();
-        let first = run(&h, &BTreeMap::new());
+        let first = run(&h, &[]);
         assert_eq!(action_of(&first, "Session start hook"), Action::Create);
         assert_eq!(action_of(&first, "Stop hook"), Action::Create);
         assert_eq!(action_of(&first, POLICY), Action::Off);
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(client_hooks::commands(&s, &STOP), vec![format!("'{BIN}' resolve")]);
         assert!(s.get("permissions").is_none());
         assert_eq!(manifest::read(&h.cfg).unwrap().unwrap().1.created_keys, vec!["hooks"]);
-        let second = plan_for(&h, &BTreeMap::new(), false);
+        let second = plan_for(&h, &[], false);
         assert!(second.is_noop(), "{}", rendered(&second));
         assert!(second.lines.iter().all(|l| matches!(l.action, Action::Unchanged | Action::Off)));
     }
@@ -809,7 +809,7 @@ mod tests {
             {"hooks": [{"type": "command", "command": "/usr/local/bin/wardwell inject \"$(pwd)\""}, {"type": "command", "command": "peon ping"}]}
         ], "Stop": [{"hooks": [{"type": "command", "command": "rtk check"}]}]}, "permissions": {"allow": ["Bash(ls)"]}});
         put_settings(&h, original.clone());
-        let plan = run(&h, &BTreeMap::new());
+        let plan = run(&h, &[]);
         assert_eq!(action_of(&plan, "Session start hook"), Action::UpdateBackup);
         let s = settings(&h);
         assert_eq!(s["model"], "keep");
@@ -877,7 +877,7 @@ mod tests {
         let python = json!({"hooks": {"PreToolUse": [{"matcher": "mcp__linear__save_comment|mcp__linear__save_issue",
             "hooks": [{"type": "command", "command": "python3 ~/.claude/hooks/linear-gate/linear-gate.py"}]}]}});
         put_settings(&h, python);
-        let off = run(&h, &BTreeMap::new());
+        let off = run(&h, &[]);
         assert!(rendered(&off).contains("linear-gate.py) kept"));
         assert!(h.home.join(".claude/settings.json").exists());
         assert_eq!(client_hooks::remove_where(&mut settings(&h), client_hooks::is_python_gate), 1);
@@ -895,7 +895,7 @@ mod tests {
             {"hooks": [{"type": "command", "command": "'/w/wardwell' companion lifecycle stop --client claude", "timeout": 3}]},
             {"hooks": [{"type": "command", "command": "/w/wardwell resolve"}]}
         ]}}));
-        let plan = run(&h, &BTreeMap::new());
+        let plan = run(&h, &[]);
         assert!(rendered(&plan).contains("Companion Stop hook runs the history check"));
         let s = settings(&h);
         assert!(client_hooks::commands(&s, &STOP).is_empty());
@@ -994,13 +994,13 @@ mod tests {
             ("{\n  \"model\": \"keep\"\n}", true),
         ] {
             fs::write(&path, text).unwrap();
-            let plan = plan_for(&h, &BTreeMap::new(), false);
+            let plan = plan_for(&h, &[], false);
             let line = plan.lines.iter().find(|l| l.label.starts_with("Session start hook")).unwrap().render();
             assert!(line.contains("UPDATE + BACKUP"), "{line}");
             assert_eq!(line.contains("UPDATE + BACKUP, reformats the file"), reformats, "{text:?}: {line}");
         }
         fs::write(&path, "{\n  \"model\": \"keep\"\n}\n").unwrap();
-        run(&h, &BTreeMap::new());
+        run(&h, &[]);
         let after = fs::read_to_string(&path).unwrap();
         assert!(after.starts_with("{\n  \"model\": \"keep\",\n  \"hooks\": {"), "{after}");
     }
@@ -1044,7 +1044,7 @@ mod tests {
         let path = settings_path(&h.home);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, " \n").unwrap();
-        let plan = run(&h, &BTreeMap::new());
+        let plan = run(&h, &[]);
         assert_eq!(action_of(&plan, "Session start hook"), Action::UpdateBackup);
         assert_eq!(client_hooks::commands(&settings(&h), &STOP).len(), 1);
     }
@@ -1058,7 +1058,7 @@ mod tests {
         fs::write(&real, "{}").unwrap();
         fs::create_dir_all(h.home.join(".claude")).unwrap();
         std::os::unix::fs::symlink(&real, settings_path(&h.home)).unwrap();
-        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &BTreeMap::new(), claude_code: true, launchd: false };
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &[], claude_code: true, launchd: false };
         let error = plan(&inputs).unwrap_err();
         assert!(error.contains(&real.display().to_string()), "{error}");
         assert!(error.contains(&format!("is a symbolic link to {}. Replace the link with a regular file, or edit the link's target by hand.", real.display())), "{error}");
@@ -1070,7 +1070,7 @@ mod tests {
     fn settings_that_are_json_but_not_an_object_are_refused() {
         let h = home();
         put_settings(&h, json!([1, 2]));
-        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &BTreeMap::new(), claude_code: true, launchd: false };
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &[], claude_code: true, launchd: false };
         let error = plan(&inputs).unwrap_err();
         assert!(error.contains("must be a JSON object"), "{error}");
         assert!(error.contains("an array"), "{error}");
@@ -1141,7 +1141,7 @@ mod tests {
         let plist = schedule::plist_path(&h.home);
         fs::create_dir_all(plist.parent().unwrap()).unwrap();
         fs::write(&plist, schedule::launch_agent_plist(Path::new(BIN), 3600, &schedule::log_path(&h.cfg))).unwrap();
-        let plan = plan_for(&h, &BTreeMap::new(), true);
+        let plan = plan_for(&h, &[], true);
         assert_eq!(action_of(&plan, "Tracker pull service"), Action::Delete);
         assert!(rendered(&plan).contains("REMOVE          Tracker pull service: no tracker binding"), "{}", rendered(&plan));
         assert!(!plan.is_noop());
@@ -1149,13 +1149,34 @@ mod tests {
         apply(&plan, &fake, &|| Ok(501)).unwrap();
         assert_eq!(fake.verbs(), vec!["bootout"]);
         assert!(!plist.exists());
-        assert!(plan_for(&h, &BTreeMap::new(), true).is_noop());
+        assert!(plan_for(&h, &[], true).is_noop());
+    }
+
+    #[test]
+    fn a_binding_list_keeps_both_setup_tiers_and_the_pull_service() {
+        let h = home();
+        let write = |trackers: &str| {
+            fs::write(h.cfg.join("config.yml"), format!("vault_path: {}\nsession_sources: []\ntrackers:\n  personal/corr:\n{trackers}", h.home.display())).unwrap();
+            crate::install::setup::tracker_bindings(&h.cfg).unwrap()
+        };
+        let github_only = write("    provider: github\n    repository: acme/app\n");
+        assert!(!policy_enabled(&github_only), "a github binding never turns on the Linear policy");
+        let plan = plan_for(&h, &github_only, true);
+        assert_eq!(action_of(&plan, "Tracker pull service, every 3600s"), Action::Create);
+        assert!(rendered(&plan).contains("Tracker policy, optional: off; no linear binding has gate: true"), "{}", rendered(&plan));
+
+        let both = write("    - provider: github\n      repository: acme/app\n    - provider: linear\n      team: COR\n      credential: c\n      gate: true\n");
+        assert_eq!(both.len(), 2);
+        assert!(policy_enabled(&both));
+        let plan = plan_for(&h, &both, true);
+        assert!(rendered(&plan).contains("Tracker policy, optional: Linear gate"), "{}", rendered(&plan));
+        assert_eq!(action_of(&plan, "Tracker pull service, every 3600s"), Action::Create);
     }
 
     #[test]
     fn no_binding_plans_no_pull() {
         let h = home();
-        let plan = plan_for(&h, &BTreeMap::new(), true);
+        let plan = plan_for(&h, &[], true);
         assert!(!rendered(&plan).contains("pull"));
     }
 

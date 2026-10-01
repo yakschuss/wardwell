@@ -11,6 +11,8 @@ struct Env {
     home: PathBuf,
     cfg: PathBuf,
     code: PathBuf,
+    /// The PATH the binary runs with: a folder made here holding only `git`.
+    path: PathBuf,
 }
 
 fn git(dir: &Path, args: &[&str], date: Option<i64>) {
@@ -38,7 +40,18 @@ fn env(extra_config: &str) -> Env {
     git(&code, &["commit", "-q", "--allow-empty", "-m", "old"], Some(1_700_000_000));
     let yaml = format!("vault_path: {}\nsession_sources: []\nprojects:\n  personal/corr:\n    paths: [\"{}\"]\n{extra_config}", root.join("vault").display(), code.display());
     std::fs::write(cfg.join("config.yml"), yaml).unwrap();
-    Env { _tmp: tmp, home, cfg, code }
+    Env { _tmp: tmp, home, cfg, code, path: git_only_path(&root) }
+}
+
+/// A folder under `root` holding a link to the git this test uses, found
+/// through `git --exec-path`, never by searching a system folder.
+fn git_only_path(root: &Path) -> PathBuf {
+    let out = Command::new("git").arg("--exec-path").output().unwrap();
+    let exec = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(exec.join("git"), bin.join("git")).unwrap();
+    bin
 }
 
 fn wardwell(e: &Env, args: &[&str], input: &Value) -> Output {
@@ -47,6 +60,8 @@ fn wardwell(e: &Env, args: &[&str], input: &Value) -> Output {
         .current_dir(&e.code)
         .env("HOME", &e.home)
         .env("WARDWELL_CONFIG_DIR", &e.cfg)
+        .env("PATH", &e.path)
+        .env("WARDWELL_GH_CANDIDATES", "")
         .env_remove("WARDWELL_STOP_CHECK")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -93,7 +108,7 @@ fn resolve_blocks_once_then_allows() {
     assert!(block["reason"].as_str().unwrap().starts_with("1 commit since "), "{block}");
     let second = wardwell(&e, &["resolve"], &stop_payload(&e, "s1"));
     assert!(second.status.success() && stdout(&second).is_empty());
-    let garbage = Command::new(env!("CARGO_BIN_EXE_wardwell")).arg("resolve").env("WARDWELL_CONFIG_DIR", &e.cfg).env("HOME", &e.home).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let garbage = Command::new(env!("CARGO_BIN_EXE_wardwell")).arg("resolve").env("WARDWELL_CONFIG_DIR", &e.cfg).env("HOME", &e.home).env("PATH", &e.path).env("WARDWELL_GH_CANDIDATES", "").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let out = { let mut c = garbage; write!(c.stdin.take().unwrap(), "not json").unwrap(); c.wait_with_output().unwrap() };
     assert!(out.status.success() && stdout(&out).is_empty(), "a bad payload allows");
 }

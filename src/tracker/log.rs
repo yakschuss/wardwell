@@ -22,9 +22,12 @@ pub struct OpenIssue {
     pub issue_title: String,
 }
 
-/// Derived state of a tracker log.
+/// Derived state of a tracker log, for one provider or for all.
 #[derive(Debug, Default, Clone)]
 pub struct LogSummary {
+    /// The provider whose events the summary folds; None folds every event.
+    /// Event ids of every provider are kept either way, so appends dedup.
+    pub provider: Option<String>,
     /// `through` of the latest pull_completed or full_resync marker in file
     /// order. Provider events never move it, so a pull that failed part way
     /// leaves it where the last completed pull put it.
@@ -34,6 +37,9 @@ pub struct LogSummary {
     pub last_full_resync_at: Option<DateTime<Utc>>,
     pub event_ids: HashSet<String>,
     pub open_issues: BTreeMap<String, OpenIssue>,
+    /// The latest `change_merged` content per change key, in file order.
+    /// Readers of merged changes take this one, never an earlier revision.
+    pub changes: BTreeMap<String, crate::tracker::events::MergedChange>,
     /// Keys whose latest issue event is `issue_removed`, with its time.
     pub removed_at: BTreeMap<String, DateTime<Utc>>,
     pub event_count: usize,
@@ -48,6 +54,9 @@ impl LogSummary {
     fn observe(&mut self, event: &Event) {
         let common = event.common();
         self.event_ids.insert(common.id.clone());
+        if self.provider.as_ref().is_some_and(|p| *p != common.provider) {
+            return;
+        }
         self.event_count += 1;
         match event {
             Event::IssueRemoved { .. } => {
@@ -64,6 +73,9 @@ impl LogSummary {
                 if *automatic_full {
                     self.last_automatic_full_failure = later(self.last_automatic_full_failure, common.occurred_at);
                 }
+            }
+            Event::ChangeMerged { change, .. } => {
+                self.changes.insert(common.external_key.clone(), (**change).clone());
             }
             Event::IssueUpserted { issue, .. } => {
                 self.removed_at.remove(&common.external_key);
@@ -92,10 +104,20 @@ pub fn path_for(vault_root: &Path, domain: &str, project: &str) -> PathBuf {
     vault_root.join(domain).join(project).join(crate::tracker::events::FILE_NAME)
 }
 
-/// Summarize the log at `path`. A missing file is an empty log; unreadable
-/// lines are counted and skipped.
+/// Summarize every provider's events in the log at `path`. A missing file
+/// is an empty log; unreadable lines are counted and skipped.
 pub fn read(path: &Path) -> Result<LogSummary, String> {
-    let mut summary = LogSummary::default();
+    read_with(path, LogSummary::default())
+}
+
+/// Summarize one provider's events in the log at `path`: its cursor, pull
+/// times, failures and open issues. Another provider's markers never move
+/// them. Event ids of every provider are kept, so appends still dedup.
+pub fn read_for(path: &Path, provider: &str) -> Result<LogSummary, String> {
+    read_with(path, LogSummary { provider: Some(provider.to_string()), ..LogSummary::default() })
+}
+
+fn read_with(path: &Path, mut summary: LogSummary) -> Result<LogSummary, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(summary),
@@ -115,13 +137,24 @@ pub fn read(path: &Path) -> Result<LogSummary, String> {
 
 /// Append events whose id is not already in `summary`, in order, and fold
 /// them into `summary`. A snapshot of a removed issue is appended even when
-/// its id is known, under a restored id, so the issue reappears. Each
+/// its id is known, under a restored id, so the issue reappears. A merged
+/// change is appended only when its content differs from the latest one
+/// logged under its key, under a revision id after the first. Each
 /// event's raw payload goes to the sidecar first, then its light row to the
 /// log. Returns how many were written.
 pub fn append_new(path: &Path, events: &[Event], summary: &mut LogSummary) -> Result<usize, String> {
     let raw_path = raw_path_for(path);
     let mut written = 0;
     for event in events {
+        let revised;
+        let event = match revision(event, summary) {
+            Revision::Same => continue,
+            Revision::New(next) => {
+                revised = *next;
+                &revised
+            }
+            Revision::NotAChange => event,
+        };
         let event = match (summary.event_ids.contains(&event.common().id), restored(event, summary)) {
             (false, _) => event.clone(),
             (true, Some(restored)) if !summary.event_ids.contains(&restored.common().id) => restored,
@@ -137,6 +170,40 @@ pub fn append_new(path: &Path, events: &[Event], summary: &mut LogSummary) -> Re
         written += 1;
     }
     Ok(written)
+}
+
+/// What to do with an event before its id is checked.
+enum Revision {
+    /// Not a merged change; append by id as usual.
+    NotAChange,
+    /// A merged change whose content equals the latest logged one.
+    Same,
+    /// A merged change to append as this event.
+    New(Box<Event>),
+}
+
+/// A merged change with nothing logged under its key keeps its id. One
+/// whose title, body or keys differ from the latest logged one gets the id
+/// suffixed `:rev:<content digest>:<update time>`, unique even when content
+/// returns to an earlier revision, and a heading that ends `; revision
+/// updated <update time>`, so a search hit shows which state it is.
+fn revision(event: &Event, summary: &LogSummary) -> Revision {
+    let Event::ChangeMerged { common, change } = event else {
+        return Revision::NotAChange;
+    };
+    let Some(latest) = summary.changes.get(&common.external_key) else {
+        return Revision::New(Box::new(event.clone()));
+    };
+    let digest = change.content_digest();
+    if latest.content_digest() == digest {
+        return Revision::Same;
+    }
+    let mut next = event.clone();
+    let updated = common.occurred_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let next_common = common_mut(&mut next);
+    next_common.id = format!("{}:rev:{digest}:{}", common.id, common.occurred_at.to_rfc3339());
+    next_common.title = format!("{}; revision updated {updated}", common.title);
+    Revision::New(Box::new(next))
 }
 
 /// A snapshot of an issue whose latest event is `issue_removed`, with its
@@ -164,6 +231,7 @@ fn common_mut(event: &mut Event) -> &mut crate::tracker::events::Common {
         | Event::CommentUpserted { common, .. }
         | Event::StateChanged { common, .. }
         | Event::LinkAdded { common, .. }
+        | Event::ChangeMerged { common, .. }
         | Event::IssueRemoved { common }
         | Event::FullResync { common, .. }
         | Event::PullCompleted { common, .. }

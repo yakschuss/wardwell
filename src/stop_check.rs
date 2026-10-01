@@ -150,7 +150,7 @@ fn hash(text: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::inject::git::testing::{commit_at, git, repo};
+    use crate::inject::git::testing::{commit_at, git};
 
     struct Fixture {
         _tmp: tempfile::TempDir,
