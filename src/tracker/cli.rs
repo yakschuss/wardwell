@@ -61,6 +61,9 @@ pub fn release_claims(config_dir: &Path, bindings: &[(String, &TrackerBinding)])
 }
 
 fn pull_summary(outcome: &crate::tracker::pull::PullOutcome) -> String {
+    if outcome.skipped {
+        return "skipped, a pull that completed while this one waited already refreshed it".to_string();
+    }
     let mode = match (outcome.full, outcome.resync_due) {
         (true, Some(due)) => format!("full pull ({}, so this pull ran full)", due.describe()),
         (true, None) => "full pull".to_string(),

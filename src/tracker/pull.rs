@@ -101,6 +101,9 @@ pub struct PullOutcome {
     /// Why the due full pull failed; the outcome is then the incremental
     /// pull that ran after it.
     pub failed_full: Option<PullError>,
+    /// True when a pull that completed after this one began waiting made it
+    /// unneeded, so it read nothing from the provider.
+    pub skipped: bool,
 }
 
 /// Builds the adapter for a binding from its credential, None when the
@@ -174,7 +177,8 @@ pub fn pull_binding(
     connect: &Connect<'_>,
 ) -> Result<PullOutcome, PullError> {
     let state = state::path(config_dir, &binding.domain, &binding.project);
-    let result = pull_binding_recorded(vault_root, config_dir, binding, mode, now, connect, &state);
+    let recording = Recording { state: &state, began: Utc::now() };
+    let result = pull_binding_recorded(vault_root, config_dir, binding, mode, now, connect, &recording);
     if let Err(error) = &result
         && error.code != FailureCode::LockBusy
     {
@@ -190,7 +194,7 @@ fn pull_binding_recorded(
     mode: Mode,
     now: DateTime<Utc>,
     connect: &Connect<'_>,
-    state: &Path,
+    recording: &Recording<'_>,
 ) -> Result<PullOutcome, PullError> {
     let wait = lock::DEFAULT_WAIT;
     let credential = load_credential(config_dir, binding)?;
@@ -201,9 +205,9 @@ fn pull_binding_recorded(
         _ => None,
     };
     let Some(due) = resync_due else {
-        return pull_recorded(vault_root, binding, adapter.as_ref(), mode, now, wait, Some(state));
+        return pull_recorded(vault_root, binding, adapter.as_ref(), mode, now, wait, Some(recording));
     };
-    let pull = |mode| pull_recorded(vault_root, binding, adapter.as_ref(), mode, now, wait, Some(state));
+    let pull = |mode| pull_recorded(vault_root, binding, adapter.as_ref(), mode, now, wait, Some(recording));
     match pull(Mode::AutomaticFull) {
         Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), ..outcome }),
         // A failed automatic full must not stop the mirror moving.
@@ -250,7 +254,15 @@ pub fn pull_project_waiting(
     pull_recorded(vault_root, binding, adapter, mode, now, wait, None)
 }
 
-/// `pull_project_waiting`, recording into the refresh state file `state` when given.
+/// Where a pull records itself, and when it began, in wall-clock time.
+pub struct Recording<'a> {
+    /// The project's refresh state file.
+    pub state: &'a Path,
+    /// When this pull began, before it waited for the lock.
+    pub began: DateTime<Utc>,
+}
+
+/// `pull_project_waiting`, recording into the refresh state when given.
 fn pull_recorded(
     vault_root: &Path,
     binding: &TrackerBinding,
@@ -258,11 +270,11 @@ fn pull_recorded(
     mode: Mode,
     now: DateTime<Utc>,
     wait: Duration,
-    state: Option<&Path>,
+    recording: Option<&Recording<'_>>,
 ) -> Result<PullOutcome, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     let lock = acquire_lock(&path, wait)?;
-    pull_held(&path, binding, adapter, mode, now, &lock, state)
+    pull_held(&path, binding, adapter, mode, now, &lock, recording)
 }
 
 /// Take the project lock beside `log_path`, failing with `lock_busy` after `wait`.
@@ -291,7 +303,7 @@ pub fn pull_binding_held(
     let adapter = connect(binding, credential.as_ref()).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     let state = state::path(config_dir, &binding.domain, &binding.project);
-    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock, Some(&state))
+    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock, Some(&Recording { state: &state, began: Utc::now() }))
 }
 
 /// The pull itself, under `_lock`: the start in the refresh state `state`
@@ -305,15 +317,21 @@ fn pull_held(
     mode: Mode,
     now: DateTime<Utc>,
     _lock: &lock::ProjectLock,
-    state: Option<&Path>,
+    recording: Option<&Recording<'_>>,
 ) -> Result<PullOutcome, PullError> {
     let record = |record| {
-        if let Some(state) = state {
-            let _ = state::record(state, &binding.provider, record, Utc::now());
+        if let Some(recording) = recording {
+            let _ = state::record(recording.state, &binding.provider, record, Utc::now());
         }
     };
+    let summary = log::read_for(path, &binding.provider);
+    if let (Some(recording), Ok(summary)) = (recording, &summary)
+        && overtaken(recording, &binding.provider, summary, mode)
+    {
+        return Ok(PullOutcome { appended: 0, removed: 0, full: false, resync_due: None, failed_full: None, skipped: true });
+    }
     record(state::Record::Started(std::process::id()));
-    let result = log::read_for(path, &binding.provider)
+    let result = summary
         .map_err(|message| PullError::new(FailureCode::LogRead, message))
         .and_then(|mut summary| {
             let started = pull_started(binding, now, std::process::id(), mode == Mode::AutomaticFull);
@@ -387,7 +405,18 @@ fn pull_locked(
     let removed = markers.len().saturating_sub(1);
     log::append_new(path, &markers, summary).map_err(|message| PullError::new(FailureCode::LogWrite, message))?;
     appended += removed;
-    Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None })
+    Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None, skipped: false })
+}
+
+/// True when a pull of `provider` completed after this one began, by the
+/// refresh state or by the log re-read under the lock. A full pull a person
+/// asked for is never overtaken.
+fn overtaken(recording: &Recording<'_>, provider: &str, summary: &log::LogSummary, mode: Mode) -> bool {
+    if matches!(mode, Mode::Full | Mode::FullAllowEmpty) {
+        return false;
+    }
+    let in_state = state::provider(recording.state, provider).and_then(|s| s.completed_at).is_some_and(|at| at > recording.began);
+    in_state || summary.last_pull_at.is_some_and(|at| at > recording.began)
 }
 
 /// Marker for a pull about to call the provider, in process `pid`. An
@@ -722,6 +751,46 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec!["pull_started", "pull_failed", "pull_started", "pull_completed"]);
         assert_eq!(crate::tracker::view::MirrorView::read_for(&path, "linear").unwrap().last_attempt, None);
+    }
+
+    /// Counts provider reads across threads.
+    struct CountsReads(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Adapter for CountsReads {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_pull_overtaken_while_it_waited_for_the_lock_reads_nothing() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        crate::tracker::credential::save(&crate::tracker::credential::path_in(config.path(), "corr-linear").unwrap(), "t").unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let state_path = state::path(config.path(), "work", "claims");
+        let held = lock::acquire(&path, Duration::ZERO).unwrap();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (vault_dir, config_dir, counter) = (vault.path().to_path_buf(), config.path().to_path_buf(), std::sync::Arc::clone(&reads));
+        let waiting = std::thread::spawn(move || {
+            let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(CountsReads(std::sync::Arc::clone(&counter)))) };
+            pull_binding(&vault_dir, &config_dir, &binding(), Mode::IncrementalOnly, at(12), &connect)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        state::record(&state_path, "linear", state::Record::Completed, Utc::now()).unwrap();
+        drop(held);
+        let outcome = waiting.join().unwrap().unwrap();
+        assert!(outcome.skipped, "{outcome:?}");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "no provider read");
+        assert!(!path.exists() || !std::fs::read_to_string(&path).unwrap().contains("pull_started"), "no start recorded");
+
+        let reads_before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        let counter = std::sync::Arc::clone(&reads);
+        let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(CountsReads(std::sync::Arc::clone(&counter)))) };
+        let fresh = pull_binding(vault.path(), config.path(), &binding(), Mode::IncrementalOnly, at(12), &connect).unwrap();
+        assert!(!fresh.skipped, "a completion before this pull began does not stop it");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), reads_before + 1);
     }
 
     #[test]
