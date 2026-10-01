@@ -155,11 +155,21 @@ Planned only when a tracker binding has `provider: linear` and `gate: true`. Eac
 
 ### Tracker pull
 
-When any binding exists, setup plans the hourly pull through `tracker schedule`'s code: a launchd agent, `~/Library/LaunchAgents/com.wardwell.tracker-pull.plist`. An interval already set is kept. Off macOS, the plan line is MANUAL with a crontab line.
+Setup installs no launchd agent. Session start and the running server refresh the mirror. Each starts a detached `tracker pull` when the last completed pull is over an hour old. The README section "How the mirror stays fresh" has the details.
+
+Why: macOS asks for consent before a background job reads a folder it protects. It asks again for every new build, and a Homebrew upgrade is a new build. A pull that a session starts runs with the client app's permission and needs no answer.
+
+An agent from an earlier version, `~/Library/LaunchAgents/com.wardwell.tracker-pull.plist`:
+
+- Exact match and the vault is under `~/Library/Mobile Documents`, `~/Documents`, `~/Desktop` or `~/Downloads`: REMOVE + BACKUP. Setup boots the job out, backs up the plist, and deletes it.
+- Exact match and the vault is elsewhere: UNCHANGED. `tracker schedule` is then the user's choice.
+- A plist that is not an exact match: UNCHANGED, and the plan line says it is left alone.
+
+An exact match is the plist `tracker schedule` writes, byte for byte, for its own program and interval, with the log in the config dir, and a program named `wardwell` or `wardwell-<version>`. The protected-folder check takes the home path as a parameter.
 
 ### Activation
 
-Installed is not active. Claude Code reads hooks and permissions when a session starts. Sessions already running do not change. Setup says this after it writes.
+Installed is not active. Claude Code reads hooks and permissions when a session starts. Sessions already running do not change. Setup says this after it writes. With a tracker binding, it also says that session start and the running server refresh the mirror, and that no background service is installed.
 
 ## `wardwell project link`
 
@@ -195,7 +205,7 @@ Removes only Wardwell's entries.
 2. Remove `<!-- wardwell:start -->` to `<!-- wardwell:end -->` from all CLAUDE.md files
 3. Remove Wardwell's hook handlers from `~/.claude/settings.json` by exact match: session start, Stop, and the Linear gate. Back up the file first. The Companion install is not touched: its hooks in both clients, its skills, its command file and its instruction blocks stay. Uninstall prints one line saying so.
 4. Remove the deny entries the install record lists, and no others. Empty the record; do not delete it.
-5. Remove the tracker pull service.
+5. Remove the launchd pull agent on an exact match. Back up the plist first. Leave any other plist alone and say so.
 6. **Do NOT delete `~/.wardwell/`** — that's the user's data. Print: "Your vault and config are preserved at ~/.wardwell/. Delete manually if desired."
 
 ## `wardwell doctor`
@@ -211,11 +221,12 @@ Diagnostic command. Checks everything is wired correctly.
 - SessionStart hook registered in settings.json ✓/✗
 - Binary path in MCP configs matches actual binary location ✓/✗
 - Session sources exist and have N sessions ✓/✗
-- Each linked project: each directory exists, ages of the last history entry and decision, the last pull when bound, the last stop-check block ✓/✗
+- Each linked project: each directory exists, ages of the last history entry and decision, the mirror's freshness when bound, the last stop-check block ✓/✗
+- Each binding's mirror: fresh, stale with its reason, or the pull running since a time. A fact row, never a failure.
 - Gate ruleset name and version ✓
 - Linear gate installed when a linear binding has `gate: true`, and its binary path is this binary ✓/✗
 - Linear deny list complete ✓/✗
-- Tracker pull service plist present and its program exists ✓/✗. Whether launchd loaded it is not checked.
+- Tracker pull service: a row only when a launchd agent exists. ✗ when the vault is under a protected folder, with the sentence "macOS asks for consent after every upgrade, and the session refresh needs none." ✗ when the program it runs is gone. Whether launchd loaded it is not checked.
 
 All checks are offline.
 
