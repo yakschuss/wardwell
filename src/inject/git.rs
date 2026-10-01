@@ -49,7 +49,7 @@ pub fn dirs_by(dir: &Path, deadline: Instant) -> Option<GitDirs> {
 }
 
 /// Commits this worktree made at or after `since`: entries in its own HEAD
-/// reflog since then whose subject begins with `commit`. A pull, a
+/// reflog since then whose subject begins with `commit`, amends excluded. A pull, a
 /// fast-forward, a checkout, a reset, a rebase and a merge record other
 /// subjects and are not counted, so commits other people or other worktrees
 /// made never count. None on any git error; the call is killed at `deadline`.
@@ -58,7 +58,10 @@ pub fn commits_made_since(dir: &Path, since: DateTime<Utc>, deadline: Instant) -
     // Reflog times are whole seconds; an entry in the start's own second is
     // not counted, so a commit made just before the start never is.
     let since = since.timestamp() + i64::from(since.timestamp_subsec_nanos() > 0);
-    Some(out.lines().filter_map(reflog_entry).filter(|(at, subject)| *at >= since && subject.starts_with("commit")).count())
+    let made: Vec<&str> = out.lines().filter_map(reflog_entry).filter(|(at, s)| *at >= since && s.starts_with("commit")).map(|(_, s)| s).collect();
+    // An amend replaces a commit, as `git log` shows; amends alone are one.
+    let new = made.iter().filter(|s| !s.starts_with("commit (amend)")).count();
+    Some(if new == 0 && !made.is_empty() { 1 } else { new })
 }
 
 /// `HEAD@{1790000000}\tcommit: message` as its time and subject.
@@ -217,7 +220,7 @@ mod tests {
         git(&main, &["commit", "-q", "--amend", "--allow-empty", "-m", "amended"]);
         git(&main, &["checkout", "-q", "--detach"]);
         git(&main, &["checkout", "-q", "main"]);
-        assert_eq!(commits_made_since(&main, since, far()), Some(3), "two commits and an amend; checkouts do not count");
+        assert_eq!(commits_made_since(&main, since, far()), Some(2), "two commits, one amended; checkouts do not count");
         assert_eq!(commits_made_since(&linked, since, far()), Some(0), "another worktree's commits are not this one's");
         git(&linked, &["rebase", "-q", "main"]);
         assert_eq!(commits_made_since(&linked, since, far()), Some(0), "a rebase brings no commits of its own");
@@ -226,5 +229,26 @@ mod tests {
         assert_eq!(after, 1, "only the amend, made now, is after the start's own second");
         let passed = Instant::now() - Duration::from_millis(1);
         assert_eq!(commits_made_since(&main, since, passed), None, "a passed deadline fails to None");
+    }
+
+    #[test]
+    fn amends_count_as_the_commit_they_replace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        commit_at(dir, "before the session", Some("@1700000000 +0000"));
+        let since = DateTime::from_timestamp(1_750_000_000, 0).unwrap();
+        git(dir, &["commit", "-q", "--amend", "--allow-empty", "-m", "amend an old commit"]);
+        assert_eq!(commits_made_since(dir, since, far()), Some(1), "only amends count as one");
+        let other = tempfile::tempdir().unwrap();
+        let dir = other.path();
+        git(dir, &["init", "-q", "-b", "main"]);
+        commit_at(dir, "before the session", Some("@1700000000 +0000"));
+        commit(dir, "one");
+        git(dir, &["commit", "-q", "--amend", "--allow-empty", "-m", "one again"]);
+        git(dir, &["commit", "-q", "--amend", "--allow-empty", "-m", "one more time"]);
+        assert_eq!(commits_made_since(dir, since, far()), Some(1), "one commit amended twice");
+        commit(dir, "two");
+        assert_eq!(commits_made_since(dir, since, far()), Some(2), "two commits");
     }
 }
