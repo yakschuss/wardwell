@@ -145,19 +145,7 @@ pub fn pull_binding(
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<PullOutcome, PullError> {
-    pull_binding_waiting(vault_root, config_dir, binding, mode, now, connect, lock::DEFAULT_WAIT)
-}
-
-/// `pull_binding`, waiting at most `wait` for the project lock.
-pub fn pull_binding_waiting(
-    vault_root: &Path,
-    config_dir: &Path,
-    binding: &TrackerBinding,
-    mode: Mode,
-    now: DateTime<Utc>,
-    connect: &Connect<'_>,
-    wait: Duration,
-) -> Result<PullOutcome, PullError> {
+    let wait = lock::DEFAULT_WAIT;
     let credential = credential::path_in(config_dir, &binding.credential)
         .and_then(|path| credential::load(&path))
         .map_err(|message| PullError::new(FailureCode::Credential, message))?;
@@ -214,17 +202,54 @@ pub fn pull_project_waiting(
     wait: Duration,
 ) -> Result<PullOutcome, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let _lock = lock::acquire(&path, wait).map_err(|message| {
+    let lock = acquire_lock(&path, wait)?;
+    pull_held(&path, binding, adapter, mode, now, &lock)
+}
+
+/// Take the project lock beside `log_path`, failing with `lock_busy` after `wait`.
+pub fn acquire_lock(log_path: &Path, wait: Duration) -> Result<lock::ProjectLock, PullError> {
+    lock::acquire(log_path, wait).map_err(|message| {
         let code = match message.contains(lock::LOCK_BUSY) {
             true => FailureCode::LockBusy,
             false => FailureCode::LogWrite,
         };
         PullError::new(code, message)
-    })?;
-    let mut summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
-    let result = pull_locked(&path, binding, adapter, mode, now, &mut summary);
+    })
+}
+
+/// An `IncrementalOnly` pull for a caller that already holds the project
+/// lock, so it can check the log under the lock before it pulls. Loads the
+/// credential first, like `pull_binding`.
+pub fn pull_binding_held(
+    vault_root: &Path,
+    config_dir: &Path,
+    binding: &TrackerBinding,
+    now: DateTime<Utc>,
+    connect: &Connect<'_>,
+    lock: &lock::ProjectLock,
+) -> Result<PullOutcome, PullError> {
+    let credential = credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .map_err(|message| PullError::new(FailureCode::Credential, message))?;
+    let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
+    let path = log::path_for(vault_root, &binding.domain, &binding.project);
+    pull_held(&path, binding, adapter.as_ref(), Mode::IncrementalOnly, now, lock)
+}
+
+/// The pull itself, under `_lock`. A failure appends a pull_failed marker
+/// (best effort) before it returns.
+fn pull_held(
+    path: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    mode: Mode,
+    now: DateTime<Utc>,
+    _lock: &lock::ProjectLock,
+) -> Result<PullOutcome, PullError> {
+    let mut summary = log::read(path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let result = pull_locked(path, binding, adapter, mode, now, &mut summary);
     if let Err(error) = &result {
-        let _ = log::append_new(&path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
+        let _ = log::append_new(path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
     }
     result
 }

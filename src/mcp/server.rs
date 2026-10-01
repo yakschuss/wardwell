@@ -3722,29 +3722,28 @@ impl WardwellServer {
     /// One incremental pull for the binding whose team key prefixes `key`,
     /// unless none does, its log has no pull marker, or its log shows a
     /// pull within the cooldown. Never a full pull. The cooldown lives in
-    /// the log, so every server on the vault shares it.
+    /// the log, so every server on the vault shares it. Both checks run
+    /// again once the project lock is held, so concurrent misses that
+    /// queued on the lock do not each pull.
     fn refresh_on_miss(&self, key: &str, p: &KanbanParams) -> Result<(), crate::tracker::refresh::Reason> {
         use crate::tracker::refresh::Reason;
         let bindings = self.read_bindings(p);
         let Some(binding) = crate::tracker::refresh::target(&bindings, key) else {
             return Err(Reason::NoBinding);
         };
+        crate::tracker::refresh::check(&self.mirror_view(binding).unwrap_or_default(), chrono::Utc::now())?;
+        let path = crate::tracker::log::path_for(&self.vault_root, &binding.domain, &binding.project);
+        let lock = crate::tracker::pull::acquire_lock(&path, crate::tracker::refresh::LOCK_WAIT).map_err(|e| Reason::PullFailed(e.code))?;
         let view = self.mirror_view(binding).unwrap_or_default();
+        if view.get(key).is_some() {
+            return Ok(());
+        }
         let now = chrono::Utc::now();
         crate::tracker::refresh::check(&view, now)?;
         let connect = |b: &crate::config::loader::TrackerBinding, c: &crate::tracker::credential::Credential| (self.tracker_connect)(b, c);
-        match crate::tracker::pull::pull_binding_waiting(
-            &self.vault_root,
-            &self.tracker_config_dir,
-            binding,
-            crate::tracker::pull::Mode::IncrementalOnly,
-            now,
-            &connect,
-            crate::tracker::refresh::LOCK_WAIT,
-        ) {
-            Ok(_) => Ok(()),
-            Err(error) => Err(Reason::PullFailed(error.code)),
-        }
+        crate::tracker::pull::pull_binding_held(&self.vault_root, &self.tracker_config_dir, binding, now, &connect, &lock)
+            .map(|_| ())
+            .map_err(|error| Reason::PullFailed(error.code))
     }
 
     fn mirror_view(&self, binding: &crate::config::loader::TrackerBinding) -> Option<crate::tracker::view::MirrorView> {

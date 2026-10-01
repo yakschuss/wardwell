@@ -596,3 +596,60 @@ fn get_while_the_project_lock_is_held_fails_fast_with_lock_busy() {
     assert!(started.elapsed() < std::time::Duration::from_secs(10), "waited {:?}", started.elapsed());
     assert!(calls.lock().unwrap().is_empty(), "the adapter is never asked while the lock is held");
 }
+
+/// Like `FakeAdapter`, but each pull takes `delay` before it delivers.
+struct SlowAdapter {
+    events: Vec<Event>,
+    delay: std::time::Duration,
+    calls: Arc<Mutex<Vec<bool>>>,
+}
+
+impl crate::tracker::adapter::Adapter for SlowAdapter {
+    fn pull(&self, _: Option<chrono::DateTime<chrono::Utc>>, full: bool, sink: &mut crate::tracker::adapter::Sink<'_>) -> Result<(), String> {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.push(full);
+        }
+        std::thread::sleep(self.delay);
+        sink(self.events.clone())
+    }
+}
+
+/// Three `get` calls for `key`, started 50 ms apart on their own threads,
+/// against an adapter that takes 500 ms and returns `events`.
+fn three_concurrent_gets(key: &'static str, events: Vec<Event>) -> (Vec<Value>, usize) {
+    let (mut f, calls) = refresh_fixture(vec![], None);
+    let recorded = calls.clone();
+    f.server.tracker_connect = Arc::new(move |_, _| {
+        Ok(Box::new(SlowAdapter { events: events.clone(), delay: std::time::Duration::from_millis(500), calls: recorded.clone() }) as Box<dyn crate::tracker::adapter::Adapter>)
+    });
+    let server = Arc::new(f.server);
+    let handles: Vec<_> = (0..3u64)
+        .map(|i| {
+            let server = server.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50 * i));
+                kanban(&server, json!({"action": "get", "ticket_id": key}))
+            })
+        })
+        .collect();
+    let responses = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let pulls = calls.lock().unwrap().len();
+    (responses, pulls)
+}
+
+#[test]
+fn concurrent_misses_for_a_key_the_pull_brings_make_one_pull() {
+    let now = chrono::Utc::now();
+    let (responses, pulls) = three_concurrent_gets("COR-99", vec![snapshot("COR-99", "New", "Todo", StateCategory::Unstarted, now)]);
+    assert_eq!(pulls, 1, "{responses:?}");
+    assert!(responses.iter().all(|r| r["item"]["ticket_id"] == "COR-99"), "{responses:?}");
+}
+
+#[test]
+fn concurrent_misses_for_a_key_still_missing_make_one_pull() {
+    let (responses, pulls) = three_concurrent_gets("COR-98", vec![]);
+    assert_eq!(pulls, 1, "{responses:?}");
+    let reasons: Vec<&str> = responses.iter().map(|r| r["refresh_reason"].as_str().unwrap()).collect();
+    assert_eq!(reasons.iter().filter(|r| **r == "still_missing").count(), 1, "{reasons:?}");
+    assert_eq!(reasons.iter().filter(|r| **r == "cooldown").count(), 2, "{reasons:?}");
+}
