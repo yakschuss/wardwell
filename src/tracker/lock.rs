@@ -18,6 +18,15 @@ pub const LOCK_BUSY: &str = "lock_busy";
 /// How long a pull or compact waits for the other to finish.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(30);
 
+/// The wait a test uses where it expects the lock to be free. Not zero: the
+/// lock is an advisory lock on an open file, and when any test thread spawns
+/// a process (git, for one), the child holds a copy of that open file until
+/// it execs. A test that drops the lock and takes it again with no wait can
+/// lose that window and fail with lock_busy. Zero stays only where a test
+/// asserts that it holds the lock itself.
+#[cfg(test)]
+pub const TEST_FREE_WAIT: Duration = Duration::from_secs(2);
+
 const POLL: Duration = Duration::from_millis(50);
 
 /// Held for as long as it lives; dropping it releases the lock.

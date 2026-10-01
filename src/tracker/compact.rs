@@ -286,7 +286,7 @@ mod tests {
         let before = std::fs::read_to_string(&path).unwrap();
         let summary_before = log::read(&path).unwrap();
 
-        let outcome = compact(&path, false, Duration::ZERO).unwrap();
+        let outcome = compact(&path, false, lock::TEST_FREE_WAIT).unwrap();
         assert!(outcome.changed);
         assert_eq!((outcome.events, outcome.moved_raw, outcome.duplicates_removed), (3, 2, 1));
 
@@ -310,12 +310,12 @@ mod tests {
     fn second_run_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
         let path = old_log(dir.path());
-        compact(&path, false, Duration::ZERO).unwrap();
+        compact(&path, false, lock::TEST_FREE_WAIT).unwrap();
         let log_after = std::fs::read(&path).unwrap();
         let sidecar_after = std::fs::read(log::raw_path_for(&path)).unwrap();
         let backup_after = std::fs::read(backup_path_for(&path)).unwrap();
 
-        let again = compact(&path, false, Duration::ZERO).unwrap();
+        let again = compact(&path, false, lock::TEST_FREE_WAIT).unwrap();
         assert!(!again.changed);
         assert_eq!(again.events, 3);
         assert_eq!(std::fs::read(&path).unwrap(), log_after);
@@ -329,12 +329,12 @@ mod tests {
         let path = old_log(dir.path());
         std::fs::write(backup_path_for(&path), "older backup").unwrap();
         let before = std::fs::read(&path).unwrap();
-        let error = compact(&path, false, Duration::ZERO).unwrap_err();
+        let error = compact(&path, false, lock::TEST_FREE_WAIT).unwrap_err();
         assert!(error.contains("--force"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!log::raw_path_for(&path).exists(), "nothing written before the refusal");
 
-        let outcome = compact(&path, true, Duration::ZERO).unwrap();
+        let outcome = compact(&path, true, lock::TEST_FREE_WAIT).unwrap();
         assert!(outcome.changed);
         assert_eq!(std::fs::read(backup_path_for(&path)).unwrap(), before, "the backup is the log just replaced");
     }
@@ -353,7 +353,7 @@ mod tests {
             + "\n";
         std::fs::write(&path, &original).unwrap();
 
-        let error = compact(&path, false, Duration::ZERO).unwrap_err();
+        let error = compact(&path, false, lock::TEST_FREE_WAIT).unwrap_err();
         assert!(error.contains("left as it was"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!backup_path_for(&path).exists());
@@ -375,7 +375,7 @@ mod tests {
             + "\n";
         std::fs::write(&path, &original).unwrap();
         for force in [false, true] {
-            let error = compact(&path, force, Duration::ZERO).unwrap_err();
+            let error = compact(&path, force, lock::TEST_FREE_WAIT).unwrap_err();
             assert!(error.contains("e1"), "names the id: {error}");
             assert!(!error.contains("e2"), "{error}");
             assert!(error.contains("by hand"), "{error}");
@@ -395,7 +395,7 @@ mod tests {
         std::fs::write(&path, &original).unwrap();
         log::append_raw(&log::raw_path_for(&path), "e1", json!({"body": "other"})).unwrap();
 
-        let error = compact(&path, false, Duration::ZERO).unwrap_err();
+        let error = compact(&path, false, lock::TEST_FREE_WAIT).unwrap_err();
         assert!(error.contains("not readable from the sidecar"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
@@ -405,7 +405,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = old_log(dir.path());
         let before = std::fs::read(&path).unwrap();
-        let _held = lock::acquire(&path, Duration::ZERO).unwrap();
+        let _held = lock::acquire(&path, lock::TEST_FREE_WAIT).unwrap();
         let error = compact(&path, false, Duration::from_millis(100)).unwrap_err();
         assert!(error.contains(lock::LOCK_BUSY), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -438,7 +438,7 @@ mod tests {
                 false => std::fs::rename(from, to),
             }
         };
-        let error = compact_with(&path, true, Duration::ZERO, &failing).unwrap_err();
+        let error = compact_with(&path, true, lock::TEST_FREE_WAIT, &failing).unwrap_err();
         assert!(error.contains("could not replace"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), log_before);
         assert_eq!(std::fs::read_to_string(backup_path_for(&path)).unwrap(), backup_before);
@@ -455,7 +455,7 @@ mod tests {
                 false => std::fs::rename(from, to),
             }
         };
-        let error = compact_with(&path, true, Duration::ZERO, &failing).unwrap_err();
+        let error = compact_with(&path, true, lock::TEST_FREE_WAIT, &failing).unwrap_err();
         assert!(error.contains("could not keep a backup"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), log_before);
         assert_eq!(std::fs::read_to_string(backup_path_for(&path)).unwrap(), backup_before);
@@ -476,7 +476,7 @@ mod tests {
                 _ => std::fs::rename(from, to),
             }
         };
-        let outcome = compact_with(&path, true, Duration::ZERO, &flaky).unwrap();
+        let outcome = compact_with(&path, true, lock::TEST_FREE_WAIT, &flaky).unwrap();
         assert!(outcome.changed);
         assert_eq!(std::fs::read(backup_path_for(&path)).unwrap(), log_before, "the backup is the log just replaced");
         assert!(leftovers(&path).is_empty(), "{:?}", leftovers(&path));
@@ -505,7 +505,7 @@ mod tests {
         let heavy = newer_row("e2", "COR-2", Some(json!({"body": "payload"})));
         std::fs::write(&path, format!("{SCHEMA_HEADER}\n{light}\n{heavy}\n")).unwrap();
 
-        let outcome = compact(&path, false, Duration::ZERO).unwrap();
+        let outcome = compact(&path, false, lock::TEST_FREE_WAIT).unwrap();
         assert_eq!(outcome.moved_raw, 1);
         let after = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = after.lines().collect();
@@ -518,14 +518,14 @@ mod tests {
         assert_eq!(moved["zz_first"], true);
         assert_eq!(moved["issue"]["estimate"], 5);
         assert_eq!(log::read_raw(&log::raw_path_for(&path)).unwrap()["e2"], json!({"body": "payload"}));
-        assert!(!compact(&path, false, Duration::ZERO).unwrap().changed, "second run is a no-op");
+        assert!(!compact(&path, false, lock::TEST_FREE_WAIT).unwrap().changed, "second run is a no-op");
     }
 
     #[test]
     fn missing_log_is_nothing_to_do() {
         let dir = tempfile::tempdir().unwrap();
         let path = log::path_for(dir.path(), "work", "claims");
-        assert!(!compact(&path, false, Duration::ZERO).unwrap().changed);
+        assert!(!compact(&path, false, lock::TEST_FREE_WAIT).unwrap().changed);
         assert!(!path.exists());
     }
 }

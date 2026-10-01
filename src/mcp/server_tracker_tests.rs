@@ -590,7 +590,7 @@ fn a_domain_scoped_session_sees_no_mirror_outside_its_domains() {
 fn get_while_the_project_lock_is_held_fails_fast_with_lock_busy() {
     let (f, calls) = refresh_fixture(vec![], None);
     let path = crate::tracker::log::path_for(&f.server.vault_root, "work", "claims");
-    let _held = crate::tracker::lock::acquire(&path, std::time::Duration::ZERO).unwrap();
+    let _held = crate::tracker::lock::acquire(&path, crate::tracker::lock::TEST_FREE_WAIT).unwrap();
     let started = std::time::Instant::now();
     let response = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-77"}));
     assert_eq!(response["refreshed"], false, "{response}");

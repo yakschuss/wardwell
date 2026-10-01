@@ -687,7 +687,7 @@ mod tests {
         IndexBuilder::full_build(&store, dir.path(), None).unwrap();
         assert_eq!(zebra(&store), (1, 1));
 
-        crate::tracker::compact::compact(&path, false, std::time::Duration::ZERO).unwrap();
+        crate::tracker::compact::compact(&path, false, crate::tracker::lock::TEST_FREE_WAIT).unwrap();
         let after = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = after.lines().collect();
         assert_eq!((lines[1], lines[3]), (light_first.as_str(), light_last.as_str()), "first and last lines unchanged");
