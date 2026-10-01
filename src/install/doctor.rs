@@ -239,7 +239,10 @@ fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, bina
     let settings_path = crate::install::installer::settings_path(home);
     let settings: Option<serde_json::Value> = std::fs::read(&settings_path).ok().and_then(|b| serde_json::from_slice(&b).ok());
     let settings = settings.unwrap_or_default();
-    let gate = client_hooks::commands(&settings, &GATE);
+    let gate = client_hooks::placements(&settings, &GATE);
+    let covers = |matcher: Option<&str>| {
+        [crate::gate::linear::COMMENT_TOOL, crate::gate::linear::ISSUE_TOOL].iter().all(|tool| client_hooks::matcher_covers(matcher, tool))
+    };
     let mut rows = vec![format!("  {:<38} \u{2713} {} v{}", "Gate ruleset", LINEAR_UPDATES.name, LINEAR_UPDATES.version)];
     let mut ok = true;
     // `None` is a row with no mark: a fact, not a check.
@@ -250,7 +253,13 @@ fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, bina
             None => rows.push(format!("  {label:<38} {text}")),
         }
     };
-    match (policy, gate.first().and_then(|c| client_hooks::executable(c))) {
+    let first = gate.first().map(|(matcher, command)| (matcher.as_deref(), client_hooks::executable(command)));
+    let uncovered = first.filter(|(matcher, _)| policy && !covers(*matcher)).and_then(|(matcher, _)| matcher);
+    match (policy, first.and_then(|(_, exe)| exe)) {
+        (true, Some(_)) if uncovered.is_some() => row("Linear gate", Some(false), format!(
+            "installed under matcher {}, which does not match Linear writes; edit that matcher or remove the handler, then run `wardwell setup`",
+            uncovered.unwrap_or_default()
+        )),
         (true, Some(exe)) if same_file(Path::new(exe), binary) => row("Linear gate", Some(true), format!("installed; runs {exe}")),
         (true, Some(exe)) => row("Linear gate", Some(false), format!("runs {exe}, not this binary {}; {FIX}", binary.display())),
         (true, None) => row("Linear gate", Some(false), format!("not installed; {FIX}")),
@@ -796,7 +805,10 @@ mod tests {
         put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/w/wardwell gate linear"}]}]}}"#);
         let (rows, ok) = policy_rows(&policy_config(home, true), home, Path::new("/w/wardwell"), false);
         assert!(!ok);
-        assert!(rows[1].contains("\u{2717} not installed"), "{}", rows[1]);
+        assert!(rows[1].contains("\u{2717} installed under matcher Bash, which does not match Linear writes"), "{}", rows[1]);
+        put(home, ".claude/settings.json", r#"{"hooks": {"PreToolUse": [{"matcher": "mcp__linear__.*", "hooks": [{"type": "command", "command": "/w/wardwell gate linear"}]}]}}"#);
+        let (rows, _) = policy_rows(&policy_config(home, true), home, Path::new("/w/wardwell"), false);
+        assert!(rows[1].contains("\u{2713} installed; runs /w/wardwell"), "{}", rows[1]);
     }
 
     #[test]

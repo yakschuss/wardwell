@@ -892,7 +892,7 @@ mod tests {
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 
-    const USER_TEXT: &str = "{\n  \"zeta\": 12345678901234567890123,\n  \"alpha\": 1e3,\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"startup\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/usr/local/bin/wardwell inject \\\"$(pwd)\\\"\"\n          }\n        ]\n      }\n    ]\n  }\n}\n";
+    const USER_TEXT: &str = "{\n  \"zeta\": 12345678901234567890123,\n  \"alpha\": 1e3,\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"startup\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"peon ping\"\n          }\n        ]\n      }\n    ]\n  }\n}\n";
 
     #[cfg(unix)]
     #[test]
@@ -905,7 +905,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         run(&h, &binding("linear", true));
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("{\n  \"zeta\": 12345678901234567890123,\n  \"alpha\": 1e3,\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"startup\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/usr/local/bin/wardwell inject"), "{text}");
+        assert!(text.starts_with("{\n  \"zeta\": 12345678901234567890123,\n  \"alpha\": 1e3,\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"matcher\": \"startup\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"peon ping\""), "{text}");
         let s = settings(&h);
         assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 2, "{text}");
         assert_eq!(client_hooks::commands(&s, &SESSION_START), vec![format!("'{BIN}' inject \"$(pwd)\"")]);
@@ -915,6 +915,30 @@ mod tests {
         apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), USER_TEXT);
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn wardwell_hooks_under_user_matchers_are_updated_in_place_and_removed_alone() {
+        let h = home();
+        put_settings(&h, json!({"hooks": {
+            "SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "/old/wardwell inject \"$(pwd)\""}, {"type": "command", "command": "peon"}]}],
+            "PreToolUse": [{"matcher": "mcp__linear__.*", "hooks": [{"type": "command", "command": "/old/wardwell gate linear"}, {"type": "command", "command": "audit"}]}]
+        }}));
+        run(&h, &binding("linear", true));
+        let s = settings(&h);
+        assert_eq!(client_hooks::commands(&s, &SESSION_START), vec![format!("'{BIN}' inject \"$(pwd)\"")]);
+        assert_eq!(client_hooks::commands(&s, &GATE), vec![format!("'{BIN}' gate linear")]);
+        assert_eq!(s["hooks"]["SessionStart"].as_array().unwrap().len(), 1, "{s}");
+        assert_eq!(s["hooks"]["SessionStart"][0]["matcher"], "startup");
+        assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1, "{s}");
+        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "mcp__linear__.*");
+        assert!(plan_for(&h, &binding("linear", true), false).is_noop());
+        apply(&uninstall_plan(&h.home, &h.cfg), &Fake::new(&[]), &|| Ok(501)).unwrap();
+        let s = settings(&h);
+        assert!(client_hooks::commands(&s, &SESSION_START).is_empty());
+        assert!(client_hooks::commands(&s, &GATE).is_empty());
+        assert_eq!(s["hooks"]["SessionStart"], json!([{"matcher": "startup", "hooks": [{"type": "command", "command": "peon"}]}]));
+        assert_eq!(s["hooks"]["PreToolUse"], json!([{"matcher": "mcp__linear__.*", "hooks": [{"type": "command", "command": "audit"}]}]));
     }
 
     #[test]

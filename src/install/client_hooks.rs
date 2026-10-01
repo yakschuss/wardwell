@@ -57,11 +57,6 @@ fn is_owned(handler: &Value, args: &str) -> bool {
     handler["type"] == "command" && handler["command"].as_str().and_then(wardwell_args) == Some(args)
 }
 
-fn matcher_fits(group: &Value, matcher: Option<&str>) -> bool {
-    let current = group.get("matcher").and_then(Value::as_str).filter(|m| !m.is_empty());
-    current == matcher
-}
-
 fn event_groups<'a>(root: &'a mut Value, event: &str) -> Result<&'a mut Vec<Value>, String> {
     root.as_object_mut()
         .ok_or("Claude settings must be a JSON object")?
@@ -75,18 +70,16 @@ fn event_groups<'a>(root: &'a mut Value, event: &str) -> Result<&'a mut Vec<Valu
         .ok_or(format!("hooks.{event} must be an array"))
 }
 
-/// Leave exactly one handler for `spec` running `command` among the groups
-/// whose matcher is `spec`'s. An owned handler there is updated in place so
-/// the file's order is kept. Groups with another matcher are not touched.
+/// Leave exactly one handler for `spec` running `command` in its event. The
+/// first owned handler counts wherever it sits, even under a matcher the user
+/// chose: its command is updated in place and its group, matcher included, is
+/// left as it is. Other owned copies are removed. With none, a new group with
+/// `spec`'s matcher is added.
 pub fn ensure(root: &mut Value, spec: &Handler, command: &str) -> Result<(), String> {
     let groups = event_groups(root, spec.event)?;
     let mut kept = false;
     let mut emptied = Vec::new();
     for (index, group) in groups.iter_mut().enumerate() {
-        // A group scoped by another matcher is the user's; never move or edit it.
-        if !matcher_fits(group, spec.matcher) {
-            continue;
-        }
         if group.get("hooks").is_none() && is_owned(group, spec.args) {
             emptied.push(index);
             continue;
@@ -185,29 +178,43 @@ fn remove_where_in(root: &mut Value, scope: impl Fn(&str, &Value) -> bool, owned
     removed
 }
 
-/// Remove every handler running `spec`'s arguments from a Wardwell binary,
-/// in `spec`'s event and in groups with `spec`'s matcher only.
+/// Remove every handler running `spec`'s arguments from a Wardwell binary in
+/// `spec`'s event, under any matcher. The rest of each group stays.
 pub fn remove(root: &mut Value, spec: &Handler) -> usize {
-    remove_where_in(
-        root,
-        |event, group| event == spec.event && matcher_fits(group, spec.matcher),
-        |command| wardwell_args(command) == Some(spec.args),
-    )
+    remove_where_in(root, |event, _| event == spec.event, |command| wardwell_args(command) == Some(spec.args))
 }
 
-/// Commands of the handlers for `spec` in groups with its matcher, in file order.
+/// Commands of the handlers for `spec` in its event, under any matcher.
 pub fn commands(root: &Value, spec: &Handler) -> Vec<String> {
+    placements(root, spec).into_iter().map(|(_, command)| command).collect()
+}
+
+/// Each handler for `spec` in its event: its group's matcher and its command.
+pub fn placements(root: &Value, spec: &Handler) -> Vec<(Option<String>, String)> {
     let Some(groups) = root["hooks"][spec.event].as_array() else { return Vec::new() };
-    groups
-        .iter()
-        .filter(|group| matcher_fits(group, spec.matcher))
-        .flat_map(|group| match group.get("hooks").and_then(Value::as_array) {
+    let mut found = Vec::new();
+    for group in groups {
+        let matcher = group.get("matcher").and_then(Value::as_str).filter(|m| !m.is_empty()).map(str::to_string);
+        let handlers = match group.get("hooks").and_then(Value::as_array) {
             Some(handlers) => handlers.clone(),
             None => vec![group.clone()],
-        })
-        .filter(|handler| is_owned(handler, spec.args))
-        .filter_map(|handler| handler["command"].as_str().map(str::to_string))
-        .collect()
+        };
+        for handler in handlers.iter().filter(|handler| is_owned(handler, spec.args)) {
+            if let Some(command) = handler["command"].as_str() {
+                found.push((matcher.clone(), command.to_string()));
+            }
+        }
+    }
+    found
+}
+
+/// True when a group with `matcher` runs for `tool`. Claude Code reads a
+/// matcher as a regular expression; none, or `*`, matches every tool.
+pub fn matcher_covers(matcher: Option<&str>, tool: &str) -> bool {
+    match matcher {
+        None | Some("*") => true,
+        Some(pattern) => regex::Regex::new(&format!("^(?:{pattern})$")).is_ok_and(|re| re.is_match(tool)),
+    }
 }
 
 /// The executable path of a hook command, quoted or not.
@@ -309,19 +316,18 @@ mod tests {
     }
 
     #[test]
-    fn ensure_collapses_duplicates_and_never_touches_another_matcher_group() {
-        let user = json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "/a/wardwell gate linear"}, {"type": "command", "command": "rtk"}]});
+    fn a_handler_under_a_user_matcher_counts_and_keeps_its_matcher() {
         let mut root = json!({"hooks": {"PreToolUse": [
-            user.clone(),
-            {"matcher": crate::gate::linear::MATCHER, "hooks": [{"type": "command", "command": "/b/wardwell gate linear"}]},
-            {"matcher": crate::gate::linear::MATCHER, "hooks": [{"type": "command", "command": "/c/wardwell gate linear"}]}
+            {"matcher": "mcp__linear__.*", "hooks": [{"type": "command", "command": "/a/wardwell gate linear"}, {"type": "command", "command": "rtk"}]},
+            {"matcher": crate::gate::linear::MATCHER, "hooks": [{"type": "command", "command": "/b/wardwell gate linear"}]}
         ]}});
         ensure(&mut root, &GATE, &cmd("gate linear")).unwrap();
         assert_eq!(commands(&root, &GATE), vec![cmd("gate linear")]);
-        assert_eq!(root["hooks"]["PreToolUse"][0], user);
-        assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        assert_eq!(root["hooks"]["PreToolUse"][0]["matcher"], "mcp__linear__.*");
+        assert_eq!(root["hooks"]["PreToolUse"][0]["hooks"][0]["command"], cmd("gate linear"));
         assert_eq!(remove(&mut root, &GATE), 1);
-        assert_eq!(root["hooks"]["PreToolUse"], json!([user]));
+        assert_eq!(root["hooks"]["PreToolUse"], json!([{"matcher": "mcp__linear__.*", "hooks": [{"type": "command", "command": "rtk"}]}]));
     }
 
     #[test]
