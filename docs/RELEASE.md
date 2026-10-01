@@ -55,9 +55,16 @@ wardwell tracker doctor
 wardwell tracker pull --project <domain>/<project>
 ```
 
-The first github pull reads the 200 most recently updated merged pull
+The first github pull takes the 200 most recently updated merged pull
 requests. Run `wardwell tracker pull --project <domain>/<project> --full` once
-for the whole history.
+for the whole history. An edit to a pull request after merge is picked up by
+the next pull.
+
+Sessions started before the upgrade keep the old binary until they restart.
+The old binary does not know about markers from more than one provider. It
+can read a github marker as Linear's. It then shows a wrong Linear pull time,
+and its on-miss refresh can start from the wrong point. Restart those
+sessions. The daily full Linear pull repairs anything the old binary missed.
 
 The hooks and the pull service name the path you ran `wardwell` from, such as
 `/opt/homebrew/bin/wardwell`, never the versioned Cellar path behind it, so

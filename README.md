@@ -715,8 +715,9 @@ lists no issues.
 `wardwell doctor` prints one row per binding, labelled with the project and
 the provider. It checks only the credential file and the provider, with no
 network call, and names `wardwell tracker doctor` for the live check. For a
-github binding it checks for a stored token or a `gh` on PATH. It looks for
-`gh` without running it. With neither, the row reads: "github: unreachable,
+github binding it checks for a stored token or a `gh`. It looks for `gh` on
+PATH, then at `/opt/homebrew/bin/gh`, then at `/usr/local/bin/gh`, without
+running it. With neither, the row reads: "github: unreachable,
 run `wardwell tracker connect github`".
 
 ```sh
@@ -749,22 +750,57 @@ Its `change` holds `number`, `title`, `body`, `author`, `merged_at`, `url`,
 `base_branch`, and `keys`, the ticket keys in the title. Keys use the same
 pattern search uses, so a search for COR-12 finds the merged change that names
 it. A search for `acme/app#42` finds the change by its number. The raw pull
-request goes to the sidecar. A re-pull of a pull request already in the log
-appends nothing.
+request goes to the sidecar. The event's `occurred_at` is the pull
+request's update time.
 
-The first pull reads the 200 most recently updated merged pull requests. Each
-later pull reads those merged since the GitHub cursor, less one hour. `wardwell
-tracker pull --full` reads every merged pull request. A github pull never runs
-full on its own, since merged pull requests are never removed.
+An edit after merge is picked up. When the title, the body or the keys of a
+pull request differ from its latest logged event, the next pull appends a
+new event. Its id ends in `:rev:` and a digest of the content. Readers take
+the latest event for each pull request. An update that changes none of
+these, such as a new comment, appends nothing.
+
+The first pull takes the 200 most recently updated merged pull requests.
+The GitHub cursor is the newest update time seen. Each later pull reads the
+merged pull requests updated since the cursor, less one hour. `wardwell
+tracker pull --full` reads every merged pull request and repairs stale keys
+the same way. A github pull never runs full on its own, since merged pull
+requests are never removed.
 
 Wardwell reads GitHub in this order:
 
-1. `gh`, when it is on PATH and answers. It runs `gh pr list --repo
-   <owner>/<name> --state merged --json number,title,body,author,mergedAt,url,baseRefName,id`
-   with a limit and a search for the merge date.
+1. `gh`, when one is found and answers. Wardwell looks on PATH, then at
+   `/opt/homebrew/bin/gh`, then at `/usr/local/bin/gh`. The hourly service
+   runs with a short PATH, so the two fixed paths matter there.
 2. The REST API at `GET /repos/<owner>/<name>/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=<n>`,
    with the token stored by `wardwell tracker connect github --token-stdin`.
+   Paging stops at the first pull request updated before the cursor.
 3. Neither: the pull fails with `credential` and names the connect command.
+
+The first pull runs this command:
+
+```sh
+gh pr list --repo <owner>/<name> --state merged --json number,title,body,author,mergedAt,url,baseRefName,id,updatedAt --limit 200 --search "sort:updated-desc"
+```
+
+A later pull asks for at most 100 rows per read:
+
+```sh
+gh pr list --repo <owner>/<name> --state merged --json <fields> --limit 100 --search "is:merged updated:>=<cursor less one hour> sort:updated-desc"
+```
+
+A reply that holds 100 rows may have left rows out. Wardwell then splits the
+update-time range in half and reads each half with
+`updated:<from>..<to>`, newer half first, until every reply holds fewer
+than 100. A one-second range that still holds 100 fails with `provider`, and
+no `pull_completed` is written. `--full` always reads this way, from 2008 to
+now, so no reply nears the 16 MiB cap.
+
+`gh` runs in its own process group. A read that runs past 120 seconds has
+the whole group stopped. A timeout, output over 16 MiB, a non-zero exit, or
+output that is not a list each fail with their own sentence and the code
+`provider`. When `gh` fails and a token is stored, the pull reads through
+the REST API instead. The code `credential` means only that no reader can
+read: no `gh` and no token, or a `gh` that is not signed in and no token.
 
 `gh` is an optional accelerator. It saves you a second token when you already
 use `gh`. Only `tracker pull` and `tracker doctor` run it. The memory path,
@@ -787,6 +823,11 @@ prints two lines for a github binding: `github token` and `github repository`,
 with the reader that answered. `compact` handles both providers in one log.
 `inject`, the kanban read path and the on-miss refresh read only the linear
 binding. They never show a merged change or a github marker.
+
+After an upgrade, sessions started earlier keep the old binary until they
+restart. The old binary can read a github marker as Linear's, so it can show
+a wrong Linear pull time or refresh from the wrong point. Restart those
+sessions. The daily full Linear pull repairs what the old binary missed.
 
 ## Domain Scoping
 
