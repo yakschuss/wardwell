@@ -11,6 +11,7 @@ pub mod credential;
 pub mod deadline;
 pub mod doctor;
 pub mod events;
+pub mod freshness;
 pub mod github;
 pub mod items;
 pub mod linear;

@@ -62,7 +62,17 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, g
         healthy &= checks.iter().all(|(_, outcome)| matches!(outcome, Outcome::Ok | Outcome::Found(_)));
         lines.extend(checks.into_iter().map(|(name, outcome)| format!("{key}: {name} {}", outcome.describe())));
     }
+    lines.extend(config.trackers.iter().map(|binding| mirror_line(&config.vault_path, binding, chrono::Utc::now())));
     (lines, healthy)
+}
+
+/// `<key>: <provider> mirror: <freshness words>`, read from the log. A
+/// fact, not a check: it never fails the run.
+pub fn mirror_line(vault_root: &Path, binding: &TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
+    let path = crate::tracker::log::path_for(vault_root, &binding.domain, &binding.project);
+    let view = crate::tracker::view::MirrorView::read_for(&path, &binding.provider).unwrap_or_default();
+    let fresh = crate::tracker::freshness::assess(&view, now, &crate::tracker::freshness::process_alive);
+    format!("{}: {} mirror: {}", binding.key(), binding.provider, fresh.sentence())
 }
 
 /// The checks that need no network: the credential file exists with
@@ -251,8 +261,35 @@ mod tests {
     fn healthy_binding_prints_one_ok_line_per_check() {
         let (dir, config) = setup(true);
         let (lines, healthy) = doctor_with(dir.path(), &config, viewer_ok(), json!([{"key": "COR"}]));
-        assert_eq!(lines, vec!["work/claims: credential ok", "work/claims: auth ok", "work/claims: team COR ok", "work/claims: kanban prefix ok"]);
-        assert!(healthy);
+        assert_eq!(lines, vec![
+            "work/claims: credential ok",
+            "work/claims: auth ok",
+            "work/claims: team COR ok",
+            "work/claims: kanban prefix ok",
+            "work/claims: linear mirror: Never pulled. Stale. Reason: No pull was tried.",
+        ]);
+        assert!(healthy, "a stale mirror is a fact, not a failed check");
+    }
+
+    #[test]
+    fn the_mirror_line_says_fresh_stale_or_running() {
+        let (_dir, config) = setup(true);
+        let binding = &config.trackers[0];
+        let now = chrono::Utc::now();
+        let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let row = |kind: &str, minutes_ago: i64, extra: &str| {
+            let at = (now - chrono::TimeDelta::minutes(minutes_ago)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            format!(r#"{{"kind":"{kind}","id":"{kind}{minutes_ago}","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{at}","title":"t"{extra}}}"#)
+        };
+        let write = |rows: &[String]| std::fs::write(&path, format!("{}\n{}\n", crate::tracker::events::SCHEMA_HEADER, rows.join("\n"))).unwrap();
+        write(&[row("pull_completed", 30, "")]);
+        assert_eq!(mirror_line(&config.vault_path, binding, now), "work/claims: linear mirror: Last pulled 30m ago.");
+        write(&[row("pull_completed", 300, ""), row("pull_failed", 60, r#","code":"timeout""#)]);
+        assert_eq!(mirror_line(&config.vault_path, binding, now), "work/claims: linear mirror: Last pulled 5h ago. Stale. Reason: The last pull failed: timeout.");
+        write(&[row("pull_completed", 300, ""), row("pull_started", 2, &format!(r#","pid":{}"#, std::process::id()))]);
+        let at = (now - chrono::TimeDelta::minutes(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert_eq!(mirror_line(&config.vault_path, binding, now), format!("work/claims: linear mirror: Last pulled 5h ago; pull running since {at}."));
     }
 
     #[test]
@@ -313,8 +350,8 @@ mod tests {
         config.trackers[0].provider = "jira".into();
         let (lines, healthy) = run(&config, dir.path(), &connect_transport, &no_gh);
         assert_eq!(
-            lines,
-            vec!["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped", "work/claims: kanban prefix ok"]
+            lines[..4],
+            ["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped", "work/claims: kanban prefix ok"]
         );
         assert!(!healthy);
     }
@@ -342,13 +379,13 @@ mod tests {
         };
         let (lines, healthy) = run_with(&config, dir.path(), &probe, &no_gh, &native);
         assert_eq!(
-            lines.last().unwrap(),
+            lines[lines.len() - 2],
             "work/claims: kanban prefix failed (prefix_collision): Tracker team key COR of work/claims equals the native kanban prefix COR of project claims. Set a different native prefix for claims in kanban.prefixes."
         );
         assert!(!healthy);
         let other = std::collections::BTreeMap::from([("work/claims".to_string(), "CL".to_string())]);
         let (lines, healthy) = run_with(&config, dir.path(), &probe, &no_gh, &other);
-        assert_eq!(lines.last().unwrap(), "work/claims: kanban prefix ok");
+        assert_eq!(lines[lines.len() - 2], "work/claims: kanban prefix ok");
         assert!(healthy);
     }
 
@@ -396,7 +433,11 @@ mod tests {
         let native = BTreeMap::new();
 
         let (lines, healthy) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::Output(b"{}".to_vec()), None), &native);
-        assert_eq!(lines[4..], ["work/claims: github token not stored; gh reads alone", "work/claims: github repository acme/app ok through gh"]);
+        assert_eq!(lines[4..6], ["work/claims: github token not stored; gh reads alone", "work/claims: github repository acme/app ok through gh"]);
+        assert_eq!(lines[6..], [
+            "work/claims: linear mirror: Never pulled. Stale. Reason: No pull was tried.",
+            "work/claims: github mirror: Never pulled. Stale. Reason: No pull was tried.",
+        ], "one mirror line per binding, last");
         assert_eq!(lines[0], "work/claims: credential ok", "the linear lines are unchanged");
         assert!(healthy, "{lines:?}");
 

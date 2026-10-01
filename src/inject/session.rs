@@ -6,6 +6,7 @@
 
 use crate::config::loader::WardwellConfig;
 use crate::tracker::events::{FailureCode, StateCategory};
+use crate::tracker::freshness::{self, Freshness, State};
 use crate::tracker::view::{MirrorView, age_words};
 use chrono::{DateTime, Local, NaiveDate, TimeDelta, Utc};
 use std::path::Path;
@@ -28,7 +29,8 @@ pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain:
     let binding = config.tracker_for(domain, project)?;
     let blocked = crate::tracker::doctor::check_offline(config_dir, binding).err().map(|(code, _)| code);
     let view = MirrorView::read_for(&project_dir.join(crate::tracker::events::FILE_NAME), &binding.provider).unwrap_or_default();
-    Some(tracker_section(&view, now, blocked))
+    let fresh = freshness::assess(&view, now, &freshness::process_alive);
+    Some(tracker_section(&view, &fresh, now, blocked))
 }
 
 /// `Last history entry 12 days ago. Last decision 3 days ago.`
@@ -46,12 +48,13 @@ fn days_ago(date: NaiveDate, today: NaiveDate) -> String {
     }
 }
 
-/// The tracker section for a mirror at `now`. When pulls cannot run
-/// (`blocked`, from the offline doctor check), one line with the code and
-/// the age. A mirror never pulled says only that. A failed or stale last
-/// pull shows only the age and the notice; otherwise up to ten started
-/// issues, most recently updated first.
-pub fn tracker_section(view: &MirrorView, now: DateTime<Utc>, blocked: Option<FailureCode>) -> Vec<String> {
+/// The tracker section for a mirror at `now`, with its freshness. When
+/// pulls cannot run (`blocked`, from the offline doctor check), one line
+/// with the code and the age. A mirror never pulled says only that. A
+/// stale mirror opens with the stale line and its reason. A failed last
+/// pull or a mirror over 24 hours old shows no issues; otherwise up to ten
+/// started issues, most recently updated first.
+pub fn tracker_section(view: &MirrorView, fresh: &Freshness, now: DateTime<Utc>, blocked: Option<FailureCode>) -> Vec<String> {
     let age = view.last_pull_at.map(|at| age_words(now - at));
     if let Some(code) = blocked {
         let pulled = age.map_or("Never pulled.".to_string(), |age| format!("Last pulled {age} ago."));
@@ -60,10 +63,13 @@ pub fn tracker_section(view: &MirrorView, now: DateTime<Utc>, blocked: Option<Fa
     let Some(age) = age else {
         return vec!["Tracker mirror. Never pulled. Not authoritative.".to_string()];
     };
-    let mut lines = vec![format!("Tracker mirror. Last pulled {age} ago. Not authoritative.")];
+    let mut lines = match fresh.state {
+        State::Stale(_) => vec![format!("Tracker mirror. {}", fresh.sentence())],
+        State::Fresh | State::Running(_) => vec![format!("Tracker mirror. Last pulled {age} ago. Not authoritative.")],
+    };
     let failed = view.failed_since_last_pull();
     let stale = view.last_pull_at.is_some_and(|at| now - at > STALE_AFTER);
-    if let Some(code) = failed {
+    if let (Some(code), false) = (failed, matches!(fresh.state, State::Stale(_))) {
         lines.push(format!("The last pull failed: {}. Run `wardwell tracker status`.", code.as_str()));
     }
     if stale {
@@ -178,6 +184,20 @@ mod tests {
         assert_eq!(rot_line(None, None, date(30)), "No history entries. No decisions.");
     }
 
+    /// The section as session start builds it; `alive` answers for every process id.
+    fn section(view: &MirrorView, blocked: Option<FailureCode>, alive: bool) -> Vec<String> {
+        let fresh = freshness::assess(view, now(), &|_| alive);
+        tracker_section(view, &fresh, now(), blocked)
+    }
+
+    fn with_attempt(mut view: MirrorView, attempt: crate::tracker::view::Attempt) -> MirrorView {
+        view.last_attempt = Some(attempt);
+        if let crate::tracker::view::Attempt::Failed { at, code } = attempt {
+            view.last_failure = Some((at, code));
+        }
+        view
+    }
+
     #[test]
     fn a_fresh_mirror_lists_started_issues_newest_first_capped_at_ten() {
         let mut issues: Vec<MirroredIssue> = (1..=12).map(|n| issue(n, StateCategory::Started)).collect();
@@ -185,8 +205,8 @@ mod tests {
         let mut archived = issue(0, StateCategory::Started);
         archived.issue.archived_at = Some(now());
         issues.push(archived);
-        let lines = tracker_section(&view(3, issues), now(), None);
-        assert_eq!(lines[0], "Tracker mirror. Last pulled 3 hours ago. Not authoritative.");
+        let lines = section(&view(1, issues), None, false);
+        assert_eq!(lines[0], "Tracker mirror. Last pulled 1 hour ago. Not authoritative.");
         assert_eq!(lines.len(), 1 + MAX_STARTED);
         assert_eq!(lines[1], "- COR-1 Work 1 (In Progress)");
         assert_eq!(lines[10], "- COR-10 Work 10 (In Progress)");
@@ -194,28 +214,57 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_mirror_shows_only_the_age_and_the_notice() {
-        let lines = tracker_section(&view(25, vec![issue(1, StateCategory::Started)]), now(), None);
+    fn a_mirror_two_to_24_hours_old_says_stale_and_why_and_still_lists_issues() {
+        let lines = section(&view(5, vec![issue(1, StateCategory::Started)]), None, false);
         assert_eq!(lines, vec![
-            "Tracker mirror. Last pulled 1 day ago. Not authoritative.",
+            "Tracker mirror. Last pulled 5h ago. Stale. Reason: No pull was tried.",
+            "- COR-1 Work 1 (In Progress)",
+        ]);
+    }
+
+    #[test]
+    fn a_stale_mirror_names_a_pull_that_did_not_finish() {
+        let started = crate::tracker::view::Attempt::Started { at: now() - TimeDelta::hours(1), pid: 4242 };
+        let lines = section(&with_attempt(view(5, vec![]), started), None, false);
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 5h ago. Stale. Reason: A pull started at 2026-09-30T11:00:00Z and did not finish."]);
+    }
+
+    #[test]
+    fn a_running_pull_adds_no_notice() {
+        let started = crate::tracker::view::Attempt::Started { at: now() - TimeDelta::minutes(2), pid: 4242 };
+        let lines = section(&with_attempt(view(5, vec![issue(1, StateCategory::Started)]), started), None, true);
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 5 hours ago. Not authoritative.", "- COR-1 Work 1 (In Progress)"]);
+    }
+
+    #[test]
+    fn a_mirror_over_24_hours_old_hides_the_issue_list() {
+        let lines = section(&view(25, vec![issue(1, StateCategory::Started)]), None, false);
+        assert_eq!(lines, vec![
+            "Tracker mirror. Last pulled 25h ago. Stale. Reason: No pull was tried.",
             "The mirror is more than 24 hours old. Run `wardwell tracker pull`.",
         ]);
     }
 
     #[test]
-    fn a_failed_last_pull_shows_only_the_age_and_the_failure() {
-        let mut failed = view(2, vec![issue(1, StateCategory::Started)]);
-        failed.last_failure = Some((now() - TimeDelta::hours(1), FailureCode::Auth));
-        let lines = tracker_section(&failed, now(), None);
+    fn a_stale_mirror_whose_last_pull_failed_names_the_code_and_hides_the_list() {
+        let failed = crate::tracker::view::Attempt::Failed { at: now() - TimeDelta::hours(1), code: FailureCode::Auth };
+        let lines = section(&with_attempt(view(2, vec![issue(1, StateCategory::Started)]), failed), None, false);
+        assert_eq!(lines, vec!["Tracker mirror. Last pulled 2h ago. Stale. Reason: The last pull failed: auth."]);
+    }
+
+    #[test]
+    fn a_fresh_mirror_whose_last_pull_failed_shows_only_the_age_and_the_failure() {
+        let failed = crate::tracker::view::Attempt::Failed { at: now() - TimeDelta::minutes(30), code: FailureCode::Auth };
+        let lines = section(&with_attempt(view(1, vec![issue(1, StateCategory::Started)]), failed), None, false);
         assert_eq!(lines, vec![
-            "Tracker mirror. Last pulled 2 hours ago. Not authoritative.",
+            "Tracker mirror. Last pulled 1 hour ago. Not authoritative.",
             "The last pull failed: auth. Run `wardwell tracker status`.",
         ]);
     }
 
     #[test]
     fn a_mirror_never_pulled_says_only_that() {
-        let lines = tracker_section(&MirrorView::default(), now(), None);
+        let lines = section(&MirrorView::default(), None, false);
         assert_eq!(lines, vec!["Tracker mirror. Never pulled. Not authoritative."]);
     }
 
@@ -223,11 +272,11 @@ mod tests {
     fn a_mirror_whose_pulls_cannot_run_is_not_presented_as_current() {
         let fresh = view(1, vec![issue(1, StateCategory::Started)]);
         assert_eq!(
-            tracker_section(&fresh, now(), Some(FailureCode::Credential)),
+            section(&fresh, Some(FailureCode::Credential), false),
             vec!["Tracker mirror. Pulls cannot run: credential. Last pulled 1 hour ago."]
         );
         assert_eq!(
-            tracker_section(&MirrorView::default(), now(), Some(FailureCode::UnsupportedProvider)),
+            section(&MirrorView::default(), Some(FailureCode::UnsupportedProvider), false),
             vec!["Tracker mirror. Pulls cannot run: unsupported_provider. Never pulled."]
         );
     }

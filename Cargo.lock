@@ -3653,6 +3653,7 @@ dependencies = [
  "dirs",
  "fastembed",
  "glob",
+ "libc",
  "notify",
  "regex",
  "reqwest",

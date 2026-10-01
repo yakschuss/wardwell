@@ -6,7 +6,7 @@ use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::pull::{Connect, Mode, pull_binding};
 use crate::tracker::schedule::{self, LaunchctlRunner};
 use crate::tracker::events::FailureCode;
-use crate::tracker::{compact, credential, lock, log};
+use crate::tracker::{compact, credential, freshness, lock, log};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
 
@@ -187,11 +187,14 @@ fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &Tracke
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
+    let view = crate::tracker::view::MirrorView::read_for(&path, &binding.provider).unwrap_or_default();
+    let fresh = freshness::assess(&view, now, &freshness::process_alive);
     let blocked = cannot_pull(config_dir, binding, gh_on_path).map(|code| format!(", cannot pull ({})", code.as_str()));
     let last = summary.last_failure.map(|(at, code)| format!(", last error {} at {}", code.as_str(), stamp(at)));
-    let failure = match (blocked, last) {
-        (None, None) => ", no errors".to_string(),
-        (blocked, last) => format!("{}{}", blocked.unwrap_or_default(), last.unwrap_or_default()),
+    let problems = format!("{}{}{}", blocked.unwrap_or_default(), last.unwrap_or_default(), freshness_tail(&fresh));
+    let failure = match problems.is_empty() {
+        true => ", no errors".to_string(),
+        false => problems,
     };
     let Some(pulled) = summary.last_pull_at else {
         return format!("{head}, never pulled{failure}");
@@ -203,6 +206,18 @@ fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &Tracke
         age(now - pulled),
         summary.event_count
     )
+}
+
+/// What the status line adds for a mirror that is not fresh and clean:
+/// the stale words and reason, the running pull, or a pull that did not
+/// finish. Empty when the mirror is fresh and clean.
+fn freshness_tail(fresh: &freshness::Freshness) -> String {
+    match (fresh.state, fresh.unfinished) {
+        (freshness::State::Stale(reason), _) => format!(". Stale. Reason: {}.", reason.sentence()),
+        (freshness::State::Running(since), _) => format!(", pull running since {}", stamp(since)),
+        (freshness::State::Fresh, Some(at)) => format!(", a pull started at {} and did not finish", stamp(at)),
+        (freshness::State::Fresh, None) => String::new(),
+    }
 }
 
 fn stamp(time: DateTime<Utc>) -> String {
@@ -514,14 +529,14 @@ mod tests {
         let (dir, mut config) = two_bindings();
         std::fs::remove_file(crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap()).unwrap();
         let lines = status(&config, dir.path(), now(), None);
-        assert!(lines[0].ends_with("never pulled, cannot pull (credential)"), "{lines:?}");
+        assert!(lines[0].ends_with("never pulled, cannot pull (credential). Stale. Reason: No pull was tried."), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("no errors")), "{lines:?}");
 
         connect(dir.path(), "corr-linear", "t").unwrap();
         config.trackers.iter_mut().find(|b| b.project == "ops").unwrap().provider = "jira".into();
         let lines = status(&config, dir.path(), now(), None);
-        assert!(lines[0].ends_with("never pulled, no errors"), "{lines:?}");
-        assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider)"), "{lines:?}");
+        assert!(lines[0].ends_with("never pulled. Stale. Reason: No pull was tried."), "{lines:?}");
+        assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider). Stale. Reason: No pull was tried."), "{lines:?}");
     }
 
     #[test]
@@ -538,7 +553,7 @@ mod tests {
         let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &revoked).unwrap_err();
         assert!(error.ends_with("(auth)"), "{error}");
         let line = &status(&config, dir.path(), now(), None)[0];
-        assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z"), "{line}");
+        assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z. Stale. Reason: The last pull failed: auth."), "{line}");
     }
 
     #[test]
@@ -548,8 +563,59 @@ mod tests {
             Err("never called without a credential".into())
         };
         let error = doctor(&config, dir.path(), &unreachable, &crate::tracker::doctor::connect_github).unwrap_err();
-        assert_eq!(error.lines().count(), 4, "{error}");
+        assert_eq!(error.lines().count(), 5, "four checks and the mirror line: {error}");
         assert!(error.starts_with("work/claims: credential failed (credential)"), "{error}");
+    }
+
+    /// Writes `rows` after a completed pull at `pulled` into work/claims's log.
+    fn seed(config: &WardwellConfig, pulled: DateTime<Utc>, rows: &[String]) {
+        let path = log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let completed = format!(
+            r#"{{"kind":"pull_completed","id":"p","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"p"}}"#,
+            stamp(pulled)
+        );
+        let body: String = std::iter::once(completed).chain(rows.iter().cloned()).map(|row| format!("{row}\n")).collect();
+        std::fs::write(path, format!("{}\n{body}", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+    }
+
+    fn started(at: DateTime<Utc>, pid: u32) -> String {
+        format!(r#"{{"kind":"pull_started","id":"s{pid}","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"s","pid":{pid}}}"#, stamp(at))
+    }
+
+    #[test]
+    fn status_never_says_no_errors_for_a_stale_mirror() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        seed(&config, now() - chrono::TimeDelta::hours(5), &[]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with("1 events. Stale. Reason: No pull was tried."), "{line}");
+        assert!(!line.contains("no errors"), "{line}");
+        seed(&config, now() - chrono::TimeDelta::minutes(30), &[]);
+        assert!(status(&config, dir.path(), now(), None)[0].ends_with("no errors"), "a fresh clean mirror");
+    }
+
+    #[test]
+    fn status_shows_a_running_pull_and_its_start_time() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        seed(&config, now() - chrono::TimeDelta::hours(5), &[started(now() - chrono::TimeDelta::minutes(2), std::process::id())]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(", pull running since 2026-09-01T11:58:00Z"), "{line}");
+        assert!(!line.contains("no errors"), "{line}");
+    }
+
+    #[test]
+    fn status_never_says_no_errors_for_an_unfinished_pull() {
+        let (dir, config) = setup(true);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let gone = u32::MAX;
+        seed(&config, now() - chrono::TimeDelta::minutes(40), &[started(now() - chrono::TimeDelta::minutes(30), gone)]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(", a pull started at 2026-09-01T11:30:00Z and did not finish"), "{line}");
+        seed(&config, now() - chrono::TimeDelta::hours(3), &[started(now() - chrono::TimeDelta::minutes(30), gone)]);
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with(". Stale. Reason: A pull started at 2026-09-01T11:30:00Z and did not finish."), "{line}");
     }
 
     #[test]
