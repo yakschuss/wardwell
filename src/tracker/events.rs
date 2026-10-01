@@ -16,6 +16,13 @@ pub const SCHEMA_HEADER: &str = r#"{"_schema":"tracker","_version":"1.0"}"#;
 /// Vault filename for the mirror. Names the concept, never the vendor.
 pub const FILE_NAME: &str = "tracker.jsonl";
 
+/// Sidecar beside the log holding each event's raw provider payload, one
+/// line per event id. The indexer and watcher skip `*.raw.jsonl`.
+pub const RAW_FILE_NAME: &str = "tracker.raw.jsonl";
+
+/// First line of every `tracker.raw.jsonl`.
+pub const RAW_SCHEMA_HEADER: &str = r#"{"_schema":"tracker_raw","_version":"1.0"}"#;
+
 /// Fields every tracker event carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Common {
@@ -31,7 +38,9 @@ pub struct Common {
     pub occurred_at: DateTime<Utc>,
     /// Human-readable line; the indexer uses it as the chunk heading.
     pub title: String,
-    #[serde(default)]
+    /// Raw provider payload. New log rows leave it out (it lives in the
+    /// sidecar); rows written before the sidecar may still carry it inline.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub raw: Value,
 }
 

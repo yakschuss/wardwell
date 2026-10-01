@@ -509,6 +509,37 @@ mod tests {
     }
 
     #[test]
+    fn full_build_skips_raw_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("work").join("claims");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("tracker.jsonl"),
+            "{\"_schema\":\"tracker\",\"_version\":\"1.0\"}\n{\"id\":\"e1\",\"title\":\"COR-1 Light row\"}\n",
+        ).unwrap();
+        std::fs::write(
+            project_dir.join("tracker.raw.jsonl"),
+            "{\"_schema\":\"tracker_raw\",\"_version\":\"1.0\"}\n{\"id\":\"e1\",\"raw\":{\"title\":\"zebrapayload\"}}\n",
+        ).unwrap();
+
+        let store = IndexStore::in_memory().unwrap();
+        let stats = IndexBuilder::full_build(&store, dir.path(), None).unwrap();
+        assert_eq!(stats.indexed, 1, "{stats:?}");
+        let conn = store.lock().unwrap();
+        let sidecar_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vault_meta WHERE path LIKE '%.raw.jsonl'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sidecar_rows, 0);
+        drop(conn);
+        let results = store.search(&crate::index::fts::SearchQuery {
+            query: "zebrapayload".into(),
+            limit: 5,
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(results.total, 0);
+    }
+
+    #[test]
     fn jsonl_incremental_only_indexes_new_lines() {
         let dir = tempfile::tempdir().unwrap();
         let project_dir = dir.path().join("work").join("myproject");

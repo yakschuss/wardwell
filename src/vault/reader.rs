@@ -67,6 +67,14 @@ pub fn read_file(path: &Path) -> Result<VaultFile, VaultError> {
     }
 }
 
+/// Whether a vault path is indexed: `.md` and `.jsonl` files, except raw
+/// payload sidecars (`*.raw.jsonl`), which are archives, not search text.
+pub fn is_indexable(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str());
+    matches!(ext, Some("md" | "jsonl")) && !name.ends_with(".raw.jsonl")
+}
+
 /// Recursively walk a vault directory and parse all .md files.
 /// Returns a Vec of Results — individual file errors don't stop the walk.
 pub fn walk_vault(root: &Path) -> Vec<Result<VaultFile, VaultError>> {
@@ -106,7 +114,7 @@ fn walk_recursive(dir: &Path, exclude: &[String], results: &mut Vec<Result<Vault
         }
         if path.is_dir() {
             walk_recursive(&path, exclude, results);
-        } else if path.extension().is_some_and(|ext| ext == "md" || ext == "jsonl") {
+        } else if is_indexable(&path) {
             results.push(read_file(&path));
         }
     }

@@ -6,9 +6,11 @@
 //! only through `kanban::jsonl::append_line`. Does NOT talk to any provider.
 
 use crate::kanban::jsonl::append_line;
-use crate::tracker::events::{Event, SCHEMA_HEADER};
+use crate::tracker::events::{Event, RAW_FILE_NAME, RAW_SCHEMA_HEADER, SCHEMA_HEADER};
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeMap, HashSet};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// What the mirror currently knows about an issue it has not seen removed.
@@ -97,20 +99,81 @@ pub fn read(path: &Path) -> Result<LogSummary, String> {
 }
 
 /// Append events whose id is not already in `summary`, in order, and fold
-/// them into `summary`. Returns how many were written.
+/// them into `summary`. Each event's raw payload goes to the sidecar first,
+/// then its light row to the log. Returns how many were written.
 pub fn append_new(path: &Path, events: &[Event], summary: &mut LogSummary) -> Result<usize, String> {
+    let raw_path = raw_path_for(path);
     let mut written = 0;
     for event in events {
         if summary.event_ids.contains(&event.common().id) {
             continue;
         }
-        let line = serde_json::to_string(event).map_err(|_| "could not encode tracker event".to_string())?;
+        let (light, raw) = split_raw(event.clone());
+        if !raw.is_null() {
+            append_raw(&raw_path, &light.common().id, raw)?;
+        }
+        let line = serde_json::to_string(&light).map_err(|_| "could not encode tracker event".to_string())?;
         append_line(path, Some(SCHEMA_HEADER), &line)
             .map_err(|error| format!("could not append to {}: {error}", path.display()))?;
-        summary.observe(event);
+        summary.observe(&light);
         written += 1;
     }
     Ok(written)
+}
+
+/// The event without its raw payload, and the payload.
+pub fn split_raw(mut event: Event) -> (Event, Value) {
+    let raw = std::mem::take(&mut common_mut(&mut event).raw);
+    (event, raw)
+}
+
+fn common_mut(event: &mut Event) -> &mut crate::tracker::events::Common {
+    match event {
+        Event::IssueUpserted { common, .. }
+        | Event::CommentUpserted { common, .. }
+        | Event::StateChanged { common, .. }
+        | Event::LinkAdded { common, .. }
+        | Event::IssueRemoved { common }
+        | Event::FullResync { common, .. }
+        | Event::PullCompleted { common, .. } => common,
+    }
+}
+
+/// One line of the raw sidecar.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RawRecord {
+    pub id: String,
+    pub raw: Value,
+}
+
+/// The sidecar beside a log: `tracker.raw.jsonl` in the same folder.
+pub fn raw_path_for(log_path: &Path) -> PathBuf {
+    log_path.with_file_name(RAW_FILE_NAME)
+}
+
+/// Append one raw payload to the sidecar at `raw_path`.
+pub fn append_raw(raw_path: &Path, id: &str, raw: Value) -> Result<(), String> {
+    let record = RawRecord { id: id.to_string(), raw };
+    let line = serde_json::to_string(&record).map_err(|_| "could not encode a raw tracker payload".to_string())?;
+    append_line(raw_path, Some(RAW_SCHEMA_HEADER), &line)
+        .map_err(|error| format!("could not append to {}: {error}", raw_path.display()))
+}
+
+/// Every raw payload in the sidecar by event id; the first line for an id
+/// wins. A missing sidecar is empty; unreadable lines are skipped.
+pub fn read_raw(raw_path: &Path) -> Result<HashMap<String, Value>, String> {
+    let content = match std::fs::read_to_string(raw_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(_) => return Err(format!("could not read {}", raw_path.display())),
+    };
+    let mut raws = HashMap::new();
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("{\"_schema\"")) {
+        if let Ok(record) = serde_json::from_str::<RawRecord>(line) {
+            raws.entry(record.id).or_insert(record.raw);
+        }
+    }
+    Ok(raws)
 }
 
 #[cfg(test)]
@@ -153,6 +216,64 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    fn with_raw(mut event: Event, raw: serde_json::Value) -> Event {
+        match &mut event {
+            Event::IssueUpserted { common, .. } => common.raw = raw,
+            _ => unreachable!(),
+        }
+        event
+    }
+
+    #[test]
+    fn append_writes_light_rows_and_raw_to_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d/p/tracker.jsonl");
+        let mut summary = read(&path).unwrap();
+        let events = vec![
+            with_raw(upsert("e1", "COR-1", 9), serde_json::json!({"identifier": "COR-1", "big": "payload"})),
+            upsert("e2", "COR-2", 10),
+        ];
+        append_new(&path, &events, &mut summary).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("\"raw\""), "{content}");
+        assert!(!content.contains("payload"), "{content}");
+        let raw_path = raw_path_for(&path);
+        assert_eq!(raw_path, dir.path().join("d/p/tracker.raw.jsonl"));
+        let sidecar = std::fs::read_to_string(&raw_path).unwrap();
+        assert_eq!(sidecar.lines().next().unwrap(), crate::tracker::events::RAW_SCHEMA_HEADER);
+        assert_eq!(sidecar.lines().count(), 2, "header and one payload; a null raw writes nothing: {sidecar}");
+        let raws = read_raw(&raw_path).unwrap();
+        assert_eq!(raws["e1"], serde_json::json!({"identifier": "COR-1", "big": "payload"}));
+        assert!(!raws.contains_key("e2"));
+    }
+
+    #[test]
+    fn sidecar_is_written_before_the_log_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        std::fs::create_dir_all(raw_path_for(&path)).unwrap();
+        let mut summary = read(&path).unwrap();
+        let event = with_raw(upsert("e1", "COR-1", 9), serde_json::json!({"id": "x"}));
+        let error = append_new(&path, &[event], &mut summary).unwrap_err();
+        assert!(error.contains("tracker.raw.jsonl"), "{error}");
+        assert!(!path.exists(), "no log line without its raw payload");
+        assert!(summary.event_ids.is_empty());
+    }
+
+    #[test]
+    fn old_rows_with_inline_raw_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tracker.jsonl");
+        let mut old = serde_json::to_value(upsert("e1", "COR-1", 9)).unwrap();
+        old["raw"] = serde_json::json!({"identifier": "COR-1"});
+        std::fs::write(&path, format!("{}\n{old}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+        let summary = read(&path).unwrap();
+        assert_eq!(summary.event_count, 1);
+        assert_eq!(summary.unreadable_lines, 0);
+        assert!(summary.open_issues.contains_key("COR-1"));
     }
 
     #[test]
