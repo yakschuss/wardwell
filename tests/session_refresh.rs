@@ -207,3 +207,45 @@ fn a_pull_past_its_deadline_is_stopped_and_records_the_timeout() {
     assert_eq!(kinds, vec!["pull_started", "pull_failed"], "the timeout marker follows the start");
     assert!(std::fs::read_to_string(project.join("tracker.jsonl")).unwrap().contains("\"code\":\"timeout\""));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_pull_blocked_reading_the_log_records_its_start_and_status_says_it_did_not_finish() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (home, cfg, stub, project) = (root.join("home"), root.join("cfg"), root.join("stub"), root.join("vault/work/claims"));
+    for dir in [&home, &cfg, &stub, &project] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    script(&stub.join("gh"), "#!/bin/sh\necho '[]'\n");
+    std::fs::write(cfg.join("config.yml"), format!(
+        "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
+        root.join("vault").display()
+    )).unwrap();
+    let log = project.join("tracker.jsonl");
+    assert!(Command::new("/usr/bin/mkfifo").arg(&log).status().unwrap().success());
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_wardwell"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("WARDWELL_CONFIG_DIR", &cfg)
+            .env("PATH", &stub)
+            .env("WARDWELL_GH_CANDIDATES", "")
+            .env("WARDWELL_PULL_DEADLINE_SECONDS", "1")
+            .output()
+            .unwrap()
+    };
+    let started = Instant::now();
+    let pull = run(&["tracker", "pull", "--project", "work/claims"]);
+    let text = String::from_utf8_lossy(&pull.stderr).to_string();
+    assert!(!pull.status.success(), "{text}");
+    assert!(started.elapsed() < Duration::from_secs(15), "{:?}", started.elapsed());
+    assert!(text.contains("recorded timeout for work/claims github"), "{text}");
+    let state = std::fs::read_to_string(cfg.join("refresh/work/claims.json")).unwrap();
+    assert!(state.contains("started_at") && state.contains("\"code\":\"timeout\""), "{state}");
+    std::fs::remove_file(&log).unwrap();
+    std::fs::write(&log, "{\"_schema\":\"tracker\",\"_version\":\"1.0\"}\n").unwrap();
+    let status = String::from_utf8_lossy(&run(&["tracker", "status"]).stdout).to_string();
+    assert!(status.contains("Stale. Reason: A pull started at ") && status.contains(" and did not finish."), "{status}");
+}

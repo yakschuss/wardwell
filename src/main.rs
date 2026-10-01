@@ -317,24 +317,31 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
 /// pull this process started and did not end, waiting a bounded time for
 /// the write, then stop the process.
 fn expire_pull(only: Option<String>) {
-    use wardwell::tracker::deadline::{MARKER_WAIT, describe, pull_deadline, record_timeouts};
+    use wardwell::tracker::deadline::{MARKER_WAIT, describe, pull_deadline, record_log_timeouts, record_state_timeouts};
     let pid = std::process::id();
     let (done, finished) = std::sync::mpsc::channel();
+    // The local state first, since it lives outside the vault; then the log
+    // marker, which may block. Each half reports as soon as it is done.
     std::thread::spawn(move || {
-        let marked = wardwell::config::loader::load(None).map(|config| {
-            let config_dir = wardwell::config::loader::config_dir();
-            let bindings: Vec<_> = config.trackers.iter().filter(|b| only.as_deref().is_none_or(|key| b.key() == key)).cloned().collect();
-            let marked = record_timeouts(&config.vault_path, &config_dir, &bindings, pid, chrono::Utc::now());
-            for binding in &bindings {
-                wardwell::tracker::state::release(&wardwell::tracker::state::claim_path(&config_dir, &binding.domain, &binding.project));
-            }
-            marked
-        });
-        let _ = done.send(marked);
+        let Ok(config) = wardwell::config::loader::load(None) else {
+            return;
+        };
+        let config_dir = wardwell::config::loader::config_dir();
+        let bindings: Vec<_> = config.trackers.iter().filter(|b| only.as_deref().is_none_or(|key| b.key() == key)).cloned().collect();
+        let now = chrono::Utc::now();
+        let _ = done.send(record_state_timeouts(&config_dir, &bindings, pid, now));
+        for binding in &bindings {
+            wardwell::tracker::state::release(&wardwell::tracker::state::claim_path(&config_dir, &binding.domain, &binding.project));
+        }
+        let _ = done.send(record_log_timeouts(&config.vault_path, &bindings, pid, now));
     });
-    let marked = match finished.recv_timeout(MARKER_WAIT) {
-        Ok(Ok(marked)) if !marked.is_empty() => format!("recorded timeout for {}", marked.join(", ")),
-        _ => "no timeout marker was written".to_string(),
+    let until = std::time::Instant::now() + MARKER_WAIT;
+    let in_state = finished.recv_timeout(MARKER_WAIT).unwrap_or_default();
+    let in_log = finished.recv_timeout(until.saturating_duration_since(std::time::Instant::now()));
+    let marked = match (in_state.is_empty(), in_log) {
+        (true, _) => "no timeout was recorded".to_string(),
+        (false, Ok(_)) => format!("recorded timeout for {}", in_state.join(", ")),
+        (false, Err(_)) => format!("recorded timeout for {} in the local state; the log marker was not written", in_state.join(", ")),
     };
     eprintln!("wardwell: tracker pull stopped after {}; {marked}", describe(pull_deadline()));
     std::process::exit(1);

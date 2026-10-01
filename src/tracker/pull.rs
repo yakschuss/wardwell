@@ -339,13 +339,20 @@ fn pull_held(
             let _ = state::record(recording.state, &binding.provider, record, recording.clock());
         }
     };
+    let skipped = Ok(PullOutcome { appended: 0, removed: 0, full: false, resync_due: None, failed_full: None, skipped: true });
+    if recording.is_some_and(|r| overtaken(r, &binding.provider, None, mode)) {
+        return skipped;
+    }
+    // The start goes to the local state before the log is read, so a read
+    // that never returns still leaves a start the deadline can close.
+    record(state::Record::Started(std::process::id()));
     let summary = log::read_for(path, &binding.provider);
     if let (Some(recording), Ok(summary)) = (recording, &summary)
-        && overtaken(recording, &binding.provider, summary, mode)
+        && overtaken(recording, &binding.provider, Some(summary), mode)
     {
-        return Ok(PullOutcome { appended: 0, removed: 0, full: false, resync_due: None, failed_full: None, skipped: true });
+        record(state::Record::Completed);
+        return skipped;
     }
-    record(state::Record::Started(std::process::id()));
     let result = summary
         .map_err(|message| PullError::new(FailureCode::LogRead, message))
         .and_then(|mut summary| {
@@ -427,7 +434,7 @@ fn pull_locked(
 /// later than this pull's clock now, by the
 /// refresh state or by the log re-read under the lock. A full pull a person
 /// asked for is never overtaken.
-fn overtaken(recording: &Recording<'_>, provider: &str, summary: &log::LogSummary, mode: Mode) -> bool {
+fn overtaken(recording: &Recording<'_>, provider: &str, summary: Option<&log::LogSummary>, mode: Mode) -> bool {
     if matches!(mode, Mode::Full | Mode::FullAllowEmpty) {
         return false;
     }
@@ -437,7 +444,7 @@ fn overtaken(recording: &Recording<'_>, provider: &str, summary: &log::LogSummar
     // never stops a pull.
     let after_start = |at: DateTime<Utc>| at > recording.began && at <= clock;
     let in_state = state::provider(recording.state, provider).and_then(|s| s.completed_at).is_some_and(after_start);
-    in_state || summary.last_pull_at.is_some_and(after_start)
+    in_state || summary.and_then(|s| s.last_pull_at).is_some_and(after_start)
 }
 
 /// Marker for a pull about to call the provider, in process `pid`. An

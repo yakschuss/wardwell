@@ -32,11 +32,12 @@ fn deadline_from(value: Option<&str>) -> Duration {
     value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|s| *s > 0).map_or(PULL_DEADLINE, Duration::from_secs)
 }
 
-/// A deadline in words: `15 minutes`, `2 seconds`.
+/// A deadline in words: `15 minutes`, `2 seconds`, `1 second`.
 pub fn describe(deadline: Duration) -> String {
+    let plural = |n: u64, unit: &str| if n == 1 { format!("1 {unit}") } else { format!("{n} {unit}s") };
     match (deadline.as_secs() >= 60, deadline.as_secs() % 60) {
-        (true, 0) => format!("{} minutes", deadline.as_secs() / 60),
-        _ => format!("{} seconds", deadline.as_secs()),
+        (true, 0) => plural(deadline.as_secs() / 60, "minute"),
+        _ => plural(deadline.as_secs(), "second"),
     }
 }
 
@@ -68,24 +69,42 @@ pub fn arm(after: Duration, on_expiry: impl FnOnce() + Send + 'static) -> Watchd
 /// outside the vault; then a pull_failed marker goes to each log that can
 /// be written. Returns the keys of the bindings recorded.
 pub fn record_timeouts(vault_root: &Path, config_dir: &Path, bindings: &[TrackerBinding], pid: u32, now: DateTime<Utc>) -> Vec<String> {
-    let in_state: Vec<bool> = bindings.iter().map(|binding| {
-        let path = state::path(config_dir, &binding.domain, &binding.project);
-        let ours = state::provider(&path, &binding.provider).and_then(|s| s.open_start()).is_some_and(|(_, started)| started == Some(pid));
-        ours && state::record(&path, &binding.provider, state::Record::Failed(FailureCode::Timeout), now).is_ok()
-    }).collect();
+    let in_state = record_state_timeouts(config_dir, bindings, pid, now);
+    let in_log = record_log_timeouts(vault_root, bindings, pid, now);
+    bindings.iter().map(key).filter(|k| in_state.contains(k) || in_log.contains(k)).collect()
+}
+
+/// The local-state half of `record_timeouts`: never touches the vault.
+pub fn record_state_timeouts(config_dir: &Path, bindings: &[TrackerBinding], pid: u32, now: DateTime<Utc>) -> Vec<String> {
     bindings
         .iter()
-        .zip(in_state)
-        .filter(|(binding, recorded)| {
-            let marked = ours_in_log(vault_root, binding, pid) && {
+        .filter(|binding| {
+            let path = state::path(config_dir, &binding.domain, &binding.project);
+            let ours = state::provider(&path, &binding.provider).and_then(|s| s.open_start()).is_some_and(|(_, started)| started == Some(pid));
+            ours && state::record(&path, &binding.provider, state::Record::Failed(FailureCode::Timeout), now).is_ok()
+        })
+        .map(key)
+        .collect()
+}
+
+/// The log half of `record_timeouts`: a marker in each log whose newest
+/// attempt is this process's start. It may block on a vault that does not answer.
+pub fn record_log_timeouts(vault_root: &Path, bindings: &[TrackerBinding], pid: u32, now: DateTime<Utc>) -> Vec<String> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            ours_in_log(vault_root, binding, pid) && {
                 let path = log::path_for(vault_root, &binding.domain, &binding.project);
                 let marker = pull::pull_failed(binding, now, FailureCode::Timeout, false);
                 log::read_for(&path, &binding.provider).and_then(|mut summary| log::append_new(&path, &[marker], &mut summary)).is_ok()
-            };
-            *recorded || marked
+            }
         })
-        .map(|(binding, _)| format!("{} {}", binding.key(), binding.provider))
+        .map(key)
         .collect()
+}
+
+fn key(binding: &TrackerBinding) -> String {
+    format!("{} {}", binding.key(), binding.provider)
 }
 
 fn ours_in_log(vault_root: &Path, binding: &TrackerBinding, pid: u32) -> bool {
