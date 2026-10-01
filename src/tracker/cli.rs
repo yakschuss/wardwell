@@ -378,7 +378,7 @@ mod tests {
                 Ok(())
             }
         }
-        let places = crate::tracker::trigger::Places { config: &config, config_dir: dir.path() };
+        let places = crate::tracker::trigger::Places { config: &config, config_dir: dir.path(), vault_bound: crate::tracker::bounded::VAULT_BOUND };
         let probes = crate::tracker::trigger::Probes { alive: &|_| false, can_pull: &|_| true };
         let outcome = crate::tracker::trigger::refresh(&places, "work", "claims", Utc::now() + chrono::TimeDelta::minutes(2), &Never(&spawned), &probes);
         assert_eq!(outcome, crate::tracker::trigger::Outcome::NotDue);

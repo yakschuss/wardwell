@@ -184,7 +184,7 @@ mod tests {
         let config = setup(tmp.path(), &code, true);
         let later = now() + chrono::TimeDelta::hours(1) + chrono::TimeDelta::minutes(1);
         let spawner = WritesStart(crate::tracker::state::path(tmp.path(), "personal", "corr-platform"), later);
-        let places = crate::tracker::trigger::Places { config: &config, config_dir: tmp.path() };
+        let places = crate::tracker::trigger::Places { config: &config, config_dir: tmp.path(), vault_bound: crate::tracker::bounded::VAULT_BOUND };
         let probes = crate::tracker::trigger::Probes { alive: &crate::tracker::freshness::process_alive, can_pull: &|_| true };
         let refresh = |domain: &str, project: &str| {
             crate::tracker::trigger::refresh(&places, domain, project, later, &spawner, &probes) == crate::tracker::trigger::Outcome::Started

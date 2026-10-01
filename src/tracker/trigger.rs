@@ -68,6 +68,8 @@ pub struct Probes<'a> {
 pub struct Places<'a> {
     pub config: &'a WardwellConfig,
     pub config_dir: &'a Path,
+    /// How long a spawn failure waits for its marker to reach the vault.
+    pub vault_bound: std::time::Duration,
 }
 
 /// Start a detached pull of `<domain>/<project>` through `spawner` when it
@@ -122,7 +124,7 @@ pub fn refresh(places: &Places<'_>, domain: &str, project: &str, now: DateTime<U
 pub fn refresh_detached(config: &WardwellConfig, config_dir: &Path, domain: &str, project: &str, now: DateTime<Utc>) -> Outcome {
     let spawner = DetachedPull::this_binary(config_dir);
     let can_pull = |binding: &TrackerBinding| crate::tracker::doctor::check_offline(config_dir, binding).is_ok();
-    let places = Places { config, config_dir };
+    let places = Places { config, config_dir, vault_bound: crate::tracker::bounded::VAULT_BOUND };
     refresh(&places, domain, project, now, &spawner, &Probes { alive: &freshness::process_alive, can_pull: &can_pull })
 }
 
@@ -217,9 +219,18 @@ fn held(state: &ProviderState, now: DateTime<Utc>) -> bool {
 fn record_spawn_failure(places: &Places<'_>, state_path: &Path, bindings: &[&TrackerBinding], now: DateTime<Utc>) {
     for binding in bindings {
         let _ = state::record(state_path, &binding.provider, state::Record::Failed(FailureCode::Spawn), now);
-        let log = crate::tracker::log::path_for(&places.config.vault_path, &binding.domain, &binding.project);
-        let _ = crate::tracker::log::append_marker(&log, &crate::tracker::pull::pull_failed(binding, now, FailureCode::Spawn, false));
     }
+    // The markers go to the vault on a helper thread; past the bound they
+    // are skipped, and the local state already holds the failure.
+    let markers: Vec<(PathBuf, crate::tracker::events::Event)> = bindings
+        .iter()
+        .map(|b| (crate::tracker::log::path_for(&places.config.vault_path, &b.domain, &b.project), crate::tracker::pull::pull_failed(b, now, FailureCode::Spawn, false)))
+        .collect();
+    let _ = crate::tracker::bounded::run(places.vault_bound, move || {
+        for (log, marker) in &markers {
+            let _ = crate::tracker::log::append_marker(log, marker);
+        }
+    });
 }
 
 /// Starts this binary as `tracker pull --project <key>` in its own session,
@@ -359,7 +370,7 @@ mod tests {
     fn run(setup: &Setup, spawner: &Fake, alive: bool, can_pull: bool) -> Outcome {
         let alive = move |_: u32| alive;
         let can_pull = move |_: &TrackerBinding| can_pull;
-        let places = Places { config: &setup.config, config_dir: &setup.config_dir };
+        let places = Places { config: &setup.config, config_dir: &setup.config_dir, vault_bound: crate::tracker::bounded::VAULT_BOUND };
         refresh(&places, "work", "claims", now(), spawner, &Probes { alive: &alive, can_pull: &can_pull })
     }
 
@@ -492,7 +503,7 @@ mod tests {
         let fake = Fake::new();
         let alive = |_: u32| false;
         let can_pull = |_: &TrackerBinding| true;
-        let places = Places { config: &s.config, config_dir: &s.config_dir };
+        let places = Places { config: &s.config, config_dir: &s.config_dir, vault_bound: crate::tracker::bounded::VAULT_BOUND };
         assert_eq!(refresh(&places, "work", "ops", now(), &fake, &Probes { alive: &alive, can_pull: &can_pull }), Outcome::NoBinding);
         assert!(fake.started.borrow().is_empty());
     }
@@ -508,6 +519,23 @@ mod tests {
         let view = crate::tracker::view::MirrorView::read_for(&log, "linear").unwrap();
         assert_eq!(view.last_failure, Some((now(), FailureCode::Spawn)), "the marker is the trace");
         assert_eq!(run(&s, &Fake::new(), false, true), Outcome::Cooldown, "the failure cools the next start down");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_spawn_failure_does_not_wait_on_a_vault_that_does_not_answer() {
+        let s = setup(false);
+        let log = crate::tracker::log::path_for(&s.config.vault_path, "work", "claims");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        assert!(std::process::Command::new("/usr/bin/mkfifo").arg(&log).status().unwrap().success());
+        let alive = |_: u32| false;
+        let can_pull = |_: &TrackerBinding| true;
+        let places = Places { config: &s.config, config_dir: &s.config_dir, vault_bound: std::time::Duration::from_millis(100) };
+        let started = std::time::Instant::now();
+        let outcome = refresh(&places, "work", "claims", now(), &Fake { fail: true, ..Fake::new() }, &Probes { alive: &alive, can_pull: &can_pull });
+        assert_eq!(outcome, Outcome::SpawnFailed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+        assert_eq!(state::provider(&s.state, "linear").unwrap().open_failure(), Some((now(), FailureCode::Spawn)), "the local state holds it first");
     }
 
     #[test]
@@ -543,7 +571,7 @@ mod tests {
                         barrier.wait();
                         let alive = |_: u32| false;
                         let can_pull = |_: &TrackerBinding| true;
-                        let places = Places { config: &s.config, config_dir: &s.config_dir };
+                        let places = Places { config: &s.config, config_dir: &s.config_dir, vault_bound: crate::tracker::bounded::VAULT_BOUND };
                         refresh(&places, "work", "claims", Utc::now(), &spawner, &Probes { alive: &alive, can_pull: &can_pull })
                     })
                 })
