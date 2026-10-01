@@ -37,7 +37,7 @@ enum Commands {
     },
     /// Check that everything is wired correctly
     Doctor,
-    /// Clean removal — removes MCP entries, hooks, and markers (preserves vault data)
+    /// Clean removal — removes connection entries, hooks, and markers (preserves vault data)
     Uninstall,
     /// Output project context for the given directory (used by hooks)
     Inject {
