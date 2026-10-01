@@ -232,31 +232,10 @@ fn merge_event(
     Ok(())
 }
 
-fn owned_command(command: &str) -> bool {
-    let command = command.trim();
-    let pair = if let Some(rest) = command.strip_prefix('\'') {
-        rest.split_once('\'').map(|(exe, args)| (exe, args.trim()))
-    } else {
-        command
-            .split_once(' ')
-            .map(|(exe, args)| (exe, args.trim()))
-    };
-    let Some((exe, args)) = pair else {
+pub(crate) fn owned_command(command: &str) -> bool {
+    let Some(args) = wardwell_args(command) else {
         return false;
     };
-    let Some(name) = Path::new(exe).file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    let owned = name == "wardwell"
-        || name.strip_prefix("wardwell-").is_some_and(|suffix| {
-            suffix.starts_with(|c: char| c.is_ascii_digit())
-                && suffix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
-        });
-    if !owned {
-        return false;
-    }
     if args == "resolve" {
         return true;
     }
@@ -269,7 +248,33 @@ fn owned_command(command: &str) -> bool {
     })
 }
 
-fn shell_quote(path: &Path) -> Result<String, String> {
+/// `<digits>.<digits>` then any of letters, digits, `.`, `+` or `-`, as in
+/// `0.11.1+companion.1`. A bare `2` or `2fa` is not a version.
+fn is_version(suffix: &str) -> bool {
+    let Some((major, rest)) = suffix.split_once('.') else { return false };
+    let minor_len = rest.chars().take_while(char::is_ascii_digit).count();
+    !major.is_empty()
+        && major.chars().all(|c| c.is_ascii_digit())
+        && minor_len > 0
+        && rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+}
+
+/// The arguments of a hook command whose executable is a Wardwell binary
+/// (`wardwell` or a versioned `wardwell-<digits>.<digits>...`), quoted or not. None for
+/// any other executable, so ownership never rests on a substring.
+pub(crate) fn wardwell_args(command: &str) -> Option<&str> {
+    let command = command.trim();
+    let (exe, args) = if let Some(rest) = command.strip_prefix('\'') {
+        rest.split_once('\'')?
+    } else {
+        command.split_once(' ')?
+    };
+    let name = Path::new(exe).file_name().and_then(|s| s.to_str())?;
+    let owned = name == "wardwell" || name.strip_prefix("wardwell-").is_some_and(is_version);
+    owned.then(|| args.trim())
+}
+
+pub(crate) fn shell_quote(path: &Path) -> Result<String, String> {
     let text = path.to_str().ok_or("Wardwell binary path is not UTF-8")?;
     if text.chars().any(char::is_control) {
         return Err("Invalid binary path".into());
@@ -459,6 +464,9 @@ mod tests {
         assert!(owned_command(
             "'/Users/x/.wardwell/bin/wardwell-0.11.1+companion.1' companion lifecycle stop --client codex"
         ));
+        for (name, owned) in [("wardwell-2fa", false), ("wardwell-2", false), ("wardwell-12.3", true), ("wardwell-0.11.1+companion.1", true), ("wardwell-.1", false)] {
+            assert_eq!(wardwell_args(&format!("/b/{name} resolve")).is_some(), owned, "{name}");
+        }
         let text = format!("Keep\n{START}\nold\n{END}\nMiddle\n{START}\nold\n{END}\nEnd\n");
         let result = replace_block(&text).unwrap();
         assert_eq!(result.matches(START).count(), 1);

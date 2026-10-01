@@ -44,6 +44,11 @@ pub fn current_uid() -> Result<u32, String> {
         .map_err(|_| "could not read the current user id".to_string())
 }
 
+/// The log both of the agent's streams go to.
+pub fn log_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("tracker-pull.log")
+}
+
 /// Where the agent plist lives under `home`.
 pub fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
@@ -132,7 +137,9 @@ pub fn schedule(
             "interval must be between {MIN_INTERVAL_SECONDS} and {MAX_INTERVAL_SECONDS} seconds"
         ));
     }
-    let binary = current_exe.canonicalize().unwrap_or_else(|_| current_exe.to_path_buf());
+    // Never resolve symlinks: a package manager's stable link (for example
+    // /opt/homebrew/bin/wardwell) survives an upgrade; its versioned target does not.
+    let binary = current_exe.to_path_buf();
     if !cfg!(target_os = "macos") {
         return Err(format!(
             "launchd scheduling is macOS only. Add this line to your crontab:\n{}",
@@ -142,7 +149,7 @@ pub fn schedule(
     let path = plist_path(home);
     let parent = path.parent().ok_or("no LaunchAgents directory")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("could not create the LaunchAgents directory: {error}"))?;
-    let body = launch_agent_plist(&binary, interval_seconds, &config_dir.join("tracker-pull.log"));
+    let body = launch_agent_plist(&binary, interval_seconds, &log_path(config_dir));
     std::fs::create_dir_all(config_dir).map_err(|error| format!("could not create the config directory: {error}"))?;
     let staged = path.with_extension("plist.tmp");
     std::fs::write(&staged, body).map_err(|error| format!("could not write {LABEL}.plist: {error}"))?;
@@ -184,6 +191,14 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
     }
 }
 
+/// The program the plist on disk runs, or None when it is not installed.
+pub fn scheduled_program(home: &Path) -> Option<PathBuf> {
+    let body = std::fs::read_to_string(plist_path(home)).ok()?;
+    let after = body.split("<key>ProgramArguments</key>").nth(1)?;
+    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+    Some(PathBuf::from(value.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")))
+}
+
 /// The interval in the plist on disk, or None when it is not installed.
 pub fn schedule_status(home: &Path) -> Option<u32> {
     let body = std::fs::read_to_string(plist_path(home)).ok()?;
@@ -192,22 +207,23 @@ pub fn schedule_status(home: &Path) -> Option<u32> {
     value.trim().parse().ok()
 }
 
+/// A launchctl runner that records each argv and fails the named verbs, so
+/// tests never invoke launchctl.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
+pub(crate) mod fake {
+    use super::LaunchctlRunner;
     use std::cell::RefCell;
 
-    struct Fake {
-        calls: RefCell<Vec<Vec<String>>>,
+    pub(crate) struct Fake {
+        pub(crate) calls: RefCell<Vec<Vec<String>>>,
         fail: Vec<&'static str>,
     }
 
     impl Fake {
-        fn new(fail: &[&'static str]) -> Self {
+        pub(crate) fn new(fail: &[&'static str]) -> Self {
             Fake { calls: RefCell::new(Vec::new()), fail: fail.to_vec() }
         }
-        fn verbs(&self) -> Vec<String> {
+        pub(crate) fn verbs(&self) -> Vec<String> {
             self.calls.borrow().iter().map(|call| call[1].clone()).collect()
         }
     }
@@ -221,6 +237,13 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::fake::Fake;
+    use super::*;
 
     #[test]
     fn plist_has_label_arguments_interval_runatload_and_both_logs() {
@@ -253,6 +276,20 @@ mod tests {
         assert_eq!(schedule_status(home.path()), Some(1800));
         let body = std::fs::read_to_string(plist_path(home.path())).unwrap();
         assert!(body.contains("cfg/tracker-pull.log"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn schedule_writes_the_symlink_path_so_the_agent_survives_an_upgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let versioned = root.path().join("Cellar/wardwell/0.12.0/bin");
+        std::fs::create_dir_all(&versioned).unwrap();
+        std::fs::write(versioned.join("wardwell"), "").unwrap();
+        std::fs::create_dir_all(root.path().join("bin")).unwrap();
+        let link = root.path().join("bin/wardwell");
+        std::os::unix::fs::symlink(versioned.join("wardwell"), &link).unwrap();
+        schedule(root.path(), &root.path().join("cfg"), 3600, &Fake::new(&[]), &link, 501).unwrap();
+        assert_eq!(scheduled_program(root.path()), Some(link));
     }
 
     #[cfg(target_os = "macos")]
@@ -372,6 +409,16 @@ mod tests {
         assert!(!path.exists());
         assert_eq!(fake.verbs(), vec!["bootout"]);
         assert!(unschedule(home.path(), &Fake::new(&["bootout"]), 501).is_ok());
+    }
+
+    #[test]
+    fn scheduled_program_reads_the_unescaped_binary_path() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(scheduled_program(home.path()), None);
+        let path = plist_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, launch_agent_plist(Path::new("/a&b/wardwell"), 60, Path::new("/l"))).unwrap();
+        assert_eq!(scheduled_program(home.path()), Some(PathBuf::from("/a&b/wardwell")));
     }
 
     #[test]

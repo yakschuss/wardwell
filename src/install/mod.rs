@@ -1,4 +1,8 @@
+pub mod client_hooks;
 mod detect;
+pub mod json_doc;
+pub mod installer;
+pub mod manifest;
 pub mod doctor;
 pub mod init;
 pub mod project;

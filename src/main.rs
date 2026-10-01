@@ -24,7 +24,7 @@ enum Commands {
         #[command(subcommand)]
         command: CompanionCommand,
     },
-    /// First-run setup — generates config, injects MCP entries, installs hooks
+    /// First-run setup — generates config, connects agent clients, installs hooks
     Init,
     /// Set up or repair Wardwell on this computer
     Setup {
@@ -37,7 +37,7 @@ enum Commands {
     },
     /// Check that everything is wired correctly
     Doctor,
-    /// Clean removal — removes MCP entries, hooks, and markers (preserves vault data)
+    /// Clean removal — removes connection entries, hooks, and markers (preserves vault data)
     Uninstall,
     /// Output project context for the given directory (used by hooks)
     Inject {
@@ -66,6 +66,17 @@ enum Commands {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    /// Check a tool call before it runs (used by hooks; reads JSON from stdin)
+    Gate {
+        #[command(subcommand)]
+        command: GateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GateCommand {
+    /// Check a Linear comment or issue write against the linear-updates ruleset
+    Linear,
 }
 
 #[derive(Subcommand)]
@@ -211,6 +222,7 @@ async fn main() {
         Commands::MigrateAttachments => run_migrate_attachments(),
         Commands::Tracker { command } => run_tracker(command),
         Commands::Project { command } => run_project(command),
+        Commands::Gate { command: GateCommand::Linear } => run_gate_linear(),
     };
     if let Err(e) = result {
         eprintln!("wardwell: {e}");
@@ -723,6 +735,24 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
         "{}",
         wardwell::inject::start::output(&cwd, &config, &loader::config_dir(), wardwell::inject::git::dirs, chrono::Utc::now(), today)
     );
+    Ok(())
+}
+
+fn run_gate_linear() -> Result<(), Box<dyn std::error::Error>> {
+    // A PreToolUse hook. It never blocks on input it cannot read: an
+    // oversized, unreadable, or malformed payload prints nothing and exits 0.
+    use std::io::{IsTerminal, Read};
+    const LIMIT: u64 = 1024 * 1024;
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    if std::io::stdin().take(LIMIT + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > LIMIT {
+        return Ok(());
+    }
+    if let Some(decision) = std::str::from_utf8(&bytes).ok().and_then(wardwell::gate::linear::evaluate) {
+        println!("{decision}");
+    }
     Ok(())
 }
 
