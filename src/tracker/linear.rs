@@ -5,7 +5,7 @@
 //! Does NOT write to Linear, decide the cursor, or touch the vault.
 
 use crate::tracker::adapter::{Adapter, Sink};
-use crate::tracker::events::{Common, Event, IssueSnapshot, Priority, Relation, RelationKind, StateCategory};
+use crate::tracker::events::{Common, Event, FailureCode, IssueSnapshot, Priority, Relation, RelationKind, StateCategory};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -43,6 +43,45 @@ const ISSUES_QUERY: &str = r#"query WardwellTrackerPull($first: Int!, $after: St
     }
   }
 }"#;
+
+const VIEWER_QUERY: &str = "query WardwellDoctorViewer { viewer { id } }";
+
+const TEAM_QUERY: &str = r#"query WardwellDoctorTeam($key: String!) {
+  teams(first: 1, filter: { key: { eq: $key } }) { nodes { key } }
+}"#;
+
+/// Doctor check: one cheap authenticated request. Any GraphQL error on the
+/// viewer query, or HTTP 401/403, means the token was refused.
+pub fn check_auth(transport: &dyn Transport) -> Result<(), FailureCode> {
+    let response = transport.post(&json!({"query": VIEWER_QUERY})).map_err(transport_code)?;
+    match (response.get("errors").is_some(), response["data"]["viewer"]["id"].is_string()) {
+        (false, true) => Ok(()),
+        (true, _) => Err(FailureCode::Auth),
+        (false, false) => Err(FailureCode::Provider),
+    }
+}
+
+/// Doctor check: the bound team key exists and the token can see it.
+pub fn check_team(transport: &dyn Transport, team: &str) -> Result<(), FailureCode> {
+    let body = json!({"query": TEAM_QUERY, "variables": {"key": team}});
+    let response = transport.post(&body).map_err(transport_code)?;
+    if response.get("errors").is_some() {
+        return Err(FailureCode::Provider);
+    }
+    let found = response["data"]["teams"]["nodes"]
+        .as_array()
+        .ok_or(FailureCode::Provider)?
+        .iter()
+        .any(|node| node["key"].as_str() == Some(team));
+    found.then_some(()).ok_or(FailureCode::TeamNotFound)
+}
+
+fn transport_code(error: String) -> FailureCode {
+    match error.as_str() {
+        "Linear returned HTTP 401" | "Linear returned HTTP 403" => FailureCode::Auth,
+        _ => FailureCode::Provider,
+    }
+}
 
 /// Posts one GraphQL body and returns the decoded JSON response.
 /// Exists so tests can inject canned responses.

@@ -85,6 +85,8 @@ enum TrackerCommand {
     },
     /// Show last pull, last full resync, event count and readonly flag per project
     Status,
+    /// Check each binding's credential, provider auth and team, one line per check
+    Doctor,
     /// Move inline raw payloads to tracker.raw.jsonl and drop exact duplicate events
     Compact {
         /// Only this <domain>/<project>
@@ -211,6 +213,10 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;
             cli::status(&config, chrono::Utc::now(), schedule_status(&home()?))
+        }
+        TrackerCommand::Doctor => {
+            let config = wardwell::config::loader::load(None)?;
+            cli::doctor(&config, &config_dir, &wardwell::tracker::doctor::connect_transport)?
         }
         TrackerCommand::Compact { project, force } => {
             let config = wardwell::config::loader::load(None)?;

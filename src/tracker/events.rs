@@ -120,6 +120,10 @@ pub enum FailureCode {
     LogWrite,
     /// The provider could not be reached or answered with an error.
     Provider,
+    /// The provider refused the token.
+    Auth,
+    /// The bound team or project key does not exist at the provider.
+    TeamNotFound,
 }
 
 impl FailureCode {
@@ -132,6 +136,8 @@ impl FailureCode {
             Self::LogRead => "log_read",
             Self::LogWrite => "log_write",
             Self::Provider => "provider",
+            Self::Auth => "auth",
+            Self::TeamNotFound => "team_not_found",
         }
     }
 }
@@ -433,7 +439,7 @@ mod tests {
     fn failure_codes_serialize_as_their_closed_names() {
         for code in [
             FailureCode::Credential, FailureCode::UnsupportedProvider, FailureCode::LockBusy, FailureCode::LogRead,
-            FailureCode::LogWrite, FailureCode::Provider,
+            FailureCode::LogWrite, FailureCode::Provider, FailureCode::Auth, FailureCode::TeamNotFound,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(code.as_str()));
         }

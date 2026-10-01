@@ -7,6 +7,7 @@
 pub mod adapter;
 pub mod cli;
 pub mod credential;
+pub mod doctor;
 pub mod events;
 pub mod compact;
 pub mod linear;

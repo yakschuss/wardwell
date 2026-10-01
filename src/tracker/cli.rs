@@ -73,6 +73,15 @@ pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Resu
     }
 }
 
+/// Credential, auth and team checks for every binding, one line each.
+/// Fails with every line when any check failed.
+pub fn doctor(config: &WardwellConfig, config_dir: &Path, probe: &crate::tracker::doctor::Probe<'_>) -> Result<Vec<String>, String> {
+    match crate::tracker::doctor::run(config, config_dir, probe) {
+        (lines, true) => Ok(lines),
+        (lines, false) => Err(lines.join("\n")),
+    }
+}
+
 fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(&'a String, &'a TrackerBinding)>, String> {
     match only {
         None => Ok(config.trackers.iter().collect()),
@@ -332,6 +341,17 @@ mod tests {
         assert!(!claims.contains("HTTP 500"), "{claims}");
         let ops = lines.iter().find(|l| l.starts_with("work/ops")).unwrap();
         assert!(ops.ends_with("no errors"), "{ops}");
+    }
+
+    #[test]
+    fn doctor_fails_the_run_when_a_check_fails() {
+        let (dir, config) = setup(false);
+        let unreachable = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn crate::tracker::linear::Transport>, String> {
+            Err("never called without a credential".into())
+        };
+        let error = doctor(&config, dir.path(), &unreachable).unwrap_err();
+        assert_eq!(error.lines().count(), 3, "{error}");
+        assert!(error.starts_with("work/claims: credential failed (credential)"), "{error}");
     }
 
     #[test]
