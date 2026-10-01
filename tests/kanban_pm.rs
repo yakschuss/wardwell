@@ -484,7 +484,7 @@ fn verification_latest_in_output() {
 
 #[test]
 fn reality_check_urgent_backlog() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Urgent task", "proj", "dom", None, Some("backlog"), Some("urgent"), None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Normal task", "proj", "dom", None, Some("backlog"), Some("medium"), None, None, None, None, None, None, &pf).unwrap();
@@ -498,7 +498,7 @@ fn reality_check_urgent_backlog() {
 
 #[test]
 fn reality_check_epic_tickets_by_status() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Todo 1", "proj", "dom", None, Some("todo"), None, None, None, None, Some("epic-a"), None, None, &pf).unwrap();
     store.create_item("In progress 1", "proj", "dom", None, Some("in_progress"), None, None, None, None, Some("epic-a"), None, None, &pf).unwrap();
@@ -514,7 +514,7 @@ fn reality_check_epic_tickets_by_status() {
 
 #[test]
 fn reality_check_open_questions() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Task", "proj", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -546,7 +546,7 @@ fn reality_check_open_questions() {
 
 #[test]
 fn reality_check_stale_tickets() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Fresh task", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -566,7 +566,7 @@ fn reality_check_stale_tickets() {
 
 #[test]
 fn reality_check_relationship_graph() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Task A", "proj", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Task B", "proj", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
@@ -584,7 +584,7 @@ fn reality_check_relationship_graph() {
 
 #[test]
 fn reality_check_done_excluded_by_default() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Done task", "proj", "dom", None, Some("done"), None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Active task", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -597,7 +597,7 @@ fn reality_check_done_excluded_by_default() {
 
 #[test]
 fn reality_check_stale_verification_in_signals() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Task", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -619,7 +619,7 @@ fn reality_check_stale_verification_in_signals() {
 
 #[test]
 fn relationship_cross_project_detected() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Task A", "proj-a", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Task B", "proj-b", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
@@ -776,7 +776,7 @@ fn proposal_change_operation_serialization() {
 
 #[test]
 fn reality_check_done_with_open_children() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let parent = store.create_item("Parent", "proj", "dom", None, Some("done"), None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Child open", "proj", "dom", None, Some("todo"), None, None, None, None, None, Some(&parent.ticket_id), None, &pf).unwrap();
@@ -792,7 +792,7 @@ fn reality_check_done_with_open_children() {
 
 #[test]
 fn reality_check_tickets_with_no_deadline() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("No deadline", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Has deadline", "proj", "dom", None, Some("todo"), None, None, Some("2026-12-01"), None, None, None, None, &pf).unwrap();
@@ -808,7 +808,7 @@ fn reality_check_tickets_with_no_deadline() {
 
 #[test]
 fn reality_check_blocked_items() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Blocker", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Blocked", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -834,7 +834,7 @@ fn reality_check_blocked_items() {
 
 #[test]
 fn reality_check_duplicate_titles() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Same name", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
     store.create_item("Same name", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -849,7 +849,7 @@ fn reality_check_duplicate_titles() {
 
 #[test]
 fn reality_check_contradicted_verification() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     store.create_item("Task", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -1148,7 +1148,7 @@ fn proposal_review_unsafe_closure_flagged() {
 
 #[test]
 fn proposal_review_priority_change_no_rationale() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let item = store.create_item("Task", "proj", "dom", None, None, None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -1287,7 +1287,7 @@ fn old_proposal_without_new_fields_loads() {
 
 #[test]
 fn proposal_list_entry_surfaces_risk_for_unsafe_closure() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let item = store.create_item("Crisis producer", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -1325,7 +1325,7 @@ fn proposal_list_entry_surfaces_risk_for_unsafe_closure() {
 
 #[test]
 fn proposal_list_entry_safe_closure_no_risk() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let producer = store.create_item("Producer", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
     let consumer = store.create_item("Consumer", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -1428,7 +1428,7 @@ fn proposal_summary_separates_preserved_from_transferred() {
 
 #[test]
 fn proposal_mixed_intent_across_unrelated_tickets_flagged() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let a = store.create_item("Ship feature", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
     let b = store.create_item("Unrelated chore", "proj", "dom", Some("low"), Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -1472,7 +1472,7 @@ fn proposal_mixed_intent_across_unrelated_tickets_flagged() {
 
 #[test]
 fn review_recomputes_risk_against_current_board() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let parent = store.create_item("Wrapper", "proj", "dom", None, Some("in_progress"), None, None, None, None, None, None, None, &pf).unwrap();
 
@@ -1539,7 +1539,7 @@ fn has_orphaned_context_flag(review: &wardwell::kanban::proposals::ProposalRevie
 
 #[test]
 fn closure_with_only_notes_is_still_flagged() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let producer = store.create_item("Crisis producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
     let other = store.create_item("Other ticket", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -1579,7 +1579,7 @@ fn closure_with_only_notes_is_still_flagged() {
 
 #[test]
 fn crisis_v3_repro_flags_orphaned_context_not_just_unrelated_batch() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     // Five unrelated tickets; CM-75 is the producer, CM-86 gets a note too.
     let cm75 = store.create_item("Crisis producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -1625,7 +1625,7 @@ fn crisis_v3_repro_flags_orphaned_context_not_just_unrelated_batch() {
 
 #[test]
 fn closure_with_context_transfer_is_not_flagged() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
     let consumer = store.create_item("Consumer", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -1660,7 +1660,7 @@ fn closure_with_context_transfer_is_not_flagged() {
 
 #[test]
 fn closure_with_outgoing_successor_link_is_not_flagged() {
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
     let consumer = store.create_item("Consumer", "proj", "dom", None, Some("todo"), None, None, None, None, None, None, None, &pf).unwrap();
@@ -1698,7 +1698,7 @@ fn closure_with_outgoing_successor_link_is_not_flagged() {
 fn closure_with_only_rationale_is_still_flagged() {
     // A free-text rationale explains WHY, not WHERE context lives — so it is not
     // structured closure metadata and must not suppress the orphaned-context flag.
-    let (dir, store) = make_store();
+    let (_dir, store) = make_store();
     let pf = HashMap::new();
     let producer = store.create_item("Producer", "proj", "dom", None, Some("backlog"), None, None, None, None, None, None, None, &pf).unwrap();
 
