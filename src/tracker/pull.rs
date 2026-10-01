@@ -824,7 +824,31 @@ mod tests {
         assert!(content.contains("\"id\":\"github:acme/app#42:rev:"), "{content}");
         assert!(content.contains("\"keys\":[\"COR-77\"]"), "{content}");
         let found = search(vault.path(), "COR-77");
-        assert_eq!(found, vec!["acme/app#42 merged into main: COR-77 Fix the claims inbox"]);
+        assert_eq!(found, vec!["acme/app#42 merged into main: COR-77 Fix the claims inbox; revision updated 2026-09-01T01:30:00Z"]);
+    }
+
+    #[test]
+    fn search_returns_every_revision_and_each_heading_shows_its_update_time() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let titles = [("COR-12 Fix the claims inbox", 10), ("COR-77 Fix the claims inbox", 90), ("COR-12 Fix the claims inbox", 200)];
+        for (title, updated) in titles {
+            let (gh, _, _) = DatasetGh::new(vec![pr(42, title, "Body", minute(10), minute(updated))]);
+            pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(updated + 5)).unwrap();
+        }
+        assert_eq!(
+            search(vault.path(), "COR-77"),
+            vec!["acme/app#42 merged into main: COR-77 Fix the claims inbox; revision updated 2026-09-01T01:30:00Z"],
+            "an earlier revision, older than the current one at 03:20"
+        );
+        let mut current = search(vault.path(), "COR-12");
+        current.sort();
+        assert_eq!(current, vec![
+            "acme/app#42 merged into main: COR-12 Fix the claims inbox",
+            "acme/app#42 merged into main: COR-12 Fix the claims inbox; revision updated 2026-09-01T03:20:00Z",
+        ]);
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "github").unwrap().changes["acme/app#42"].keys, vec!["COR-12"]);
     }
 
     #[test]

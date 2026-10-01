@@ -756,8 +756,10 @@ request's update time.
 
 An edit after merge is picked up. When the title, the body or the keys of a
 pull request differ from its latest logged event, the next pull appends a
-new event. Its id ends in `:rev:` and a digest of the content. Readers take
-the latest event for each pull request. An update that changes none of
+new event. Its id ends in `:rev:` and a digest of the content. Its heading
+ends with "revision updated" and its update time. Search returns every
+revision of a merged change. The row with the newest update time is the
+current one. An update that changes none of
 these, such as a new comment, appends nothing.
 
 The first pull takes the 200 most recently updated merged pull requests.

@@ -185,7 +185,8 @@ enum Revision {
 /// A merged change with nothing logged under its key keeps its id. One
 /// whose title, body or keys differ from the latest logged one gets the id
 /// suffixed `:rev:<content digest>:<update time>`, unique even when content
-/// returns to an earlier revision.
+/// returns to an earlier revision, and a heading that ends `; revision
+/// updated <update time>`, so a search hit shows which state it is.
 fn revision(event: &Event, summary: &LogSummary) -> Revision {
     let Event::ChangeMerged { common, change } = event else {
         return Revision::NotAChange;
@@ -198,7 +199,10 @@ fn revision(event: &Event, summary: &LogSummary) -> Revision {
         return Revision::Same;
     }
     let mut next = event.clone();
-    common_mut(&mut next).id = format!("{}:rev:{digest}:{}", common.id, common.occurred_at.to_rfc3339());
+    let updated = common.occurred_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let next_common = common_mut(&mut next);
+    next_common.id = format!("{}:rev:{digest}:{}", common.id, common.occurred_at.to_rfc3339());
+    next_common.title = format!("{}; revision updated {updated}", common.title);
     Revision::New(Box::new(next))
 }
 
