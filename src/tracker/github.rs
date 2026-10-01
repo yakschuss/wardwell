@@ -18,11 +18,12 @@ const API_ROOT: &str = "https://api.github.com";
 /// A first pull, with no cursor and no `--full`, reads this many of the
 /// most recently updated merged pull requests.
 pub const FIRST_PULL_LIMIT: usize = 200;
-/// GitHub search returns at most this many results; an incremental `gh`
-/// read asks for all of them.
-const SEARCH_LIMIT: usize = 1_000;
-/// A full `gh` read lists every merged pull request up to this many.
-const FULL_LIMIT: usize = 100_000;
+/// Rows one windowed `gh` read asks for. A reply that holds this many may
+/// have left rows out, so its window is split. Small enough that a reply
+/// stays far below `RESPONSE_LIMIT` even with long bodies.
+const WINDOW_LIMIT: usize = 100;
+/// The earliest update time a full `gh` read asks for: GitHub's launch year.
+const GITHUB_EPOCH_SECONDS: i64 = 1_199_145_600;
 /// The `gh pr list` fields the adapter reads.
 pub const GH_FIELDS: &str = "number,title,body,author,mergedAt,url,baseRefName,id,updatedAt";
 const PER_PAGE: usize = 100;
@@ -187,10 +188,47 @@ impl GitHub {
         unreachable_line(&self.credential)
     }
 
-    /// Merged pull requests through `gh`, or why `gh` gave none.
+    /// Merged pull requests through `gh`, or why `gh` gave none. A first
+    /// pull is one bounded read. An incremental pull reads the window from
+    /// `since`; a full pull reads every update time since GitHub began. A
+    /// window is split until no reply holds `WINDOW_LIMIT` rows.
     fn read_gh(&self, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Result<Vec<Value>, GhFailure> {
-        let args = gh_list_args(&self.repository, since, limit);
-        match self.gh.run(&args) {
+        let mut nodes = Vec::new();
+        match (limit, since) {
+            (Some(_), _) => return self.run_list(&GhRead::First),
+            (None, Some(since)) => self.read_window(since, None, &mut nodes)?,
+            (None, None) => {
+                let start = DateTime::from_timestamp(GITHUB_EPOCH_SECONDS, 0).unwrap_or_default();
+                self.read_window(start, Some(latest_update()), &mut nodes)?;
+            }
+        }
+        Ok(nodes)
+    }
+
+    /// The rows of one window, or of its two halves, newer half first, when
+    /// the reply holds `WINDOW_LIMIT` rows. A one-second window at the limit
+    /// cannot be split and fails.
+    fn read_window(&self, from: DateTime<Utc>, to: Option<DateTime<Utc>>, nodes: &mut Vec<Value>) -> Result<(), GhFailure> {
+        let rows = self.run_list(&GhRead::Window { from, to })?;
+        if rows.len() < WINDOW_LIMIT {
+            nodes.extend(rows);
+            return Ok(());
+        }
+        let (start, end) = (from.timestamp(), to.unwrap_or_else(latest_update).timestamp());
+        if end <= start {
+            return Err(GhFailure::Failed(format!(
+                "gh returned {WINDOW_LIMIT} pull requests updated in the second {}, the most one read returns; Wardwell cannot read them all",
+                second(from)
+            )));
+        }
+        let middle = start + (end - start) / 2;
+        let at = |seconds| DateTime::from_timestamp(seconds, 0).unwrap_or_default();
+        self.read_window(at(middle + 1), Some(at(end)), nodes)?;
+        self.read_window(at(start), Some(at(middle)), nodes)
+    }
+
+    fn run_list(&self, read: &GhRead) -> Result<Vec<Value>, GhFailure> {
+        match self.gh.run(&gh_list_args(&self.repository, read)) {
             GhOutcome::Output(bytes) => parse_list(&bytes).ok_or_else(|| GhFailure::Failed(UNPARSEABLE.to_string())),
             outcome => Err(GhFailure::from(outcome)),
         }
@@ -282,21 +320,36 @@ pub fn unreachable_line(credential: &str) -> String {
     format!("github: {UNREACHABLE} {credential}`")
 }
 
-/// The arguments of the `gh pr list` read. A first pull asks for the
-/// `FIRST_PULL_LIMIT` most recently updated; an incremental pull searches
-/// for merged ones updated at or after `since`; a full pull lists every one.
-pub fn gh_list_args(repository: &str, since: Option<DateTime<Utc>>, limit: Option<usize>) -> Vec<String> {
-    let (limit, search) = match (since, limit) {
-        (Some(since), _) => (SEARCH_LIMIT, Some(format!("is:merged updated:>={} sort:updated-desc", since.to_rfc3339_opts(SecondsFormat::Secs, true)))),
-        (None, Some(limit)) => (limit, Some("sort:updated-desc".to_string())),
-        (None, None) => (FULL_LIMIT, None),
+/// One `gh pr list` read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRead {
+    /// The first pull: the `FIRST_PULL_LIMIT` most recently updated.
+    First,
+    /// Merged pull requests updated from `from` through `to`, or with no
+    /// upper bound when `to` is None.
+    Window { from: DateTime<Utc>, to: Option<DateTime<Utc>> },
+}
+
+/// The arguments of one `gh pr list` read.
+pub fn gh_list_args(repository: &str, read: &GhRead) -> Vec<String> {
+    let (limit, search) = match read {
+        GhRead::First => (FIRST_PULL_LIMIT, "sort:updated-desc".to_string()),
+        GhRead::Window { from, to: None } => (WINDOW_LIMIT, format!("is:merged updated:>={} sort:updated-desc", second(*from))),
+        GhRead::Window { from, to: Some(to) } => (WINDOW_LIMIT, format!("is:merged updated:{}..{} sort:updated-desc", second(*from), second(*to))),
     };
     let limit = limit.to_string();
-    let mut args = strings(&["pr", "list", "--repo", repository, "--state", "merged", "--limit", &limit, "--json", GH_FIELDS]);
-    if let Some(search) = search {
-        args.extend(strings(&["--search", &search]));
-    }
-    args
+    strings(&["pr", "list", "--repo", repository, "--state", "merged", "--json", GH_FIELDS, "--limit", &limit, "--search", &search])
+}
+
+/// A time to the second, as GitHub search reads it.
+fn second(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// The upper bound of an open window when it must be split: an hour past
+/// now, for clock skew.
+fn latest_update() -> DateTime<Utc> {
+    Utc::now() + chrono::TimeDelta::hours(1)
 }
 
 /// The REST path of one page of the repository's closed pull requests,
@@ -643,16 +696,22 @@ pub(crate) mod tests {
             }
             let limit: usize = after(args, "--limit").unwrap().parse().unwrap();
             let search = after(args, "--search").unwrap_or_default();
-            let mut rows: Vec<Value> = self.nodes.borrow().clone();
-            for term in search.split_whitespace() {
-                if let Some(from) = term.strip_prefix("updated:>=") {
-                    rows.retain(|r| time(r, "updatedAt").unwrap() >= stamp(from));
-                } else if let Some((from, to)) = term.strip_prefix("updated:").and_then(|t| t.split_once("..")) {
-                    rows.retain(|r| (stamp(from)..=stamp(to)).contains(&time(r, "updatedAt").unwrap()));
-                }
-            }
-            rows.sort_by_key(|r| std::cmp::Reverse(time(r, "updatedAt").unwrap()));
-            rows.truncate(limit);
+            let keeps = |row: &Value| {
+                let updated = time(row, "updatedAt").unwrap();
+                search.split_whitespace().all(|term| match term.strip_prefix("updated:") {
+                    Some(range) => match (range.strip_prefix(">="), range.split_once("..")) {
+                        (Some(from), _) => updated >= stamp(from),
+                        (None, Some((from, to))) => (stamp(from)..=stamp(to)).contains(&updated),
+                        (None, None) => panic!("unknown range {range}"),
+                    },
+                    None => true,
+                })
+            };
+            let nodes = self.nodes.borrow();
+            let mut kept: Vec<&Value> = nodes.iter().filter(|r| keeps(r)).collect();
+            kept.sort_by_key(|r| std::cmp::Reverse(time(r, "updatedAt").unwrap()));
+            kept.truncate(limit);
+            let rows: Vec<Value> = kept.into_iter().cloned().collect();
             let bytes = serde_json::to_vec(&rows).unwrap();
             self.replies.borrow_mut().push((args.to_vec(), rows.len(), bytes.len()));
             match bytes.len() > RESPONSE_LIMIT {
@@ -721,21 +780,63 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gh_arguments_bound_the_first_pull_search_from_the_cursor_and_list_all_on_full() {
+    fn gh_arguments_bound_the_first_pull_and_read_windows_by_update_time() {
         let fields = GH_FIELDS;
         assert!(fields.ends_with(",updatedAt"), "{fields}");
-        let first = gh_list_args("acme/app", None, Some(FIRST_PULL_LIMIT)).join(" ");
-        assert_eq!(first, format!("pr list --repo acme/app --state merged --limit 200 --json {fields} --search sort:updated-desc"));
-        let since = gh_list_args("acme/app", Some(at(9)), None).join(" ");
-        assert_eq!(since, format!("pr list --repo acme/app --state merged --limit 1000 --json {fields} --search is:merged updated:>=2026-09-01T09:00:00Z sort:updated-desc"));
-        let full = gh_list_args("acme/app", None, None).join(" ");
-        assert_eq!(full, format!("pr list --repo acme/app --state merged --limit 100000 --json {fields}"));
+        let head = format!("pr list --repo acme/app --state merged --json {fields}");
+        assert_eq!(gh_list_args("acme/app", &GhRead::First).join(" "), format!("{head} --limit 200 --search sort:updated-desc"));
+        let open = GhRead::Window { from: at(9), to: None };
+        assert_eq!(gh_list_args("acme/app", &open).join(" "), format!("{head} --limit 100 --search is:merged updated:>=2026-09-01T09:00:00Z sort:updated-desc"));
+        let closed = GhRead::Window { from: at(9), to: Some(at(10)) };
+        assert_eq!(
+            gh_list_args("acme/app", &closed).join(" "),
+            format!("{head} --limit 100 --search is:merged updated:2026-09-01T09:00:00Z..2026-09-01T10:00:00Z sort:updated-desc")
+        );
 
-        for (since, full, expected) in [(None, false, &first), (Some(at(9)), false, &since), (Some(at(9)), true, &full), (None, true, &full)] {
+        for (since, full, expected) in [(None, false, "--limit 200 --search sort:updated-desc"), (Some(at(9)), false, "updated:>=2026-09-01T09:00:00Z"), (Some(at(9)), true, "updated:2008-01-01T00:00:00Z..")] {
             let (gh, calls) = gh_with(output(vec![]));
             collect(&GitHub::new("acme/app", "github", gh, None), since, full).unwrap();
-            assert_eq!(&calls.borrow()[0].join(" "), expected);
+            assert_eq!(calls.borrow().len(), 1);
+            assert!(calls.borrow()[0].join(" ").contains(expected), "{:?}", calls.borrow());
         }
+    }
+
+    /// `count` pull requests with `body_bytes` bodies, one updated each minute from `start`.
+    fn many(count: u64, body_bytes: usize, start: DateTime<Utc>) -> Vec<Value> {
+        let body = "x".repeat(body_bytes);
+        (1..=count).map(|n| pr(n, &format!("COR-{n} Change"), &body, start, start + chrono::TimeDelta::minutes(n as i64))).collect()
+    }
+
+    #[test]
+    fn a_thousand_rows_since_the_cursor_are_all_read_in_windows_under_the_limit() {
+        let (gh, _, replies) = DatasetGh::new(many(1_000, 10, at(10)));
+        let events = collect(&GitHub::new("acme/app", "github", Box::new(gh), None), Some(at(9)), false).unwrap();
+        let numbers: std::collections::BTreeSet<u64> = events.iter().map(|e| match e {
+            Event::ChangeMerged { change, .. } => change.number,
+            _ => 0,
+        }).collect();
+        assert_eq!(numbers.len(), 1_000);
+        let kept = replies.borrow().iter().filter(|(_, rows, _)| *rows < WINDOW_LIMIT).count();
+        assert!(kept >= 10, "{kept} windows under the limit");
+    }
+
+    #[test]
+    fn a_full_pull_of_2800_rows_with_6_kb_bodies_reads_newest_first_and_never_nears_the_cap() {
+        let (gh, _, replies) = DatasetGh::new(many(2_800, 6 * 1024, at(10)));
+        let events = collect(&GitHub::new("acme/app", "github", Box::new(gh), None), None, true).unwrap();
+        assert_eq!(events.len(), 2_800);
+        let replies = replies.borrow();
+        assert!(replies.iter().all(|(_, _, bytes)| *bytes < RESPONSE_LIMIT / 2), "largest reply {:?}", replies.iter().map(|r| r.2).max());
+        let first_kept = events.first().unwrap().common().occurred_at;
+        assert!(events.iter().all(|e| e.common().occurred_at <= first_kept), "newest window first");
+    }
+
+    #[test]
+    fn a_one_second_window_at_the_limit_fails_without_a_partial_read() {
+        let rows: Vec<Value> = (1..=WINDOW_LIMIT as u64).map(|n| pr(n, "Same second", "Body", at(10), at(11))).collect();
+        let (gh, _, _) = DatasetGh::new(rows);
+        let error = collect(&GitHub::new("acme/app", "github", Box::new(gh), None), Some(at(9)), false).unwrap_err();
+        assert_eq!(error, "gh returned 100 pull requests updated in the second 2026-09-01T11:00:00Z, the most one read returns; Wardwell cannot read them all");
     }
 
     #[test]

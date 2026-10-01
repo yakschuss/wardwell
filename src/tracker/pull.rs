@@ -889,6 +889,21 @@ mod tests {
     }
 
     #[test]
+    fn a_gh_reply_at_the_limit_in_one_second_writes_no_pull_completed() {
+        use crate::tracker::github::tests::{DatasetGh, pr};
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let (gh, nodes, _) = DatasetGh::new(vec![pr(1, "One", "Body", minute(10), minute(10))]);
+        pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(20)).unwrap();
+        nodes.borrow_mut().extend((2..=101).map(|n| pr(n, "Same second", "Body", minute(30), minute(40))));
+        let gh = DatasetGh { nodes: nodes.clone(), replies: Default::default() };
+        let error = pull_project(vault.path(), &github(), &dataset_adapter(gh), false, minute(50)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Provider, "{error}");
+        let summary = log::read_for(&path, "github").unwrap();
+        assert_eq!((summary.cursor, summary.last_pull_at), (Some(minute(10)), Some(minute(20))), "no pull_completed");
+    }
+
+    #[test]
     fn a_full_github_pull_never_removes_linear_issues_in_the_same_log() {
         let vault = tempfile::tempdir().unwrap();
         pull_project(vault.path(), &binding(), &fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9)]), true, at(10)).unwrap();
