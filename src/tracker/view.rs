@@ -14,9 +14,13 @@ use std::path::Path;
 /// The mirror's latest knowledge of one issue.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MirroredIssue {
+    /// External issue key, such as COR-12.
     pub key: String,
+    /// Provider id the issue came from.
     pub provider: String,
+    /// The provider's own id for the issue.
     pub external_id: String,
+    /// The latest provider-neutral snapshot.
     pub issue: IssueSnapshot,
     /// Provider time of the snapshot held.
     pub updated_at: DateTime<Utc>,
@@ -43,6 +47,7 @@ pub struct MirrorView {
     pub issues: BTreeMap<String, MirroredIssue>,
     /// When the latest pull_completed or full_resync marker was written.
     pub last_pull_at: Option<DateTime<Utc>>,
+    /// When the latest full resync marker was written.
     pub last_full_resync_at: Option<DateTime<Utc>>,
     /// The latest pull_failed marker, its time and code.
     pub last_failure: Option<(DateTime<Utc>, FailureCode)>,

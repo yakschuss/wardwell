@@ -60,11 +60,17 @@ pub fn pulled_age(last_pull_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> St
 /// The kanban list filters as they apply to a mirrored issue.
 #[derive(Debug, Default, Clone)]
 pub struct ListFilter<'a> {
+    /// Tracker state name or category.
     pub status: Option<&'a str>,
+    /// Priority label.
     pub priority: Option<&'a str>,
+    /// Assignee name.
     pub assignee: Option<&'a str>,
+    /// Epic filter; the mirror has no epics.
     pub epic: Option<&'a str>,
+    /// Label filter.
     pub tag: Option<&'a str>,
+    /// Keep completed and canceled issues.
     pub include_done: bool,
 }
 
