@@ -792,8 +792,11 @@ gh pr list --repo <owner>/<name> --state merged --json <fields> --limit 100 --se
 A reply that holds 100 rows may have left rows out. Wardwell then splits the
 update-time range in half and reads each half with
 `updated:<from>..<to>`, newer half first, until every reply holds fewer
-than 100. A one-second range that still holds 100 fails with `provider`, and
-no `pull_completed` is written. `--full` always reads this way, from 2008 to
+than 100. A one-second range that still holds 100 cannot be read through `gh`.
+With a token stored, that pull reads through the REST API, which has no such
+limit. Without one, it fails with `provider` and a sentence that says to run
+`wardwell tracker connect github --token-stdin`, and no `pull_completed` is
+written. `--full` always reads this way, from 2008 to
 now, so no reply nears the 16 MiB cap.
 
 `gh` runs in its own process group. A read that runs past 120 seconds has

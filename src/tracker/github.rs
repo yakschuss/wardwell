@@ -217,7 +217,7 @@ impl GitHub {
         let (start, end) = (from.timestamp(), to.unwrap_or_else(latest_update).timestamp());
         if end <= start {
             return Err(GhFailure::Failed(format!(
-                "gh returned {WINDOW_LIMIT} pull requests updated in the second {}, the most one read returns; Wardwell cannot read them all",
+                "gh returned {WINDOW_LIMIT} pull requests updated in the second {}, the most one gh read returns; store a token with `wardwell tracker connect github --token-stdin` and the pull reads them through the API, which has no such limit",
                 second(from)
             )));
         }
@@ -846,11 +846,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_one_second_window_at_the_limit_fails_without_a_partial_read() {
-        let rows: Vec<Value> = (1..=WINDOW_LIMIT as u64).map(|n| pr(n, "Same second", "Body", at(10), at(11))).collect();
-        let (gh, _, _) = DatasetGh::new(rows);
+    fn a_one_second_window_at_the_limit_names_the_token_and_reads_through_it_when_stored() {
+        let rows = || -> Vec<Value> { (1..=WINDOW_LIMIT as u64).map(|n| pr(n, "Same second", "Body", at(10), at(11))).collect() };
+        let (gh, _, _) = DatasetGh::new(rows());
         let error = collect(&GitHub::new("acme/app", "github", Box::new(gh), None), Some(at(9)), false).unwrap_err();
-        assert_eq!(error, "gh returned 100 pull requests updated in the second 2026-09-01T11:00:00Z, the most one read returns; Wardwell cannot read them all");
+        assert_eq!(
+            error,
+            "gh returned 100 pull requests updated in the second 2026-09-01T11:00:00Z, the most one gh read returns; store a token with `wardwell tracker connect github --token-stdin` and the pull reads them through the API, which has no such limit"
+        );
+
+        let (gh, _, _) = DatasetGh::new(rows());
+        let page: Vec<Value> = (1..=WINDOW_LIMIT as u64).map(|n| rest_node(n, 11, true)).collect();
+        let (rest, calls) = rest_with(vec![Ok(json!(page)), Ok(json!([]))]);
+        let events = collect(&GitHub::new("acme/app", "github", Box::new(gh), Some(rest)), Some(at(9)), false).unwrap();
+        assert_eq!(events.len(), WINDOW_LIMIT);
+        assert!(!calls.borrow().is_empty(), "the token read the window gh could not");
     }
 
     #[test]
