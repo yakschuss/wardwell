@@ -13,19 +13,23 @@ pub struct Handler {
     pub matcher: Option<&'static str>,
     pub args: &'static str,
     pub timeout: Option<u64>,
+    /// Tools the handler must run for. A group whose matcher misses one of
+    /// them does not count as installed. Empty: any matcher counts.
+    pub tools: &'static [&'static str],
 }
 
 /// Session start: print the project's context.
 pub const SESSION_START: Handler =
-    Handler { event: "SessionStart", matcher: None, args: "inject \"$(pwd)\"", timeout: None };
+    Handler { event: "SessionStart", matcher: None, args: "inject \"$(pwd)\"", timeout: None, tools: &[] };
 /// Stop: the history check.
-pub const STOP: Handler = Handler { event: "Stop", matcher: None, args: "resolve", timeout: None };
+pub const STOP: Handler = Handler { event: "Stop", matcher: None, args: "resolve", timeout: None, tools: &[] };
 /// PreToolUse: the Linear write gate.
 pub const GATE: Handler = Handler {
     event: "PreToolUse",
     matcher: Some(crate::gate::linear::MATCHER),
     args: "gate linear",
     timeout: Some(5),
+    tools: &[crate::gate::linear::COMMENT_TOOL, crate::gate::linear::ISSUE_TOOL],
 };
 
 /// Every handler `setup` may install, in plan order.
@@ -72,14 +76,19 @@ fn event_groups<'a>(root: &'a mut Value, event: &str) -> Result<&'a mut Vec<Valu
 
 /// Leave exactly one handler for `spec` running `command` in its event. The
 /// first owned handler counts wherever it sits, even under a matcher the user
-/// chose: its command is updated in place and its group, matcher included, is
-/// left as it is. Other owned copies are removed. With none, a new group with
+/// chose, as long as that matcher covers `spec.tools`: its command is updated
+/// in place and its group, matcher included, is left as it is. Other owned copies are removed. With none, a new group with
 /// `spec`'s matcher is added.
 pub fn ensure(root: &mut Value, spec: &Handler, command: &str) -> Result<(), String> {
     let groups = event_groups(root, spec.event)?;
     let mut kept = false;
     let mut emptied = Vec::new();
     for (index, group) in groups.iter_mut().enumerate() {
+        // A group whose matcher misses a tool the handler must see is the
+        // user's to keep; it does not count, and Wardwell adds its own group.
+        if !group_covers(group, spec) {
+            continue;
+        }
         if group.get("hooks").is_none() && is_owned(group, spec.args) {
             emptied.push(index);
             continue;
@@ -206,6 +215,25 @@ pub fn placements(root: &Value, spec: &Handler) -> Vec<(Option<String>, String)>
         }
     }
     found
+}
+
+fn group_covers(group: &Value, spec: &Handler) -> bool {
+    let matcher = group.get("matcher").and_then(Value::as_str).filter(|m| !m.is_empty());
+    spec.tools.iter().all(|tool| matcher_covers(matcher, tool))
+}
+
+/// True when a handler for `spec` sits in a group whose matcher covers its tools.
+pub fn covered(root: &Value, spec: &Handler) -> bool {
+    placements(root, spec).iter().any(|(matcher, _)| spec.tools.iter().all(|tool| matcher_covers(matcher.as_deref(), tool)))
+}
+
+/// Matchers of `spec`'s handlers that miss one of its tools.
+pub fn uncovered_matchers(root: &Value, spec: &Handler) -> Vec<String> {
+    placements(root, spec)
+        .into_iter()
+        .filter(|(matcher, _)| !spec.tools.iter().all(|tool| matcher_covers(matcher.as_deref(), tool)))
+        .map(|(matcher, _)| matcher.unwrap_or_default())
+        .collect()
 }
 
 /// True when a group with `matcher` runs for `tool`. Claude Code reads a

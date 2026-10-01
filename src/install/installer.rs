@@ -140,6 +140,7 @@ pub struct Plan {
     pub lines: Vec<Line>,
     changes: Vec<Change>,
     pull: Pull,
+    /// A gate entry whose matcher covers the Linear writes exists after apply.
     policy: bool,
     settings: bool,
     /// Steps that cannot be taken, each a sentence that says what to do.
@@ -295,6 +296,7 @@ pub fn plan(inputs: &Inputs) -> Result<Plan, String> {
     let mut lines = Vec::new();
     let mut changes = Vec::new();
     let policy = policy_enabled(inputs.trackers);
+    let mut gate_active = false;
     if inputs.claude_code {
         let recorded = manifest::read(inputs.config_dir)?;
         let mut draft = Draft::read(settings_path(inputs.home), false)?;
@@ -305,12 +307,13 @@ pub fn plan(inputs: &Inputs) -> Result<Plan, String> {
         policy_steps(&mut draft, &mut lines, &quoted, policy, &mut record)?;
         prune_created(&mut draft.value, &mut created);
         note_created(&draft.original, &draft.value, &mut created);
+        gate_active = client_hooks::covered(&draft.value, &GATE);
         changes.extend(draft.into_change()?);
         let next = Manifest { claude_permissions_deny: record, created_keys: created, ..Manifest::default() };
         changes.extend(manifest_change(inputs.config_dir, recorded, &next, &mut lines)?);
     }
     let pull = pull_step(inputs, &mut lines);
-    Ok(Plan { lines, changes, pull, policy: policy && inputs.claude_code, settings: inputs.claude_code, failures: Vec::new() })
+    Ok(Plan { lines, changes, pull, policy: policy && gate_active, settings: inputs.claude_code, failures: Vec::new() })
 }
 
 /// Tier one: the session-start hook and the Stop hook.
@@ -331,7 +334,14 @@ fn policy_steps(draft: &mut Draft, lines: &mut Vec<Line>, quoted: &str, policy: 
     let python = draft.has(client_hooks::is_python_gate);
     let tools = LINEAR_UPDATES.denied_tools;
     if policy {
-        let gate_label = format!("{POLICY}: Linear gate, ruleset {} v{}", LINEAR_UPDATES.name, LINEAR_UPDATES.version);
+        let mut gate_label = format!("{POLICY}: Linear gate, ruleset {} v{}", LINEAR_UPDATES.name, LINEAR_UPDATES.version);
+        let uncovered = client_hooks::uncovered_matchers(&draft.value, &GATE);
+        if !uncovered.is_empty() && !client_hooks::covered(&draft.value, &GATE) {
+            gate_label.push_str(&format!(
+                "; the gate under matcher {} does not match Linear writes, so Wardwell adds its own group and leaves that one",
+                uncovered.join(", ")
+            ));
+        }
         draft.step(lines, gate_label, |v| client_hooks::ensure(v, &GATE, &command(quoted, &GATE)))?;
         draft.step(lines, format!("{POLICY}: deny list, {} destructive Linear tools", tools.len()), |v| {
             let stale: Vec<String> = record.iter().filter(|t| !tools.contains(&t.as_str())).cloned().collect();
@@ -993,6 +1003,39 @@ mod tests {
         run(&h, &BTreeMap::new());
         let after = fs::read_to_string(&path).unwrap();
         assert!(after.starts_with("{\n  \"model\": \"keep\",\n  \"hooks\": {"), "{after}");
+    }
+
+    #[test]
+    fn a_gate_under_a_matcher_that_misses_linear_writes_gets_a_covering_group() {
+        let h = home();
+        put_settings(&h, json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/old/wardwell gate linear"},
+            {"type": "command", "command": "rtk"}
+        ]}]}}));
+        let trackers = binding("linear", true);
+        let plan = run(&h, &trackers);
+        assert!(rendered(&plan).contains("the gate under matcher Bash does not match Linear writes"), "{}", rendered(&plan));
+        assert!(plan.activation().iter().any(|n| n.contains("The Linear gate checks")));
+        let s = settings(&h);
+        let groups = s["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "{s}");
+        assert_eq!(groups[0]["hooks"][0]["command"], "/old/wardwell gate linear");
+        assert_eq!(groups[1]["matcher"], crate::gate::linear::MATCHER);
+        assert_eq!(groups[1]["hooks"][0]["command"], format!("'{BIN}' gate linear"));
+        fs::write(h.cfg.join("config.yml"), format!("vault_path: {}\nsession_sources: []\ntrackers:\n  personal/corr:\n    provider: linear\n    team: COR\n    credential: c\n    gate: true\n", h.home.display())).unwrap();
+        let config = crate::config::loader::load(Some(&h.cfg.join("config.yml"))).unwrap();
+        let (rows, ok) = crate::install::doctor::policy_rows(&config, &h.home, Path::new(BIN), false);
+        assert!(ok, "{rows:?}");
+        assert!(plan_for(&h, &trackers, false).is_noop());
+        apply(&uninstall_plan(&h.home, &h.cfg), &Fake::new(&[]), &|| Ok(501)).unwrap();
+        assert_eq!(settings(&h)["hooks"]["PreToolUse"], json!([{"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk"}]}]));
+    }
+
+    #[test]
+    fn the_gate_note_prints_only_when_a_covering_gate_exists() {
+        let h = home();
+        assert!(!plan_for(&h, &binding("linear", false), false).activation().iter().any(|n| n.contains("Linear gate")));
+        assert!(plan_for(&h, &binding("linear", true), false).activation().iter().any(|n| n.contains("Linear gate")));
     }
 
     #[test]

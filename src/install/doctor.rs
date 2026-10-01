@@ -231,7 +231,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// pull service, read offline from Claude settings and the plist. Whether
 /// launchd has the agent loaded is not checked. The bool is false when a row
 /// failed.
-fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, binary: &Path, launchd: bool) -> (Vec<String>, bool) {
+pub(crate) fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, binary: &Path, launchd: bool) -> (Vec<String>, bool) {
     use crate::gate::ruleset::LINEAR_UPDATES;
     use crate::install::client_hooks::{self, GATE};
     const FIX: &str = "run `wardwell setup`";
@@ -253,7 +253,11 @@ fn policy_rows(config: &crate::config::loader::WardwellConfig, home: &Path, bina
             None => rows.push(format!("  {label:<38} {text}")),
         }
     };
-    let first = gate.first().map(|(matcher, command)| (matcher.as_deref(), client_hooks::executable(command)));
+    let first = gate
+        .iter()
+        .find(|(matcher, _)| covers(matcher.as_deref()))
+        .or(gate.first())
+        .map(|(matcher, command)| (matcher.as_deref(), client_hooks::executable(command)));
     let uncovered = first.filter(|(matcher, _)| policy && !covers(*matcher)).and_then(|(matcher, _)| matcher);
     match (policy, first.and_then(|(_, exe)| exe)) {
         (true, Some(_)) if uncovered.is_some() => row("Linear gate", Some(false), format!(
