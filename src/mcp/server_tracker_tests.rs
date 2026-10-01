@@ -655,6 +655,29 @@ fn concurrent_misses_for_a_key_still_missing_make_one_pull() {
 }
 
 #[test]
+fn a_mirror_only_project_keeps_its_mirror_when_the_team_key_is_the_prefix_it_would_derive() {
+    let now = chrono::Utc::now();
+    let mut f = fixture(&[], true);
+    let existing = vec!["CL".to_string()];
+    let derived = crate::kanban::prefix::resolve_prefix("intake", &std::collections::HashMap::new(), &existing).unwrap();
+    let mut intake = binding(true);
+    intake.project = "intake".into();
+    intake.team = derived.clone();
+    Arc::get_mut(&mut f.server.config).unwrap().trackers.insert("work/intake".to_string(), intake);
+    std::fs::create_dir_all(f.server.vault_root.join("work/intake")).unwrap();
+    let path = crate::tracker::log::path_for(&f.server.vault_root, "work", "intake");
+    let mut summary = crate::tracker::log::read(&path).unwrap();
+    let key = format!("{derived}-5");
+    crate::tracker::log::append_new(&path, &[snapshot(&key, "Mirrored five", "In Progress", StateCategory::Started, now), pulled(now)], &mut summary).unwrap();
+
+    let listed = kanban(&f.server, json!({"action": "list", "project": "intake"}));
+    assert!(listed.to_string().contains("Mirrored five"), "{listed}");
+    assert!(listed["tracker_note"].is_null(), "{listed}");
+    let got = kanban(&f.server, json!({"action": "get", "ticket_id": key, "project": "intake"}));
+    assert_eq!(got["item"]["origin"], "tracker", "{got}");
+}
+
+#[test]
 fn a_team_key_equal_to_the_derived_native_prefix_leaves_the_mirror_out_with_a_note() {
     let now = chrono::Utc::now();
     let mut f = fixture(&[], false);

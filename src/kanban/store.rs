@@ -1400,19 +1400,14 @@ pub fn default_kanban_queries() -> HashMap<String, String> {
     m
 }
 
-/// The prefix `project` is registered with in `conn`, else the one it would
-/// derive for its first ticket. None when the tables cannot be read.
-pub fn native_prefix_in(conn: &Connection, project: &str, config_prefixes: &HashMap<String, String>) -> Option<String> {
-    let registered: Option<String> = conn
-        .query_row("SELECT prefix FROM kanban_projects WHERE project=?1", rusqlite::params![project], |row| row.get(0))
+/// The prefix `project` is registered with in `conn`. None when the project
+/// has no native ticket yet, or the tables cannot be read. A prefix the
+/// project would only derive later is not returned: a project that holds a
+/// mirror and no native ticket has nothing for a tracker key to collide with.
+pub fn native_prefix_in(conn: &Connection, project: &str, _config_prefixes: &HashMap<String, String>) -> Option<String> {
+    conn.query_row("SELECT prefix FROM kanban_projects WHERE project=?1", rusqlite::params![project], |row| row.get(0))
         .optional()
-        .ok()?;
-    if registered.is_some() {
-        return registered;
-    }
-    let mut stmt = conn.prepare("SELECT prefix FROM kanban_projects").ok()?;
-    let existing: Vec<String> = stmt.query_map([], |row| row.get(0)).ok()?.filter_map(Result::ok).collect();
-    crate::kanban::prefix::resolve_prefix(project, config_prefixes, &existing)
+        .ok()?
 }
 
 pub fn merge_kanban_queries(config_queries: &HashMap<String, String>) -> HashMap<String, String> {
