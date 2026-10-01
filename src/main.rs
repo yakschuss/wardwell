@@ -685,7 +685,7 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Output context for a specific domain's projects.
 fn inject_domain_context(config: &wardwell::config::loader::WardwellConfig, domain_dir: &Path) {
     let today = chrono::Local::now().date_naive();
-    print!("{}", wardwell::inject::domain::domain_context(config, domain_dir, chrono::Utc::now(), today));
+    print!("{}", wardwell::inject::domain::domain_context(config, &wardwell::config::loader::config_dir(), domain_dir, chrono::Utc::now(), today));
 }
 
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {

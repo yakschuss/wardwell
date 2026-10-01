@@ -11,13 +11,14 @@ use chrono::{DateTime, NaiveDate, Utc};
 use std::path::{Path, PathBuf};
 
 /// The inject output for `domain_dir` at `now` and local date `today`.
-pub fn domain_context(config: &WardwellConfig, domain_dir: &Path, now: DateTime<Utc>, today: NaiveDate) -> String {
+/// Tracker credentials are checked, offline, in `config_dir`.
+pub fn domain_context(config: &WardwellConfig, config_dir: &Path, domain_dir: &Path, now: DateTime<Utc>, today: NaiveDate) -> String {
     let domain = domain_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
     let state = domain_dir.join("current_state.md");
     if state.exists()
         && let Ok(content) = std::fs::read_to_string(&state)
     {
-        return with_bound_sections(content, config, domain, domain_dir, now);
+        return with_bound_sections(content, config, config_dir, domain, domain_dir, now);
     }
     let mut out = String::new();
     for p in subdirectories(domain_dir) {
@@ -26,7 +27,7 @@ pub fn domain_context(config: &WardwellConfig, domain_dir: &Path, now: DateTime<
         if skipped(project) {
             continue;
         }
-        let tracker = project_tracker_lines(config, domain, &p, now);
+        let tracker = project_tracker_lines(config, config_dir, domain, &p, now);
         if printed {
             push_line(&mut out, &format!("  {}", project_rot_line(&p, today)));
         } else if tracker.is_some() {
@@ -39,13 +40,13 @@ pub fn domain_context(config: &WardwellConfig, domain_dir: &Path, now: DateTime<
 
 /// The domain state, then a header and tracker section per bound project.
 /// The state ends with a newline before anything follows it.
-fn with_bound_sections(mut out: String, config: &WardwellConfig, domain: &str, domain_dir: &Path, now: DateTime<Utc>) -> String {
+fn with_bound_sections(mut out: String, config: &WardwellConfig, config_dir: &Path, domain: &str, domain_dir: &Path, now: DateTime<Utc>) -> String {
     for p in subdirectories(domain_dir) {
         let project = p.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
         if skipped(project) {
             continue;
         }
-        let Some(lines) = project_tracker_lines(config, domain, &p, now) else {
+        let Some(lines) = project_tracker_lines(config, config_dir, domain, &p, now) else {
             continue;
         };
         if !out.is_empty() && !out.ends_with('\n') {
@@ -165,6 +166,10 @@ mod tests {
             }
         }
         std::fs::write(dir.join("config.yml"), yaml).unwrap();
+        let credential = crate::tracker::credential::path_in(dir, "c").unwrap();
+        if !credential.exists() {
+            crate::tracker::credential::save(&credential, "t").unwrap();
+        }
         crate::config::loader::load(Some(&dir.join("config.yml"))).unwrap()
     }
 
@@ -210,7 +215,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let work = sixty_project_vault(dir.path());
         let config = config(dir.path(), &dir.path().join("vault"), &[]);
-        let new = domain_context(&config, &work, now(), today());
+        let new = domain_context(&config, dir.path(), &work, now(), today());
         let rot = "  Last history entry 12 days ago. Last decision 3 days ago.";
         let mut expected = String::new();
         for line in old_output(&work).lines() {
@@ -234,7 +239,7 @@ mod tests {
         let work = sixty_project_vault(dir.path());
         pulled_mirror(&work.join("proj03"));
         let config = config(dir.path(), &dir.path().join("vault"), &["work/proj03"]);
-        let new = domain_context(&config, &work, now(), today());
+        let new = domain_context(&config, dir.path(), &work, now(), today());
         let block = "**work/proj03** (active): Ship the thing number 3.\n  Next: Open the PR.\n  Last history entry 12 days ago. Last decision 3 days ago.\n  Tracker mirror. Last pulled 1 hour ago. Not authoritative.\n";
         assert!(new.contains(block), "{new}");
         assert_eq!(new.matches("Tracker mirror.").count(), 1);
@@ -251,10 +256,10 @@ mod tests {
         pulled_mirror(&work.join("_templates"));
         std::fs::write(work.join("current_state.md"), "# Work\n\n## Focus\nDomain focus line.\n").unwrap();
         let config = config(dir.path(), &dir.path().join("vault"), &["work/beta", "work/_templates"]);
-        let new = domain_context(&config, &work, now(), today());
+        let new = domain_context(&config, dir.path(), &work, now(), today());
         assert_eq!(new, format!("{}**work/beta**\n{SECTION}", old_output(&work)));
 
-        let unbound = domain_context(&config_without_trackers(dir.path()), &work, now(), today());
+        let unbound = domain_context(&config_without_trackers(dir.path()), dir.path(), &work, now(), today());
         assert_eq!(unbound, old_output(&work), "no binding, no change at all");
     }
 
@@ -271,7 +276,7 @@ mod tests {
         pulled_mirror(&work.join("beta"));
         std::fs::write(work.join("current_state.md"), "# Work\n\n## Next Action\nLAST LINE NO NEWLINE").unwrap();
         let config = config(dir.path(), &dir.path().join("vault"), &["work/beta"]);
-        let new = domain_context(&config, &work, now(), today());
+        let new = domain_context(&config, dir.path(), &work, now(), today());
         assert!(new.starts_with("# Work\n\n## Next Action\nLAST LINE NO NEWLINE\n**work/beta**\n"), "{new}");
     }
 
@@ -282,7 +287,7 @@ mod tests {
         state(&work.join("alpha"), 1);
         pulled_mirror(&work.join("beta"));
         let config = config(dir.path(), &dir.path().join("vault"), &["work/beta"]);
-        let new = domain_context(&config, &work, now(), today());
+        let new = domain_context(&config, dir.path(), &work, now(), today());
         assert!(new.contains(&format!("**work/beta**\n{SECTION}")), "{new}");
         assert!(!new.contains("**work/beta**\n  No history"), "no rot line for a project the summaries did not print");
     }

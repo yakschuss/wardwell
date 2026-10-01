@@ -490,7 +490,11 @@ Folders that are hidden or start with an underscore get no added lines. The
 section's first line is "Tracker mirror. Last pulled 2 hours ago. Not
 authoritative." Up to ten issues in a started state follow, each with key,
 title and state. When the last pull failed or is more than 24 hours old, the
-section shows only the age and that notice.
+section shows only the age and that notice. A mirror never pulled says only
+"Tracker mirror. Never pulled. Not authoritative." Inject also runs the
+offline doctor check. When pulls cannot run, the section is one line, such as
+"Tracker mirror. Pulls cannot run: credential. Last pulled 3 days ago." It
+lists no issues.
 
 `wardwell doctor` prints one row per binding. It checks only the credential
 file and the provider, with no network call, and names `wardwell tracker
