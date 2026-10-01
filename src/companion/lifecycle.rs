@@ -284,37 +284,20 @@ pub fn coverage(client: Option<Client>) -> Result<Value, String> {
     )
 }
 
-/// When this session's first lifecycle record opened: the earliest
-/// `opened_at` among its generations, the first prompt the hooks saw. None
-/// when the session has none, or when the scan passes `deadline`.
-pub fn session_started_at(client: Client, session: &str, deadline: std::time::Instant) -> Option<DateTime<Utc>> {
-    session_started_at_in(&root(), client, session, deadline)
+/// When this session's lifecycle record was first created, read from that
+/// session's own file. None when the file is missing, belongs to another
+/// session, or predates the field. Nothing else is scanned.
+pub fn session_started_at(client: Client, session: &str) -> Option<DateTime<Utc>> {
+    session_started_at_in(&root(), client, session)
 }
 
-fn session_started_at_in(base: &Path, client: Client, session: &str, deadline: std::time::Instant) -> Option<DateTime<Utc>> {
+pub(crate) fn session_started_at_in(base: &Path, client: Client, session: &str) -> Option<DateTime<Utc>> {
     valid(session, "session id").ok()?;
-    // Every generation maps its session first; no mapping means no generation.
-    let mapping = base.join("sessions").join(format!("{}.json", hash(&format!("{}:{session}", client.name()))));
-    if !mapping.is_file() {
+    let value = read_json(&session_path(base, client, session)).ok()??;
+    if value["client"].as_str() != Some(client.name()) || value["session_id"].as_str() != Some(session) {
         return None;
     }
-    let mut earliest: Option<DateTime<Utc>> = None;
-    for entry in fs::read_dir(base.join("generations")).ok()?.flatten() {
-        if std::time::Instant::now() > deadline {
-            return None;
-        }
-        let Some(state) = read_json(&entry.path()).ok().flatten().and_then(|v| serde_json::from_value::<Generation>(v).ok()) else {
-            continue;
-        };
-        if state.client != client || state.session_id != session {
-            continue;
-        }
-        if let Ok(at) = DateTime::parse_from_rfc3339(&state.opened_at) {
-            let at = at.with_timezone(&Utc);
-            earliest = Some(earliest.map_or(at, |e| e.min(at)));
-        }
-    }
-    earliest
+    DateTime::parse_from_rfc3339(value["opened_at"].as_str()?).ok().map(|at| at.with_timezone(&Utc))
 }
 
 fn begin_at(base: &Path, client: Client, value: &Value) -> Result<Value, String> {
@@ -547,11 +530,15 @@ fn active_path(base: &Path, client: Client, session: &str) -> PathBuf {
     ))
 }
 
-fn source_key(base: &Path, client: Client, session: &str) -> Result<String, String> {
-    let path = base.join("sessions").join(format!(
+fn session_path(base: &Path, client: Client, session: &str) -> PathBuf {
+    base.join("sessions").join(format!(
         "{}.json",
         hash(&format!("{}:{session}", client.name()))
-    ));
+    ))
+}
+
+fn source_key(base: &Path, client: Client, session: &str) -> Result<String, String> {
+    let path = session_path(base, client, session);
     if let Some(value) = read_json(&path)? {
         if value["client"].as_str() != Some(client.name())
             || value["session_id"].as_str() != Some(session)
@@ -577,7 +564,7 @@ fn source_key(base: &Path, client: Client, session: &str) -> Result<String, Stri
     atomic(
         &path,
         &serde_json::to_vec_pretty(
-            &json!({"client":client,"session_id":session,"source_key":source}),
+            &json!({"client":client,"session_id":session,"source_key":source,"opened_at":Utc::now().to_rfc3339()}),
         )
         .map_err(|_| "Could not encode session mapping")?,
     )?;
@@ -1057,34 +1044,19 @@ mod tests {
     }
 
     #[test]
-    fn session_start_is_the_earliest_generation_of_that_session_only() {
+    fn the_session_file_records_its_start_once_and_the_stop_check_reads_only_it() {
         let dir = tempfile::tempdir().unwrap();
-        let far = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1", far), None);
-        let generation = |session: &str, id: &str, client: Client, opened: &str| Generation {
-            version: 1,
-            client,
-            session_id: session.into(),
-            generation_id: id.into(),
-            source_key: format!("companion:claude:{session}"),
-            token: uuid::Uuid::new_v4().to_string(),
-            opened_at: opened.into(),
-            corrective_used: false,
-            checkpoint: None,
-        };
-        save(dir.path(), &generation("session-1", "p2", Client::Claude, "2026-10-01T15:00:00+00:00")).unwrap();
-        save(dir.path(), &generation("session-1", "p1", Client::Claude, "2026-10-01T14:02:00+00:00")).unwrap();
-        save(dir.path(), &generation("session-2", "p0", Client::Claude, "2026-10-01T09:00:00+00:00")).unwrap();
-        save(dir.path(), &generation("session-1", "t0", Client::Codex, "2026-10-01T08:00:00+00:00")).unwrap();
-        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1", far), None, "no session mapping, no start");
-        atomic(
-            &dir.path().join("sessions").join(format!("{}.json", hash("claude:session-1"))),
-            br#"{"client":"claude","session_id":"session-1","source_key":"companion:claude:session-1"}"#,
-        )
-        .unwrap();
-        let start = session_started_at_in(dir.path(), Client::Claude, "session-1", far).unwrap();
-        assert_eq!(start.to_rfc3339(), "2026-10-01T14:02:00+00:00");
-        let past = std::time::Instant::now() - std::time::Duration::from_millis(1);
-        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1", past), None, "a passed deadline gives no start");
+        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1"), None);
+        let path = session_path(dir.path(), Client::Claude, "session-1");
+        atomic(&path, br#"{"client":"claude","session_id":"session-1","source_key":"companion:claude:session-1"}"#).unwrap();
+        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1"), None, "a file without a start allows");
+        fs::remove_file(&path).unwrap();
+        let before = Utc::now();
+        let source = source_key(dir.path(), Client::Codex, "session-1").unwrap();
+        let start = session_started_at_in(dir.path(), Client::Codex, "session-1").unwrap();
+        assert!(start >= before - chrono::TimeDelta::seconds(1) && start <= Utc::now());
+        assert_eq!(source_key(dir.path(), Client::Codex, "session-1").unwrap(), source);
+        assert_eq!(session_started_at_in(dir.path(), Client::Codex, "session-1"), Some(start), "written once, never moved");
+        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1"), None, "per client");
     }
 }

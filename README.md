@@ -189,7 +189,7 @@ When a session stops, Wardwell checks that work was recorded. In a mapped projec
 2 commits since 14:02, no history entry. Run wardwell_write append_history for personal/corr-platform, or set WARDWELL_STOP_CHECK=off.
 ```
 
-The session begins at its first prompt that the Companion lifecycle hooks recorded. Without those hooks there is no start time, and the check allows.
+The session begins when the Companion lifecycle hooks first record it. The time is stored once in that session's own file. Without those hooks there is no start time, and the check allows.
 
 - It blocks at most once per session.
 - It allows when the agent is already continuing from a Stop block.

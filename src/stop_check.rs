@@ -35,14 +35,14 @@ pub fn enabled(switch: Option<&str>) -> bool {
 
 /// The check as the Stop hooks run it: config from the config dir, the
 /// switch from `WARDWELL_STOP_CHECK`, the start time from the session's
-/// first lifecycle record. `stop_hook: false` in config.yml also turns it off.
+/// own lifecycle file. `stop_hook: false` in config.yml also turns it off.
 pub fn check(client: crate::companion::lifecycle::Client, payload: &Value) -> Option<String> {
     let deadline = Instant::now() + BUDGET;
     let config = crate::config::loader::load(None).ok()?;
     let state = state_dir(&crate::config::loader::config_dir());
     let on = config.stop_hook && enabled(std::env::var("WARDWELL_STOP_CHECK").ok().as_deref());
     Check { enabled: on, config: &config, state_dir: &state, deadline }
-        .evaluate(payload, |session| crate::companion::lifecycle::session_started_at(client, session, deadline))
+        .evaluate(payload, |session| crate::companion::lifecycle::session_started_at(client, session))
 }
 
 /// What one evaluation reads.
@@ -356,5 +356,27 @@ mod tests {
         let mut p = payload(&f, "s-1", false);
         p["cwd"] = json!(feature);
         assert_eq!(check(&f, true).evaluate(&p, |_| Some(start())), None);
+    }
+
+    #[test]
+    fn fifty_thousand_generation_files_do_not_slow_the_check() {
+        let f = fixture();
+        let base = f.state.parent().unwrap().join("companions/lifecycle");
+        let generations = base.join("generations");
+        std::fs::create_dir_all(&generations).unwrap();
+        for i in 0..50_000 {
+            std::fs::write(generations.join(format!("{i:064x}.json")), "{\"session_id\":\"other\"}").unwrap();
+        }
+        let digest: String = Sha256::digest(b"claude:s-1").iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::create_dir_all(base.join("sessions")).unwrap();
+        let record = json!({"client":"claude","session_id":"s-1","source_key":"companion:claude:s-1","opened_at":start().to_rfc3339()});
+        std::fs::write(base.join("sessions").join(format!("{digest}.json")), record.to_string()).unwrap();
+        after_start(&f, 1);
+        let began = Instant::now();
+        let deadline = began + BUDGET;
+        let blocked = Check { deadline, ..check(&f, true) }
+            .evaluate(&payload(&f, "s-1", false), |s| crate::companion::lifecycle::session_started_at_in(&base, crate::companion::lifecycle::Client::Claude, s));
+        assert!(began.elapsed() < BUDGET, "{:?}", began.elapsed());
+        assert!(blocked.is_some_and(|r| r.starts_with("1 commit since")));
     }
 }
