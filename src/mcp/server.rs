@@ -4420,6 +4420,7 @@ mod tests {
             kanban_prefixes: std::collections::HashMap::new(),
             features: Default::default(),
             trackers: Default::default(),
+            projects: Default::default(),
         };
         WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None, None)
     }

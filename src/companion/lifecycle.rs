@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -284,6 +284,22 @@ pub fn coverage(client: Option<Client>) -> Result<Value, String> {
     )
 }
 
+/// When this session's lifecycle record was first created, read from that
+/// session's own file. None when the file is missing, belongs to another
+/// session, or predates the field. Nothing else is scanned.
+pub fn session_started_at(client: Client, session: &str) -> Option<DateTime<Utc>> {
+    session_started_at_in(&root(), client, session)
+}
+
+pub(crate) fn session_started_at_in(base: &Path, client: Client, session: &str) -> Option<DateTime<Utc>> {
+    valid(session, "session id").ok()?;
+    let value = read_json(&session_path(base, client, session)).ok()??;
+    if value["client"].as_str() != Some(client.name()) || value["session_id"].as_str() != Some(session) {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(value["opened_at"].as_str()?).ok().map(|at| at.with_timezone(&Utc))
+}
+
 fn begin_at(base: &Path, client: Client, value: &Value) -> Result<Value, String> {
     let hook = parse(value, "UserPromptSubmit")?;
     let generation = generation(base, client, &hook)?;
@@ -514,11 +530,15 @@ fn active_path(base: &Path, client: Client, session: &str) -> PathBuf {
     ))
 }
 
-fn source_key(base: &Path, client: Client, session: &str) -> Result<String, String> {
-    let path = base.join("sessions").join(format!(
+fn session_path(base: &Path, client: Client, session: &str) -> PathBuf {
+    base.join("sessions").join(format!(
         "{}.json",
         hash(&format!("{}:{session}", client.name()))
-    ));
+    ))
+}
+
+fn source_key(base: &Path, client: Client, session: &str) -> Result<String, String> {
+    let path = session_path(base, client, session);
     if let Some(value) = read_json(&path)? {
         if value["client"].as_str() != Some(client.name())
             || value["session_id"].as_str() != Some(session)
@@ -544,7 +564,7 @@ fn source_key(base: &Path, client: Client, session: &str) -> Result<String, Stri
     atomic(
         &path,
         &serde_json::to_vec_pretty(
-            &json!({"client":client,"session_id":session,"source_key":source}),
+            &json!({"client":client,"session_id":session,"source_key":source,"opened_at":Utc::now().to_rfc3339()}),
         )
         .map_err(|_| "Could not encode session mapping")?,
     )?;
@@ -1021,5 +1041,22 @@ mod tests {
             handle.join().unwrap();
         }
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_session_file_records_its_start_once_and_the_stop_check_reads_only_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1"), None);
+        let path = session_path(dir.path(), Client::Claude, "session-1");
+        atomic(&path, br#"{"client":"claude","session_id":"session-1","source_key":"companion:claude:session-1"}"#).unwrap();
+        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1"), None, "a file without a start allows");
+        fs::remove_file(&path).unwrap();
+        let before = Utc::now();
+        let source = source_key(dir.path(), Client::Codex, "session-1").unwrap();
+        let start = session_started_at_in(dir.path(), Client::Codex, "session-1").unwrap();
+        assert!(start >= before - chrono::TimeDelta::seconds(1) && start <= Utc::now());
+        assert_eq!(source_key(dir.path(), Client::Codex, "session-1").unwrap(), source);
+        assert_eq!(session_started_at_in(dir.path(), Client::Codex, "session-1"), Some(start), "written once, never moved");
+        assert_eq!(session_started_at_in(dir.path(), Client::Claude, "session-1"), None, "per client");
     }
 }

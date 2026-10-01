@@ -159,9 +159,59 @@ Copies content to the system clipboard via `pbcopy`. The AI is instructed to alw
 
 ## SessionStart Hook
 
-When you open a Claude Code session, wardwell checks if your current directory name matches a domain folder in your vault. If it does, it prints a summary of active projects and their state — this gets injected into the session as context.
+When you open a Claude Code session, the hook runs `wardwell inject "$(pwd)"`. Wardwell decides which project the directory belongs to, in this order:
 
-The hook runs `wardwell inject "$(pwd)"` and outputs the content of `current_state.md` files found under the matching domain.
+1. A git worktree counts as its main checkout. A linked worktree anywhere on disk resolves like the repository it came from.
+2. The longest directory under `projects:` in config.yml that contains the directory wins.
+3. A directory named like a vault domain folder prints that domain's projects, as before.
+
+A mapping whose vault folder does not exist is skipped, and the next rule applies. `wardwell doctor` reports the missing folder.
+
+A mapped project prints its summary, a rot line with the age of its last history entry and last decision, and its tracker section when it has a binding. No match prints nothing.
+
+### Link a repository to a project
+
+Run this once in the repository:
+
+```bash
+wardwell project link personal/corr-platform
+```
+
+Wardwell shows the change first. It asks once before writing. `--dry-run` writes nothing. `--yes` skips the question. `--path <dir>` links another directory. Leave out the project to use the one vault project named like the directory.
+
+The command adds the directory under `projects:` in config.yml. Comments and other keys stay as they are. The old file is saved beside it with owner-only permissions. A second run changes nothing and says so. A project folder that does not exist in the vault is refused; create it with `wardwell seed` first. A linked worktree is refused. Link its main checkout instead; worktrees resolve through it. `wardwell doctor` fails a mapped path that is a linked worktree and names the main checkout.
+
+`wardwell project list` shows each project and its directories. Sessions already running do not change. The mapping applies from the next session.
+
+## Stop check
+
+When a session stops, Wardwell checks that work was recorded. In a mapped project with a vault folder, it counts the commits this worktree made since the session began. It reads the worktree's own HEAD reflog. A pull, a checkout, a rebase or a merge does not count, so other people's commits never do. With commits and no history entry written since then, it blocks the stop once with one line, for example:
+
+```
+2 commits since 14:02, no history entry. Run wardwell_write append_history for personal/corr-platform, or set WARDWELL_STOP_CHECK=off.
+```
+
+The session begins when the Companion lifecycle hooks first record it. The time is stored once in that session's own file. Without those hooks there is no start time, and the check allows.
+
+- It blocks at most once per session.
+- It allows when the agent is already continuing from a Stop block.
+- It allows on any error or timeout, and when the project has no vault folder.
+- It reads only the local git repository. Merged pull requests are not counted.
+- An amend counts as the commit it replaces. A session that only amended counts one.
+- These do not count, because git records them as something other than a commit:
+  - a cherry-pick
+  - a revert
+  - `git am`
+  - a pull
+  - a checkout
+  - a rebase
+  - a merge, unless you finish it with your own `git commit`
+- Only a history entry in this project counts. An entry written to a different project does not satisfy the check for this one.
+- Two sessions that share one checkout cannot be told apart. A commit by either counts for both. Give each session its own worktree.
+- Each block is logged to `~/.wardwell/stop-check/blocks.jsonl`. `wardwell doctor` shows the last one per project.
+- `WARDWELL_STOP_CHECK=off` turns it off. So does `stop_hook: false` in config.yml.
+
+The Companion Stop check runs first. When both block, one block carries both reasons, the Companion's first.
 
 ## CLI Commands
 
@@ -173,7 +223,9 @@ wardwell setup --dry-run      Preview agent config repair; never changes the vau
 wardwell setup                Configure detected agents, with backups and one consent gate
 wardwell doctor               Check that everything is wired correctly
 wardwell uninstall            Clean removal — MCP entries, hooks, markers (preserves vault)
-wardwell inject .             Output project context for a directory (used by hooks)
+wardwell inject .             Output project context for a directory, used by hooks
+wardwell project link [<d/p>] [--path <dir>] [--dry-run] [--yes]   Link a directory to a vault project
+wardwell project list         Show each linked project and its directories
 wardwell reindex              Rebuild the vault search index from scratch
 wardwell seed <path>          Create domain or project folders
 wardwell tracker connect <name> --token-stdin   Store a tracker API token
@@ -229,6 +281,7 @@ Checks that everything is wired correctly:
 - Local context and hosted-app MCP entries configured in Claude Code and Codex
 - Local context configured in Claude Desktop; hosted access remains an account connector
 - SessionStart hook registered
+- Each linked project: whether each directory exists, the age of the last history entry and last decision, the last pull when bound, and the last stop-check block
 - Claude CLI available (for summarizer)
 
 `doctor` verifies configuration, not authorization. Complete OAuth and publish
@@ -317,6 +370,8 @@ exclude:
 | `domains` | Optional domain config with path patterns and aliases (migration path) |
 | `ai.summarize_model` | Claude model for session summarization (default: `haiku`) |
 | `trackers` | Optional `<domain>/<project>` bindings to an issue tracker (see Tracker mirror) |
+| `projects` | Optional `<domain>/<project>` entries, each with `paths:`, a list of directories. Session start and the Stop check use them. `~/` is expanded. Paths must be absolute. Any other key in an entry is an error. |
+| `stop_hook` | Set to `false` to turn off the Stop check. Default `true`. |
 
 ## Tracker mirror
 

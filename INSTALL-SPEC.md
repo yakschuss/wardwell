@@ -109,6 +109,32 @@ If vault is empty:
 - Confirm hook installed
 - Print: "Done. Restart Claude Desktop and/or start a new Claude Code session."
 
+## `wardwell project link`
+
+Records which directories belong to a vault project, so session start finds it.
+
+- Writes one entry under `projects:` in `~/.wardwell/config.yml`.
+- Previews first. The plan line is UPDATE + BACKUP or UNCHANGED. `--dry-run` writes nothing. It asks once. `--yes` skips the question.
+- Idempotent. A directory already covered by the project changes nothing and says so.
+- Preserves everything else. The crate has no comment-preserving YAML editor, so the entry is inserted as text. The result is parsed before writing. Keys outside `projects:` must be unchanged, and `projects:` must differ by the one path. Otherwise nothing is written.
+- Backs up config.yml beside itself with mode 0600. Writes through a temp file and a rename.
+- Holds `config.yml.lock` from the read to the rename, created exclusively. A dry run takes no lock. It waits up to 10 seconds for another link, then stops with a message. The lock is released while the question waits for an answer. The lock is removed on every exit.
+- Refuses a project folder that does not exist in the vault, a directory linked to another project, and a `projects:` section written in flow style.
+- Refuses a linked worktree and names its main checkout. Doctor fails a mapped linked worktree the same way.
+
+## Stop check
+
+Runs inside the Stop hook: `wardwell companion lifecycle stop`, and `wardwell resolve` too. The check needs the Companion lifecycle hooks for a session start time. `wardwell resolve` alone has none, so without those hooks it always allows.
+
+- Resolves the project with the same mapping as session start. Allows when there is no mapped project or no vault folder.
+- Start time: `opened_at` in the session's own lifecycle file, written once when the lifecycle hooks first record the session. Claude Code's Stop payload carries no start time. A file without it allows.
+- Counts entries in this worktree's HEAD reflog since the start whose subject begins with `commit`. Allows on any git error. The whole check has a 1.2 second budget.
+- Blocks when there are commits and no history entry since the start. One line names the count, the start time, and the command to run.
+- Blocks at most once per session id, using a marker under `~/.wardwell/stop-check/blocked/`. Honours `stop_hook_active`.
+- Logs each block to `~/.wardwell/stop-check/blocks.jsonl`.
+- `WARDWELL_STOP_CHECK=off` or `stop_hook: false` turns it off.
+- Order: the Companion check runs first and keeps its output. The Stop check runs only when the Companion check succeeds. When both block, one block carries both reasons.
+
 ## `wardwell uninstall`
 
 Clean removal. Reverse of init.
@@ -132,6 +158,7 @@ Diagnostic command. Checks everything is wired correctly.
 - SessionStart hook registered in settings.json ✓/✗
 - Binary path in MCP configs matches actual binary location ✓/✗
 - Session sources exist and have N sessions ✓/✗
+- Each linked project: each directory exists, ages of the last history entry and decision, the last pull when bound, the last stop-check block ✓/✗
 
 ## Distribution
 

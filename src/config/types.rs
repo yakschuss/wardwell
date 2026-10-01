@@ -169,6 +169,9 @@ pub enum ConfigError {
 
     #[error("invalid tracker binding '{key}': {reason}")]
     InvalidTrackerBinding { key: String, reason: String },
+
+    #[error("invalid project mapping '{key}': {reason}")]
+    InvalidProjectMapping { key: String, reason: String },
 }
 
 fn dirs_home() -> Option<PathBuf> {

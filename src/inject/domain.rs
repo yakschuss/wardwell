@@ -3,7 +3,10 @@
 //! each project with a tracker binding only, a rot line and its tracker
 //! section.
 //!
-//! Does NOT choose the domain (main.rs matches it to the cwd) or pull.
+//! A directory mapped to one project prints only that project, with its rot
+//! line whether or not it is bound.
+//!
+//! Does NOT choose the domain or project (resolve.rs does) or pull.
 
 use crate::config::loader::WardwellConfig;
 use crate::inject::session::{project_rot_line, project_tracker_lines};
@@ -36,6 +39,24 @@ pub fn domain_context(config: &WardwellConfig, config_dir: &Path, domain_dir: &P
         push_line(&mut out, &format!("  {}", project_rot_line(&p, today)));
         tracker.iter().for_each(|line| push_line(&mut out, &format!("  {line}")));
     }
+    out
+}
+
+/// The inject output for one mapped project: its summary or header, its rot
+/// line, and its tracker section when bound. Nothing when the project has
+/// no vault folder.
+pub fn project_context(config: &WardwellConfig, config_dir: &Path, domain: &str, project: &str, now: DateTime<Utc>, today: NaiveDate) -> String {
+    let dir = config.vault_path.join(domain).join(project);
+    if !dir.is_dir() {
+        return String::new();
+    }
+    let mut out = String::new();
+    if !push_summary(&mut out, domain, project, &dir) {
+        push_line(&mut out, &format!("**{domain}/{project}**"));
+    }
+    push_line(&mut out, &format!("  {}", project_rot_line(&dir, today)));
+    let tracker = project_tracker_lines(config, config_dir, domain, &dir, now).unwrap_or_default();
+    tracker.iter().for_each(|line| push_line(&mut out, &format!("  {line}")));
     out
 }
 

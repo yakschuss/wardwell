@@ -276,7 +276,7 @@ fn shell_quote(path: &Path) -> Result<String, String> {
     }
     Ok(format!("'{}'", text.replace('\'', "'\\''")))
 }
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
     match fs::symlink_metadata(path) {
         Ok(meta)
             if meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= MAX_CONFIG =>
@@ -295,7 +295,7 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
         Err(_) => Err(format!("Could not inspect {}", path.display())),
     }
 }
-fn backup_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+pub(crate) fn backup_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -313,7 +313,7 @@ fn backup_file(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
         .map_err(|_| "Could not write rollback backup")?;
     Ok(backup)
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Config path has no parent")?;
     fs::create_dir_all(parent).map_err(|_| "Could not create client directory")?;
     if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
