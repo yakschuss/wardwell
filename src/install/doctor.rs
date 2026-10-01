@@ -96,6 +96,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                // Tracker bindings: offline checks only
+                let (rows, trackers_ok) = tracker_rows(&config, &config_dir());
+                for row in rows {
+                    println!("{row}");
+                }
+                all_ok &= trackers_ok;
+
                 // MCP configs
                 let mcp_paths = McpConfigPaths::detect();
                 let binary_path = detect::find_binary_path();
@@ -203,6 +210,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// One row per tracker binding from the offline doctor checks (credential
+/// file and provider; no network). Each row names `wardwell tracker doctor`
+/// for the live check. The bool is false when any binding failed.
+fn tracker_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
+    const LIVE: &str = "live check: `wardwell tracker doctor`";
+    let mut ok = true;
+    let rows = config
+        .trackers
+        .iter()
+        .map(|(key, binding)| {
+            let label = format!("Tracker {key}");
+            match crate::tracker::doctor::check_offline(config_dir, binding) {
+                Ok(()) => format!("  {label:<38} \u{2713} credential ok; {LIVE}"),
+                Err((code, detail)) => {
+                    ok = false;
+                    let detail = detail.map(|d| format!(": {d}")).unwrap_or_default();
+                    format!("  {label:<38} \u{2717} failed ({}){detail}; {LIVE}", code.as_str())
+                }
+            }
+        })
+        .collect();
+    (rows, ok)
 }
 
 fn check_session_start_hook(settings_path: &std::path::Path) -> bool {
@@ -401,6 +432,51 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
         assert!(check_session_start_hook(&path));
+    }
+
+    fn tracker_config(dir: &Path, provider: &str) -> crate::config::loader::WardwellConfig {
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: corr-linear\n",
+            vault.display()
+        );
+        std::fs::write(dir.join("config.yml"), yaml).unwrap();
+        let mut config = loader::load(Some(&dir.join("config.yml"))).unwrap();
+        config.trackers.get_mut("work/claims").unwrap().provider = provider.into();
+        config
+    }
+
+    #[test]
+    fn tracker_rows_use_the_row_format_and_name_the_live_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let (rows, ok) = tracker_rows(&config, dir.path());
+        assert!(!ok);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].starts_with("  Tracker work/claims                    \u{2717} failed (credential): tracker credential not configured"), "{}", rows[0]);
+        assert!(rows[0].ends_with("; live check: `wardwell tracker doctor`"), "{}", rows[0]);
+        assert_eq!(rows[0].find('\u{2717}'), "  Config                                 \u{2713}".find('\u{2713}'), "marks line up with the other rows");
+
+        let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
+        crate::tracker::credential::save(&path, "lin_api_secret").unwrap();
+        let (rows, ok) = tracker_rows(&config, dir.path());
+        assert!(ok);
+        assert_eq!(rows, vec!["  Tracker work/claims                    \u{2713} credential ok; live check: `wardwell tracker doctor`"]);
+        assert!(!rows[0].contains("lin_api_secret"));
+
+        let jira = tracker_config(dir.path(), "jira");
+        let (rows, ok) = tracker_rows(&jira, dir.path());
+        assert!(!ok);
+        assert!(rows[0].contains("\u{2717} failed (unsupported_provider); live check"), "{}", rows[0]);
+    }
+
+    #[test]
+    fn no_bindings_no_tracker_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = tracker_config(dir.path(), "linear");
+        config.trackers.clear();
+        assert_eq!(tracker_rows(&config, dir.path()), (vec![], true));
     }
 
     #[test]

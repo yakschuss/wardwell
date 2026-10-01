@@ -39,6 +39,19 @@ pub fn run(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>) -> (Ve
     (lines, healthy)
 }
 
+/// The checks that need no network: the credential file exists with
+/// owner-only permissions, and Wardwell has an adapter for the provider.
+/// The error is a closed code and, for the credential, the path and fix.
+pub fn check_offline(config_dir: &Path, binding: &TrackerBinding) -> Result<(), (FailureCode, Option<String>)> {
+    credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .map_err(|message| (FailureCode::Credential, Some(message)))?;
+    match crate::tracker::SUPPORTED_PROVIDERS.contains(&binding.provider.as_str()) {
+        true => Ok(()),
+        false => Err((FailureCode::UnsupportedProvider, None)),
+    }
+}
+
 enum Outcome {
     Ok,
     Failed(FailureCode, Option<String>),
@@ -209,6 +222,20 @@ mod tests {
             vec!["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped"]
         );
         assert!(!healthy);
+    }
+
+    #[test]
+    fn offline_checks_read_the_credential_and_provider_without_a_probe() {
+        let (dir, config) = setup(true);
+        let binding = &config.trackers["work/claims"];
+        assert_eq!(check_offline(dir.path(), binding), Ok(()));
+        let mut unknown = binding.clone();
+        unknown.provider = "jira".into();
+        assert_eq!(check_offline(dir.path(), &unknown), Err((FailureCode::UnsupportedProvider, None)));
+        let (empty, config) = setup(false);
+        let (code, detail) = check_offline(empty.path(), &config.trackers["work/claims"]).unwrap_err();
+        assert_eq!(code, FailureCode::Credential);
+        assert!(detail.unwrap().contains("not configured"));
     }
 
     #[test]
