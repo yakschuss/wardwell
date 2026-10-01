@@ -49,6 +49,8 @@ pub enum State {
     Stale(Reason),
     /// A pull whose process is alive started at this time.
     Running(DateTime<Utc>),
+    /// The mirror log could not be read, with the closed code.
+    Unreadable(FailureCode),
 }
 
 /// One binding's freshness at a moment.
@@ -72,12 +74,22 @@ impl Freshness {
             State::Fresh => format!("{pulled}."),
             State::Stale(reason) => format!("{pulled}. Stale. Reason: {}.", reason.sentence()),
             State::Running(since) => format!("{pulled}; pull running since {}.", stamp(since)),
+            State::Unreadable(code) => format!("Could not read the mirror log: {}.", code.as_str()),
         }
     }
 
     /// True when the mirror is fresh and no pull is unfinished.
     pub fn is_clean(&self) -> bool {
         self.state == State::Fresh && self.unfinished.is_none()
+    }
+}
+
+/// The freshness of a log read: `assess` on a view, or the unreadable
+/// state when the read failed. An unreadable log is never "No pull was tried".
+pub fn assess_read(read: &Result<MirrorView, String>, now: DateTime<Utc>, alive: &dyn Fn(u32) -> bool) -> Freshness {
+    match read {
+        Ok(view) => assess(view, now, alive),
+        Err(_) => Freshness { age: None, state: State::Unreadable(FailureCode::LogRead), unfinished: None },
     }
 }
 
@@ -222,6 +234,13 @@ mod tests {
         let started_ahead = Some(Attempt::Started { at: now() + TimeDelta::minutes(10), pid: 4242 });
         let fresh = assess(&view(Some(5), started_ahead), now(), ALIVE);
         assert_eq!(fresh.state, State::Stale(Reason::Unfinished(now() + TimeDelta::minutes(10))), "a start 10 minutes ahead is not running");
+    }
+
+    #[test]
+    fn an_unreadable_log_says_so() {
+        let unreadable = assess_read(&Err("could not read".to_string()), now(), GONE);
+        assert_eq!(unreadable.sentence(), "Could not read the mirror log: log_read.");
+        assert!(!unreadable.is_clean());
     }
 
     #[test]

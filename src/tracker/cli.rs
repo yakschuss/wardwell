@@ -249,6 +249,7 @@ fn freshness_tail(fresh: &freshness::Freshness) -> String {
     match (fresh.state, fresh.unfinished) {
         (freshness::State::Stale(reason), _) => format!(". Stale. Reason: {}.", reason.sentence()),
         (freshness::State::Running(since), _) => format!(", pull running since {}", stamp(since)),
+        (freshness::State::Unreadable(code), _) => format!(". Could not read the mirror log: {}.", code.as_str()),
         (freshness::State::Fresh, Some(at)) => format!(", a pull started at {} and did not finish", stamp(at)),
         (freshness::State::Fresh, None) => String::new(),
     }

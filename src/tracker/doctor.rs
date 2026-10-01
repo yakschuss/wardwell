@@ -70,8 +70,8 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, g
 /// fact, not a check: it never fails the run.
 pub fn mirror_line(vault_root: &Path, binding: &TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
     let path = crate::tracker::log::path_for(vault_root, &binding.domain, &binding.project);
-    let view = crate::tracker::view::MirrorView::read_for(&path, &binding.provider).unwrap_or_default();
-    let fresh = crate::tracker::freshness::assess(&view, now, &crate::tracker::freshness::process_alive);
+    let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
+    let fresh = crate::tracker::freshness::assess_read(&read, now, &crate::tracker::freshness::process_alive);
     format!("{}: {} mirror: {}", binding.key(), binding.provider, fresh.sentence())
 }
 
@@ -269,6 +269,25 @@ mod tests {
             "work/claims: linear mirror: Never pulled. Stale. Reason: No pull was tried.",
         ]);
         assert!(healthy, "a stale mirror is a fact, not a failed check");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_mirror_log_is_its_own_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, config) = setup(true);
+        let binding = &config.trackers[0];
+        let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"_schema\":\"tracker\"}\n\xff\n").unwrap();
+        let line = mirror_line(&config.vault_path, binding, chrono::Utc::now());
+        assert_eq!(line, "work/claims: linear mirror: Could not read the mirror log: log_read.");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let line = mirror_line(&config.vault_path, binding, chrono::Utc::now());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(line, "work/claims: linear mirror: Could not read the mirror log: log_read.");
+        assert!(!line.contains("No pull was tried"));
     }
 
     #[test]

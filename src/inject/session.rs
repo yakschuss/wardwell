@@ -64,7 +64,7 @@ pub fn tracker_section(view: &MirrorView, fresh: &Freshness, now: DateTime<Utc>,
         return vec!["Tracker mirror. Never pulled. Not authoritative.".to_string()];
     };
     let mut lines = match fresh.state {
-        State::Stale(_) => vec![format!("Tracker mirror. {}", fresh.sentence())],
+        State::Stale(_) | State::Unreadable(_) => vec![format!("Tracker mirror. {}", fresh.sentence())],
         State::Fresh | State::Running(_) => vec![format!("Tracker mirror. Last pulled {age} ago. Not authoritative.")],
     };
     let failed = view.failed_since_last_pull();

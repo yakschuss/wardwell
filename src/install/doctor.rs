@@ -373,8 +373,8 @@ fn mirror_rows(config: &crate::config::loader::WardwellConfig, now: chrono::Date
 /// The freshness words for one binding, read from its log.
 fn freshness_words(config: &crate::config::loader::WardwellConfig, binding: &crate::config::loader::TrackerBinding, now: chrono::DateTime<chrono::Utc>) -> String {
     let path = crate::tracker::log::path_for(&config.vault_path, &binding.domain, &binding.project);
-    let view = crate::tracker::view::MirrorView::read_for(&path, &binding.provider).unwrap_or_default();
-    crate::tracker::freshness::assess(&view, now, &crate::tracker::freshness::process_alive).sentence()
+    let read = crate::tracker::view::MirrorView::read_for(&path, &binding.provider);
+    crate::tracker::freshness::assess_read(&read, now, &crate::tracker::freshness::process_alive).sentence()
 }
 
 /// One row per mapped project: whether each path exists, the age of the
@@ -721,6 +721,23 @@ mod tests {
         let started = format!(r#"{{"kind":"pull_started","id":"s","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{}","title":"s","pid":{}}}"#, at(1), std::process::id());
         std::fs::write(&path, format!("{}\n{completed}\n{started}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
         assert!(mirror_rows(&config, now)[0].ends_with(&format!("Last pulled 5h ago; pull running since {}.", at(1))), "{:?}", mirror_rows(&config, now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_mirror_log_is_named_and_never_called_untried() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = tracker_config(dir.path(), "linear");
+        let path = crate::tracker::log::path_for(&config.vault_path, "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let expected = vec![format!("  {:<38} Could not read the mirror log: log_read.", "Mirror work/claims linear")];
+        std::fs::write(&path, b"\xff").unwrap();
+        assert_eq!(mirror_rows(&config, chrono::Utc::now()), expected);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let rows = mirror_rows(&config, chrono::Utc::now());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(rows, expected);
     }
 
     #[test]
