@@ -739,14 +739,26 @@ run `wardwell tracker connect github`".
 
 No background service pulls the mirror. Two things start a pull instead.
 
-- Session start. The session-start hook reads the last pull markers of the
-  project it resolves. When the last completed pull of any binding is more
-  than one hour old, no pull of the project is running, and no pull marker is
-  younger than 60 seconds, it starts `wardwell tracker pull --project
-  <domain>/<project>` in the background and returns at once. That session
-  prints one line: "Refresh started in the background." The hook never waits
-  on the pull and never opens the network. The pull runs in its own session,
-  with its output appended to `~/.wardwell/tracker-pull.log`.
+- Session start. The session-start hook prints the project context and the
+  tracker section first. Then it reads the project's local refresh state
+  file, `~/.wardwell/refresh/<domain>__<project>.json`. It never reads the
+  vault. A provider is due when its last completed pull is more than one
+  hour old, or when the file is missing or unreadable. A provider whose last
+  pull failed less than one hour ago is held. Nothing starts while a pull of
+  the project runs, or while any start, completion or failure is younger
+  than 60 seconds. A time stamped in the future counts as old.
+- When a provider is due, the hook takes the project's claim file,
+  `<domain>__<project>.claim` beside the state file, which only one process
+  can create. A claim younger than 20 minutes stops any other start; an
+  older one is replaced. The hook then starts `wardwell tracker pull
+  --project <domain>/<project> --provider <provider>` for the due providers
+  in the background and returns at once. A failed provider is not pulled
+  again with its healthy sibling. That session prints one line: "Refresh
+  started in the background." The hook never waits on the pull and never
+  opens the network. The pull runs in its own session, with its output
+  appended to `~/.wardwell/tracker-pull.log`. It releases the claim when it
+  ends. After it takes the project lock, it reads nothing from the provider
+  when another pull completed while it waited.
 - The running server. While `wardwell serve` runs, it asks every bound
   project the same question once an hour, the first time one hour after it
   starts. It uses the same function as the hook. A failure goes to its log
