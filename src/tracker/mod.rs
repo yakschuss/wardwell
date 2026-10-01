@@ -16,6 +16,9 @@ pub mod log;
 pub mod pull;
 pub mod schedule;
 
+/// Provider ids Wardwell has an adapter for.
+pub const SUPPORTED_PROVIDERS: &[&str] = &["linear"];
+
 /// Display name for a provider id, for messages a person reads.
 pub fn provider_label(provider: &str) -> String {
     match provider {

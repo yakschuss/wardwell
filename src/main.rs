@@ -212,7 +212,7 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
         }
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;
-            cli::status(&config, chrono::Utc::now(), schedule_status(&home()?))
+            cli::status(&config, &config_dir, chrono::Utc::now(), schedule_status(&home()?))
         }
         TrackerCommand::Doctor => {
             let config = wardwell::config::loader::load(None)?;

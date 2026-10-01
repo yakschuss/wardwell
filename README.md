@@ -399,10 +399,14 @@ tracker goes away, the log stays as a searchable archive.
 
 One binding that fails does not stop the others. A failure after the log is
 open appends a `pull_failed` marker with a closed `code` and no provider text.
-The codes are `provider`, `log_read` and `log_write`. Three failures write
+The codes are `auth` when the provider refuses the token, `provider` for any
+other provider failure, `log_read` and `log_write`. Three failures write
 nothing to the log: a missing credential is `credential`, an unknown provider
 is `unsupported_provider`, and a held lock is `lock_busy`. `status` lists every
-binding with its last error. `pull` exits non-zero when any binding failed.
+binding with its last error. It also checks, without a network call, that the
+provider is known and the credential reads, and prints `cannot pull` with the
+code when either fails; it says `no errors` only when both pass and no pull
+failed. `pull` exits non-zero when any binding failed.
 
 `doctor` prints three lines per binding: whether the credential file exists
 with owner-only permissions, whether the provider accepts the token on one

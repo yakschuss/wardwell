@@ -4,7 +4,7 @@
 //!
 //! Does NOT write to Linear, decide the cursor, or touch the vault.
 
-use crate::tracker::adapter::{Adapter, Sink};
+use crate::tracker::adapter::{AUTH_REFUSED, Adapter, Sink};
 use crate::tracker::events::{Common, Event, FailureCode, IssueSnapshot, Priority, Relation, RelationKind, StateCategory};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -77,9 +77,9 @@ pub fn check_team(transport: &dyn Transport, team: &str) -> Result<(), FailureCo
 }
 
 fn transport_code(error: String) -> FailureCode {
-    match error.as_str() {
-        "Linear returned HTTP 401" | "Linear returned HTTP 403" => FailureCode::Auth,
-        _ => FailureCode::Provider,
+    match error.contains(AUTH_REFUSED) {
+        true => FailureCode::Auth,
+        false => FailureCode::Provider,
     }
 }
 
@@ -152,6 +152,9 @@ struct Page<'a> {
 
 fn issues_page(response: &Value) -> Result<Page<'_>, String> {
     if let Some(errors) = response.get("errors").and_then(Value::as_array) {
+        if errors.iter().any(is_auth_error) {
+            return Err(format!("Linear returned an error: {AUTH_REFUSED}"));
+        }
         let message = errors
             .first()
             .and_then(|e| e.get("message"))
@@ -425,14 +428,26 @@ async fn send(token: &str, body: Vec<u8>) -> Result<Value, String> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    let decoded: Option<Value> = serde_json::from_slice(&bytes).ok();
-    match (status.is_success(), decoded) {
-        (true, Some(value)) => Ok(value),
-        (true, None) => Err("Linear returned invalid JSON".to_string()),
+    reply(status.as_u16(), serde_json::from_slice(&bytes).ok())
+}
+
+/// The decoded reply for an HTTP status. 401 and 403 are a refused token
+/// whatever the body says; other GraphQL errors pass through to the caller.
+fn reply(status: u16, decoded: Option<Value>) -> Result<Value, String> {
+    match (status, decoded) {
+        (401 | 403, _) => Err(format!("Linear returned HTTP {status}: {AUTH_REFUSED}")),
+        (200..=299, Some(value)) => Ok(value),
+        (200..=299, None) => Err("Linear returned invalid JSON".to_string()),
         // GraphQL errors arrive with 400; surface their message, not the body.
-        (false, Some(value)) if value.get("errors").is_some() => Ok(value),
-        (false, _) => Err(format!("Linear returned HTTP {}", status.as_u16())),
+        (_, Some(value)) if value.get("errors").is_some() => Ok(value),
+        (_, _) => Err(format!("Linear returned HTTP {status}")),
     }
+}
+
+/// True when a GraphQL error says the request was not authenticated.
+fn is_auth_error(error: &Value) -> bool {
+    let extensions = &error["extensions"];
+    extensions["code"].as_str() == Some("AUTHENTICATION_ERROR") || extensions["type"].as_str() == Some("authentication error")
 }
 
 #[cfg(test)]
@@ -845,6 +860,32 @@ mod tests {
         let transport = FakeTransport::new(vec![json!({"errors": [{"message": "Team not found"}]})]);
         let error = collect(&Linear::new(&transport, "NOPE"), None, false).unwrap_err();
         assert!(error.contains("Team not found"), "{error}");
+    }
+
+    #[test]
+    fn an_authentication_error_fails_the_pull_as_a_refused_token() {
+        let transport = FakeTransport::new(vec![json!({"errors": [{
+            "message": "Authentication required, not authenticated",
+            "extensions": {"type": "authentication error", "code": "AUTHENTICATION_ERROR"}
+        }]})]);
+        let error = collect(&Linear::new(&transport, "COR"), None, false).unwrap_err();
+        assert!(error.contains(crate::tracker::adapter::AUTH_REFUSED), "{error}");
+        let other = FakeTransport::new(vec![json!({"errors": [{"message": "Team not found"}]})]);
+        let error = collect(&Linear::new(&other, "COR"), None, false).unwrap_err();
+        assert!(!error.contains(crate::tracker::adapter::AUTH_REFUSED), "{error}");
+    }
+
+    #[test]
+    fn http_401_and_403_are_a_refused_token_whatever_the_body() {
+        let errors = Some(json!({"errors": [{"message": "Authentication required"}]}));
+        for status in [401, 403] {
+            let error = reply(status, errors.clone()).unwrap_err();
+            assert!(error.contains(crate::tracker::adapter::AUTH_REFUSED), "{error}");
+            assert!(reply(status, None).unwrap_err().contains(crate::tracker::adapter::AUTH_REFUSED));
+        }
+        assert_eq!(reply(400, errors.clone()).unwrap(), errors.unwrap(), "other GraphQL errors pass through");
+        assert_eq!(reply(500, None).unwrap_err(), "Linear returned HTTP 500");
+        assert_eq!(reply(200, None).unwrap_err(), "Linear returned invalid JSON");
     }
 
     #[test]

@@ -191,9 +191,10 @@ fn pull_locked(
         Ok(())
     });
     pulled.map_err(|message| {
-        let code = match write_failed {
-            true => FailureCode::LogWrite,
-            false => FailureCode::Provider,
+        let code = match (write_failed, message.contains(crate::tracker::adapter::AUTH_REFUSED)) {
+            (true, _) => FailureCode::LogWrite,
+            (false, true) => FailureCode::Auth,
+            (false, false) => FailureCode::Provider,
         };
         PullError::new(code, message)
     })?;
@@ -428,6 +429,17 @@ mod tests {
         assert_eq!(summary.last_failure, Some((at(13), FailureCode::Provider)));
         assert_eq!(summary.last_pull_at, Some(at(12)), "a failure is not a pull");
         assert_eq!(summary.cursor, Some(at(9)));
+    }
+
+    #[test]
+    fn a_refused_token_is_recorded_as_auth() {
+        let vault = tempfile::tempdir().unwrap();
+        let message = format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED);
+        let revoked = FakeAdapter { pages: vec![], fail_after: Some(message.leak()), calls: RefCell::new(vec![]) };
+        let error = pull_project(vault.path(), &binding(), &revoked, false, at(13)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Auth, "{error}");
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_failure, Some((at(13), FailureCode::Auth)));
     }
 
     #[test]

@@ -6,6 +6,10 @@
 use crate::tracker::events::Event;
 use chrono::{DateTime, Utc};
 
+/// Text an adapter puts in its error when the provider refused the token,
+/// so the pull records `auth` rather than `provider`.
+pub const AUTH_REFUSED: &str = "the provider refused the token";
+
 /// Receives one page of events as the adapter reads it. An error stops the pull.
 pub type Sink<'a> = dyn FnMut(Vec<Event>) -> Result<(), String> + 'a;
 

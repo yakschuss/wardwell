@@ -165,7 +165,7 @@ mod tests {
     fn refused_token_fails_auth_without_echoing_anything() {
         let (dir, config) = setup(true);
         for viewer in [
-            Err("Linear returned HTTP 401".to_string()),
+            Err(format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED)),
             Ok(json!({"errors": [{"message": "Authentication required for lin_api_secret"}]})),
         ] {
             let (lines, healthy) = doctor_with(dir.path(), &config, viewer, json!([{"key": "COR"}]));

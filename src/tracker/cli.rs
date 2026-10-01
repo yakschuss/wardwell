@@ -5,6 +5,7 @@
 use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::pull::{Connect, pull_binding};
 use crate::tracker::schedule::{self, LaunchctlRunner};
+use crate::tracker::events::FailureCode;
 use crate::tracker::{compact, credential, lock, log};
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::path::Path;
@@ -103,15 +104,16 @@ fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(&
 }
 
 /// One line per bound project: provider, last pull and its age, last full
-/// resync, event count, readonly flag; then one line on the pull schedule
+/// resync, event count, readonly flag, and the closed code when the binding
+/// cannot pull or its last pull failed; then one line on the pull schedule
 /// (`scheduled` is the interval from the installed plist, if any).
-pub fn status(config: &WardwellConfig, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
+pub fn status(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
     let mut lines = match config.trackers.is_empty() {
         true => vec!["No trackers bound. Add a trackers section to config.yml.".to_string()],
         false => config
             .trackers
             .iter()
-            .map(|(key, binding)| status_line(&config.vault_path, key, binding, now))
+            .map(|(key, binding)| status_line(&config.vault_path, config_dir, key, binding, now))
             .collect(),
     };
     lines.push(schedule_line(scheduled));
@@ -142,7 +144,19 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
     schedule::unschedule(home, runner, uid)
 }
 
-fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>) -> String {
+/// Read-only check that a pull could start: a known provider and a
+/// readable credential. Never opens the network.
+fn cannot_pull(config_dir: &Path, binding: &TrackerBinding) -> Option<FailureCode> {
+    if !crate::tracker::SUPPORTED_PROVIDERS.contains(&binding.provider.as_str()) {
+        return Some(FailureCode::UnsupportedProvider);
+    }
+    credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .err()
+        .map(|_| FailureCode::Credential)
+}
+
+fn status_line(vault_root: &Path, config_dir: &Path, key: &str, binding: &TrackerBinding, now: DateTime<Utc>) -> String {
     let mode = if binding.readonly { "readonly" } else { "writable" };
     let head = format!("{key}: {} {} ({mode})", binding.provider, binding.team);
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
@@ -150,9 +164,11 @@ fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: Date
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
-    let failure = match summary.last_failure {
-        Some((at, code)) => format!(", last error {} at {}", code.as_str(), stamp(at)),
-        None => ", no errors".to_string(),
+    let blocked = cannot_pull(config_dir, binding).map(|code| format!(", cannot pull ({})", code.as_str()));
+    let last = summary.last_failure.map(|(at, code)| format!(", last error {} at {}", code.as_str(), stamp(at)));
+    let failure = match (blocked, last) {
+        (None, None) => ", no errors".to_string(),
+        (blocked, last) => format!("{}{}", blocked.unwrap_or_default(), last.unwrap_or_default()),
     };
     let Some(pulled) = summary.last_pull_at else {
         return format!("{head}, never pulled{failure}");
@@ -268,7 +284,7 @@ mod tests {
         pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(5);
         pull(&config, dir.path(), None, false, later, &fake_connect).unwrap();
-        let line = &status(&config, later, None)[0];
+        let line = &status(&config, dir.path(), later, None)[0];
         assert!(line.contains("last pull 2026-09-01T12:05:00Z (0m ago)"), "{line}");
         assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "the first pull runs full: {line}");
     }
@@ -276,13 +292,13 @@ mod tests {
     #[test]
     fn status_shows_pull_age_resync_count_and_readonly() {
         let (dir, config) = setup(true);
-        let before = status(&config, now(), None);
+        let before = status(&config, dir.path(), now(), None);
         assert!(before[0].contains("never pulled"), "{}", before[0]);
 
         connect(dir.path(), "corr-linear", "lin_api_secret").unwrap();
         pull(&config, dir.path(), None, true, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(90);
-        let lines = status(&config, later, None);
+        let lines = status(&config, dir.path(), later, None);
         let line = &lines[0];
         assert!(line.contains("work/claims"), "{line}");
         assert!(line.contains("readonly"), "{line}");
@@ -363,7 +379,7 @@ mod tests {
         pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(10);
         pull(&config, dir.path(), None, false, later, &claims_breaks).unwrap_err();
-        let lines = status(&config, later, None);
+        let lines = status(&config, dir.path(), later, None);
         assert_eq!(lines.len(), 3, "{lines:?}");
         let claims = lines.iter().find(|l| l.starts_with("work/claims")).unwrap();
         assert!(claims.contains("last pull 2026-09-01T12:00:00Z"), "{claims}");
@@ -371,6 +387,38 @@ mod tests {
         assert!(!claims.contains("HTTP 500"), "{claims}");
         let ops = lines.iter().find(|l| l.starts_with("work/ops")).unwrap();
         assert!(ops.ends_with("no errors"), "{ops}");
+    }
+
+    #[test]
+    fn status_names_the_code_when_a_binding_cannot_pull() {
+        let (dir, mut config) = two_bindings();
+        std::fs::remove_file(crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap()).unwrap();
+        let lines = status(&config, dir.path(), now(), None);
+        assert!(lines[0].ends_with("never pulled, cannot pull (credential)"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("no errors")), "{lines:?}");
+
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        config.trackers.get_mut("work/ops").unwrap().provider = "jira".into();
+        let lines = status(&config, dir.path(), now(), None);
+        assert!(lines[0].ends_with("never pulled, no errors"), "{lines:?}");
+        assert!(lines[1].ends_with("never pulled, cannot pull (unsupported_provider)"), "{lines:?}");
+    }
+
+    #[test]
+    fn status_shows_a_refused_token_as_auth() {
+        struct Revoked;
+        impl Adapter for Revoked {
+            fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+                Err(format!("Linear returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED))
+            }
+        }
+        let revoked = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Revoked)) };
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let error = pull(&config, dir.path(), None, false, now(), &revoked).unwrap_err();
+        assert!(error.ends_with("(auth)"), "{error}");
+        let line = &status(&config, dir.path(), now(), None)[0];
+        assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z"), "{line}");
     }
 
     #[test]
@@ -386,8 +434,8 @@ mod tests {
 
     #[test]
     fn status_ends_with_the_schedule_line() {
-        let (_dir, config) = setup(false);
-        assert_eq!(status(&config, now(), None).last().unwrap(), "pull schedule: not scheduled");
-        assert_eq!(status(&config, now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
+        let (dir, config) = setup(false);
+        assert_eq!(status(&config, dir.path(), now(), None).last().unwrap(), "pull schedule: not scheduled");
+        assert_eq!(status(&config, dir.path(), now(), Some(900)).last().unwrap(), "pull schedule: every 900 s (plist on disk)");
     }
 }
