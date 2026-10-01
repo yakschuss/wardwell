@@ -595,22 +595,37 @@ fn inject_claude_md_pointer() {
 /// The installer's plan for this computer, with the bindings in config.yml.
 fn hooks_plan(binary_path: &Path) -> Result<installer::Plan, String> {
     let home = dirs::home_dir().ok_or("Could not find the home directory")?;
-    let config_dir = config_dir();
-    let trackers = crate::install::setup::tracker_bindings(&config_dir)?;
+    hooks_plan_at(&home, &config_dir(), binary_path, cfg!(target_os = "macos"))
+}
+
+fn hooks_plan_at(home: &Path, config_dir: &Path, binary_path: &Path, launchd: bool) -> Result<installer::Plan, String> {
+    let trackers = crate::install::setup::tracker_bindings(config_dir)?;
     installer::plan(&installer::Inputs {
-        home: &home,
-        config_dir: &config_dir,
+        home,
+        config_dir,
         binary: binary_path,
         trackers: &trackers,
         claude_code: true,
-        launchd: cfg!(target_os = "macos"),
+        launchd,
     })
 }
 
 /// Apply the installer's plan; the lines to print, activation notes last.
 fn install_hooks(binary_path: &Path) -> Result<Vec<String>, String> {
-    let plan = hooks_plan(binary_path)?;
-    let mut lines = installer::apply(&plan, &SystemRunner, &current_uid).map_err(|failed| {
+    let home = dirs::home_dir().ok_or("Could not find the home directory")?;
+    install_hooks_at(&home, &config_dir(), binary_path, cfg!(target_os = "macos"), &SystemRunner, &current_uid)
+}
+
+fn install_hooks_at(
+    home: &Path,
+    config_dir: &Path,
+    binary_path: &Path,
+    launchd: bool,
+    runner: &dyn crate::tracker::schedule::LaunchctlRunner,
+    uid: &dyn Fn() -> Result<u32, String>,
+) -> Result<Vec<String>, String> {
+    let plan = hooks_plan_at(home, config_dir, binary_path, launchd)?;
+    let mut lines = installer::apply(&plan, runner, uid).map_err(|failed| {
         let mut text = failed.lines.join("\n");
         if !text.is_empty() {
             text.push('\n');
@@ -661,6 +676,41 @@ mod tests {
     fn count_files_recursive_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(count_files_recursive(dir.path()), 0);
+    }
+
+    #[test]
+    fn init_installs_hooks_through_the_careful_installer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cfg = home.join(".wardwell");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), r#"{"model": "keep", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "peon ping"}]}]}}"#).unwrap();
+        std::fs::write(cfg.join("config.yml"), format!("vault_path: {}\nsession_sources: []\n", dir.path().display())).unwrap();
+        let fake = crate::tracker::schedule::fake::Fake::new(&[]);
+        let binary = Path::new("/nonexistent-init-test/wardwell");
+        let lines = install_hooks_at(&home, &cfg, binary, true, &fake, &|| Ok(501)).unwrap();
+        assert!(lines.iter().any(|l| l.contains("Hooks installed")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Sessions already running do not change")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("backup:")), "{lines:?}");
+        let text = std::fs::read_to_string(home.join(".claude/settings.json")).unwrap();
+        assert!(text.contains("peon ping") && text.contains("\"model\": \"keep\""), "{text}");
+        assert!(text.contains("'/nonexistent-init-test/wardwell' inject"), "{text}");
+        assert!(fake.calls.borrow().is_empty());
+        let again = hooks_plan_at(&home, &cfg, binary, true).unwrap();
+        assert!(again.is_noop());
+    }
+
+    #[test]
+    fn init_hooks_refuse_a_malformed_settings_file_and_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), "{").unwrap();
+        let fake = crate::tracker::schedule::fake::Fake::new(&[]);
+        let error = install_hooks_at(&home, &home.join(".wardwell"), Path::new("/w"), true, &fake, &|| Ok(501)).unwrap_err();
+        assert!(error.contains("no files changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(), "{");
     }
 
     #[test]

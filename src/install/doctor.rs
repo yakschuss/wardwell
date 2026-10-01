@@ -778,6 +778,18 @@ mod tests {
     }
 
     #[test]
+    fn the_pull_row_fails_when_the_plist_program_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        put(home, "Library/LaunchAgents/com.wardwell.tracker-pull.plist",
+            &crate::tracker::schedule::launch_agent_plist(Path::new("/gone/wardwell"), 3600, Path::new("/l")));
+        let (rows, ok) = policy_rows(&policy_config(home, false), home, Path::new("/w"), true);
+        assert!(!ok);
+        let row = rows.iter().find(|r| r.contains("Tracker pull service")).unwrap();
+        assert!(row.contains("\u{2717} plist runs /gone/wardwell, which does not exist; run `wardwell setup`"), "{row}");
+    }
+
+    #[test]
     fn the_gate_row_checks_the_matcher_as_well_as_the_command() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
