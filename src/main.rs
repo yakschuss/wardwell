@@ -377,7 +377,13 @@ async fn run_companion(command: CompanionCommand) -> Result<(), Box<dyn std::err
                     refresh_companion_resume(client.parse()?, &input).await
                 }
                 LifecycleCommand::Stop { client } => {
-                    wardwell::companion::lifecycle::stop(client.parse()?, &input)
+                    // The Companion check runs first and keeps its output;
+                    // the history Stop check runs only after it succeeds and
+                    // joins its block into the same response.
+                    let client = client.parse()?;
+                    wardwell::companion::lifecycle::stop(client, &input).map(|output| {
+                        wardwell::stop_check::merge(output, wardwell::stop_check::check(client, &input))
+                    })
                 }
             }
         }
@@ -721,9 +727,20 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
-    // No-op. Session logging is handled by CLAUDE.md behavioral rules.
-    // The hook entry is kept so wardwell can re-enable blocking if
-    // Claude Code adds a silent block mechanism.
+    // Stop hook for setups without the Companion lifecycle hooks: the
+    // history Stop check alone. It allows on any error, so a bad payload
+    // prints nothing and exits zero.
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    let Ok(input) = read_stdin_json::<serde_json::Value>(200_000) else {
+        return Ok(());
+    };
+    let client = wardwell::companion::lifecycle::Client::Claude;
+    if let Some(reason) = wardwell::stop_check::check(client, &input) {
+        println!("{}", serde_json::json!({"decision": "block", "reason": reason}));
+    }
     Ok(())
 }
 

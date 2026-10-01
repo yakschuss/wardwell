@@ -10,4 +10,5 @@ pub mod daemon;
 pub mod kanban;
 
 pub mod companion;
+pub mod stop_check;
 pub mod tracker;

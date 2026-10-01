@@ -35,7 +35,12 @@ impl GitDirs {
 
 /// `git rev-parse` for `dir`, or None outside a repository or on any error.
 pub fn dirs(dir: &Path) -> Option<GitDirs> {
-    let out = run(dir, &["rev-parse", "--show-toplevel", "--git-common-dir"])?;
+    dirs_by(dir, Instant::now() + DEADLINE)
+}
+
+/// `dirs`, killed at `deadline`.
+pub fn dirs_by(dir: &Path, deadline: Instant) -> Option<GitDirs> {
+    let out = run(dir, &["rev-parse", "--show-toplevel", "--git-common-dir"], deadline)?;
     let mut lines = out.lines();
     let toplevel = PathBuf::from(lines.next()?);
     let common = PathBuf::from(lines.next()?);
@@ -46,10 +51,13 @@ pub fn dirs(dir: &Path) -> Option<GitDirs> {
 /// Commits reachable from HEAD in `dir`'s repository authored at or after
 /// `since`, or None on any git error. A rebased commit keeps its old author
 /// time and is not counted.
-pub fn commits_since(dir: &Path, since: DateTime<Utc>) -> Option<usize> {
+/// The call is killed at `deadline`.
+pub fn commits_since(dir: &Path, since: DateTime<Utc>, deadline: Instant) -> Option<usize> {
     let after = format!("--since={}", since.timestamp());
-    let out = run(dir, &["log", "--format=%at", &after, "HEAD"])?;
-    let since = since.timestamp();
+    let out = run(dir, &["log", "--format=%at", &after, "HEAD"], deadline)?;
+    // Git times are whole seconds; a commit in the start's own second is
+    // not counted, so a commit made just before the start never is.
+    let since = since.timestamp() + i64::from(since.timestamp_subsec_nanos() > 0);
     Some(out.lines().filter_map(|l| l.trim().parse::<i64>().ok()).filter(|t| *t >= since).count())
 }
 
@@ -58,10 +66,13 @@ pub fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Stdout of `git -C dir <args>` when it exits zero within the deadline.
+/// Stdout of `git -C dir <args>` when it exits zero before `deadline`.
 /// The caller's git environment is cleared so a hook's GIT_DIR cannot
 /// point the call at another repository.
-fn run(dir: &Path, args: &[&str]) -> Option<String> {
+fn run(dir: &Path, args: &[&str], deadline: Instant) -> Option<String> {
+    if Instant::now() > deadline {
+        return None;
+    }
     let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -76,12 +87,11 @@ fn run(dir: &Path, args: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let started = Instant::now();
     loop {
         match child.try_wait().ok()? {
             Some(status) if status.success() => break,
             Some(_) => return None,
-            None if started.elapsed() > DEADLINE => {
+            None if Instant::now() > deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
@@ -160,6 +170,10 @@ mod tests {
     use super::testing::*;
     use super::*;
 
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(10)
+    }
+
     #[test]
     fn a_linked_worktree_names_the_main_checkout() {
         let tmp = tempfile::tempdir().unwrap();
@@ -177,7 +191,7 @@ mod tests {
     fn outside_a_repository_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(dirs(tmp.path()), None);
-        assert_eq!(commits_since(tmp.path(), Utc::now()), None);
+        assert_eq!(commits_since(tmp.path(), Utc::now(), far()), None);
     }
 
     #[test]
@@ -189,8 +203,12 @@ mod tests {
         commit_at(tmp.path(), "new1", Some("@1800000000 +0000"));
         commit_at(tmp.path(), "new2", Some("@1800000100 +0000"));
         let since = DateTime::from_timestamp(1_790_000_000, 0).unwrap();
-        assert_eq!(commits_since(tmp.path(), since), Some(2));
+        assert_eq!(commits_since(tmp.path(), since, far()), Some(2));
+        let mid_second = DateTime::from_timestamp(1_800_000_000, 500_000_000).unwrap();
+        assert_eq!(commits_since(tmp.path(), mid_second, far()), Some(1), "the start's own second is excluded");
         let later = DateTime::from_timestamp(1_900_000_000, 0).unwrap();
-        assert_eq!(commits_since(tmp.path(), later), Some(0));
+        assert_eq!(commits_since(tmp.path(), later, far()), Some(0));
+        let passed = Instant::now() - Duration::from_millis(1);
+        assert_eq!(commits_since(tmp.path(), since, passed), None, "a passed deadline fails to None");
     }
 }

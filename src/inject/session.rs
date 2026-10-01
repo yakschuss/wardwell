@@ -78,10 +78,15 @@ pub fn tracker_section(view: &MirrorView, now: DateTime<Utc>, blocked: Option<Fa
     lines
 }
 
-/// Local date of the last entry in `history.jsonl`, read from the file's
-/// tail: the last line with a `date`. The window grows only when the tail
-/// holds no such line.
+/// Local date of the last entry in `history.jsonl`.
 pub fn last_history_date(project_dir: &Path) -> Option<NaiveDate> {
+    local_date(&last_history_stamp(project_dir)?)
+}
+
+/// The `date` of the last entry in `history.jsonl` as written, read from
+/// the file's tail: the last line with a `date`. The window grows only when
+/// the tail holds no such line.
+pub fn last_history_stamp(project_dir: &Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     const FIRST_WINDOW: u64 = 64 * 1024;
     const MAX_WINDOW: u64 = 4 * 1024 * 1024;
@@ -104,9 +109,9 @@ pub fn last_history_date(project_dir: &Path) -> Option<NaiveDate> {
     }
 }
 
-fn entry_date(line: &str) -> Option<NaiveDate> {
+fn entry_date(line: &str) -> Option<String> {
     let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
-    entry.get("date").and_then(|d| d.as_str()).and_then(local_date)
+    entry.get("date").and_then(|d| d.as_str()).filter(|d| local_date(d).is_some()).map(str::to_string)
 }
 
 /// Newest `## YYYY-MM-DD` heading date in `decisions.md`.
