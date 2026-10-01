@@ -2218,7 +2218,7 @@ impl WardwellServer {
         match kanban.search(query, p.project.as_deref(), domains) {
             Ok(items) => {
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::SEARCH_CAP, &|issue| crate::tracker::items::search_keeps(issue, query));
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::SEARCH_CAP, false, &|issue| crate::tracker::items::search_keeps(issue, query));
                 items.extend(mirrored);
                 let total = items.len();
                 let mut response = serde_json::json!({"items": items, "total": total});
@@ -2257,7 +2257,7 @@ impl WardwellServer {
                     include_done: p.include_done.unwrap_or(false),
                 };
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, &|issue| filter.keeps(issue));
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, true, &|issue| filter.keeps(issue));
                 items.extend(mirrored);
                 let total = items.len();
                 let mut response = serde_json::json!({"items": items, "total": total, "returned": total});
@@ -2416,7 +2416,7 @@ impl WardwellServer {
             Ok(items) => {
                 let now = chrono::Utc::now();
                 let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
-                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, &|issue| {
+                let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, true, &|issue| {
                     crate::tracker::items::query_keeps(issue, question, now).unwrap_or(false)
                 });
                 items.extend(mirrored);
@@ -3665,11 +3665,12 @@ impl WardwellServer {
     }
 
     /// Mirrored issues of the covered bindings that `keep` accepts, as
-    /// summaries in key order, at most `cap`, with how many were left out.
-    /// A log that cannot be read contributes nothing.
-    fn mirror_items(&self, p: &KanbanParams, cap: usize, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> (Vec<serde_json::Value>, usize) {
+    /// summaries, at most `cap`, with how many were left out. `newest_first`
+    /// orders by the snapshot's update time before the cap, ties by key;
+    /// otherwise by key alone. A log that cannot be read contributes nothing.
+    fn mirror_items(&self, p: &KanbanParams, cap: usize, newest_first: bool, keep: &dyn Fn(&crate::tracker::view::MirroredIssue) -> bool) -> (Vec<serde_json::Value>, usize) {
         let now = chrono::Utc::now();
-        let mut items: Vec<(String, serde_json::Value)> = self
+        let mut items: Vec<(String, chrono::DateTime<chrono::Utc>, serde_json::Value)> = self
             .read_bindings(p)
             .into_iter()
             .filter_map(|binding| self.mirror_view(binding).map(|view| (binding, view)))
@@ -3677,13 +3678,19 @@ impl WardwellServer {
                 view.issues
                     .values()
                     .filter(|issue| keep(issue))
-                    .map(|issue| (issue.key.clone(), crate::tracker::items::summary(binding, &view, issue, now)))
+                    .map(|issue| (issue.key.clone(), issue.updated_at, crate::tracker::items::summary(binding, &view, issue, now)))
                     .collect::<Vec<_>>()
             })
             .collect();
-        items.sort_by(|a, b| crate::tracker::items::key_order(&a.0, &b.0));
+        items.sort_by(|a, b| {
+            let by_key = crate::tracker::items::key_order(&a.0, &b.0);
+            match newest_first {
+                true => b.1.cmp(&a.1).then(by_key),
+                false => by_key,
+            }
+        });
         let truncated = items.len().saturating_sub(cap);
-        (items.into_iter().take(cap).map(|(_, item)| item).collect(), truncated)
+        (items.into_iter().take(cap).map(|(_, _, item)| item).collect(), truncated)
     }
 
     /// The mirrored issue under `key` in any covered binding, removed and

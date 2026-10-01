@@ -327,9 +327,26 @@ fn raw_kanban(server: &WardwellServer, args: Value) -> String {
     }
 }
 
+/// 200 open backlog issues where a higher key number is a newer update,
+/// as in a real tracker.
+fn newest_highest_200() -> Vec<Event> {
+    let now = chrono::Utc::now();
+    let mut events: Vec<Event> = (0..200i64)
+        .map(|n| {
+            let mut e = snapshot(&format!("COR-{n}"), "A typical backlog issue title here", "Backlog", StateCategory::Backlog, now - chrono::TimeDelta::days(9) + chrono::TimeDelta::minutes(n));
+            if let Event::IssueUpserted { issue, .. } = &mut e {
+                issue.description = Some("d".repeat(1500));
+            }
+            e
+        })
+        .collect();
+    events.push(pulled(now));
+    events
+}
+
 #[test]
-fn list_and_query_cap_mirrored_items_sort_by_key_number_and_drop_descriptions() {
-    let f = fixture(&backlog_of_200(), true);
+fn list_and_query_keep_the_fifty_most_recently_updated_and_drop_descriptions() {
+    let f = fixture(&newest_highest_200(), true);
     for args in [
         json!({"action": "list", "project": "claims"}),
         json!({"action": "list"}),
@@ -342,12 +359,20 @@ fn list_and_query_cap_mirrored_items_sort_by_key_number_and_drop_descriptions() 
         assert_eq!(mirrored.len(), 50, "{args}");
         assert_eq!(response["tracker_truncated"], 150, "{args}");
         let keys: Vec<&str> = mirrored.iter().map(|i| i["ticket_id"].as_str().unwrap()).collect();
-        assert_eq!(&keys[..4], ["COR-0", "COR-1", "COR-2", "COR-3"], "{args}");
-        assert_eq!(keys[10], "COR-10");
+        assert_eq!(&keys[..3], ["COR-199", "COR-198", "COR-197"], "{args}");
+        assert_eq!(keys[49], "COR-150", "{args}");
         assert!(mirrored.iter().all(|i| i.get("description").is_none()), "{args}");
     }
     let get = kanban(&f.server, json!({"action": "get", "ticket_id": "COR-7"}));
     assert_eq!(get["item"]["description"].as_str().unwrap().len(), 1500, "get keeps the description");
+}
+
+#[test]
+fn equal_update_times_fall_back_to_key_order() {
+    let f = fixture(&backlog_of_200(), true);
+    let response = kanban(&f.server, json!({"action": "list", "project": "claims"}));
+    let keys = keys(&response);
+    assert_eq!(&keys[1..4], ["COR-0", "COR-1", "COR-2"], "{:?}", &keys[..5]);
 }
 
 #[test]
