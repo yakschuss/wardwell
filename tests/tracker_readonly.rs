@@ -18,10 +18,15 @@ struct Mcp {
 
 impl Mcp {
     fn start(config: &std::path::Path) -> Self {
+        // PATH is an empty folder made here, so no host tool, gh included, is found.
+        let path = config.join("empty-path");
+        std::fs::create_dir_all(&path).unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_wardwell"))
             .arg("serve")
             .env("WARDWELL_CONFIG_DIR", config)
             .env("HF_HUB_OFFLINE", "1")
+            .env("PATH", &path)
+            .env("WARDWELL_GH_CANDIDATES", "")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

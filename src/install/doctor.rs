@@ -306,7 +306,7 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// check. The bool is false when any binding failed.
 fn tracker_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
     let native = crate::tracker::doctor::native_prefixes(config, &config_dir.join("kanban.db"));
-    tracker_rows_with(config, config_dir, &native, crate::tracker::github::gh_available())
+    tracker_rows_with(config, config_dir, &native, crate::tracker::github::gh_available_for(&config.trackers))
 }
 
 /// `tracker_rows` with each binding's native kanban prefix given by key and

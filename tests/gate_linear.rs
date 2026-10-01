@@ -5,8 +5,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn gate(stdin: &str) -> (bool, String) {
+    let empty = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_wardwell"))
         .args(["gate", "linear"])
+        .env("PATH", empty.path())
+        .env("WARDWELL_GH_CANDIDATES", "")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

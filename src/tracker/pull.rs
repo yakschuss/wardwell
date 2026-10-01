@@ -1109,8 +1109,10 @@ mod tests {
         let stub = stub_gh(&dir.path().join("homebrew"), &format!(
             "if [ \"$1\" = repo ]; then echo '{{\"nameWithOwner\":\"acme/app\"}}'; exit 0; fi\necho '[{node}]'"
         ));
-        let bare = std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
-        let found = locate_gh(Some(&bare), std::slice::from_ref(&stub));
+        // PATH is an empty folder made here, never a system folder.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let found = locate_gh(Some(empty.as_os_str()), std::slice::from_ref(&stub));
         assert_eq!(found.as_deref(), Some(stub.as_path()));
 
         let vault = tempfile::tempdir().unwrap();

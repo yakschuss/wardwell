@@ -124,7 +124,7 @@ fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(S
 /// failed, each read from that provider's own events; then one line on the
 /// pull schedule (`scheduled` is the interval from the installed plist, if any).
 pub fn status(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
-    status_with(config, config_dir, now, scheduled, crate::tracker::github::gh_available())
+    status_with(config, config_dir, now, scheduled, crate::tracker::github::gh_available_for(&config.trackers))
 }
 
 /// `status`, told whether a `gh` was found.

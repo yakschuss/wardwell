@@ -70,7 +70,7 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, g
 /// The error is a closed code and, for the credential, the path and fix.
 /// A github binding passes without a token when a `gh` is found.
 pub fn check_offline(config_dir: &Path, binding: &TrackerBinding) -> Result<(), (FailureCode, Option<String>)> {
-    check_offline_with(config_dir, binding, crate::tracker::github::gh_available())
+    check_offline_with(config_dir, binding, crate::tracker::github::gh_available_for(std::slice::from_ref(binding)))
 }
 
 /// `check_offline`, told whether a `gh` was found.

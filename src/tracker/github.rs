@@ -367,6 +367,12 @@ pub fn gh_available() -> bool {
     find_gh().is_some()
 }
 
+/// Whether any of `bindings` is a github binding and `find_gh` finds a
+/// `gh`. Looks for `gh` only when a github binding exists.
+pub fn gh_available_for(bindings: &[crate::config::loader::TrackerBinding]) -> bool {
+    bindings.iter().any(|b| b.provider == crate::tracker::GITHUB) && gh_available()
+}
+
 #[cfg(unix)]
 fn is_executable(file: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1107,8 +1113,11 @@ pub(crate) mod tests {
         let homebrew = dir.path().join("homebrew");
         let local = dir.path().join("local");
         let candidates = vec![homebrew.join("gh"), local.join("gh")];
-        let bare = std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
-        let path = std::env::join_paths([dir.path().join("none"), on_path.clone()]).unwrap();
+        // PATH holds only folders made here: an empty one for "not on PATH".
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let bare = empty.clone().into_os_string();
+        let path = std::env::join_paths([empty, on_path.clone()]).unwrap();
         assert_eq!(locate_gh(Some(&bare), &candidates), None);
         std::fs::create_dir_all(&local).unwrap();
         std::fs::write(local.join("gh"), "#!/bin/sh\nexit 1\n").unwrap();

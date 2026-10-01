@@ -16,6 +16,7 @@ fn connect_github_stores_the_token_privately_and_never_echoes_it() {
         .args(["tracker", "connect", "github", "--token-stdin"])
         .env_clear()
         .env("WARDWELL_GH_CANDIDATES", "")
+        .env("PATH", tmp.path().join("empty-path"))
         .env("HOME", &home)
         .env("WARDWELL_CONFIG_DIR", &cfg)
         .stdin(Stdio::piped())
