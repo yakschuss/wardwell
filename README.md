@@ -493,10 +493,11 @@ tracker pull` first. `list`, `query` and `search` never pull.
 
 At session start, `wardwell inject` prints what it printed before: the
 domain's `current_state.md` when it has one, else a summary of each project
-that has its own. Under each project summary it adds one rot line. It reads
-like this: Last history entry 12 days ago. Last decision 3 days ago. The
-history age comes from the last entry at the end of `history.jsonl`. A bound
-project also gets a tracker section. When the domain's own state file is
+that has its own. Every project without a tracker binding prints exactly
+that. Under a bound project it adds one rot line and a tracker section. The
+rot line reads like this: Last history entry 12 days ago. Last decision 3
+days ago. The history age comes from the last entry at the end of
+`history.jsonl`. When the domain's own state file is
 printed, only the bound projects follow it, each under its own header.
 Folders that are hidden or start with an underscore get no added lines. The
 section's first line is "Tracker mirror. Last pulled 2 hours ago. Not

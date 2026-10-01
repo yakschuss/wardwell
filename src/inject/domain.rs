@@ -1,7 +1,7 @@
 //! What `wardwell inject` prints for the vault domain a session starts in:
-//! the domain's own state, or each project's summary, as before; then a rot
-//! line under each project summary, and the tracker section for each bound
-//! project.
+//! the domain's own state, or each project's summary, as before; then, under
+//! each project with a tracker binding only, a rot line and its tracker
+//! section.
 //!
 //! Does NOT choose the domain (main.rs matches it to the cwd) or pull.
 
@@ -27,13 +27,14 @@ pub fn domain_context(config: &WardwellConfig, config_dir: &Path, domain_dir: &P
         if skipped(project) {
             continue;
         }
-        let tracker = project_tracker_lines(config, config_dir, domain, &p, now);
-        if printed {
-            push_line(&mut out, &format!("  {}", project_rot_line(&p, today)));
-        } else if tracker.is_some() {
+        let Some(tracker) = project_tracker_lines(config, config_dir, domain, &p, now) else {
+            continue;
+        };
+        if !printed {
             push_line(&mut out, &format!("**{domain}/{project}**"));
         }
-        tracker.into_iter().flatten().for_each(|line| push_line(&mut out, &format!("  {line}")));
+        push_line(&mut out, &format!("  {}", project_rot_line(&p, today)));
+        tracker.iter().for_each(|line| push_line(&mut out, &format!("  {line}")));
     }
     out
 }
@@ -211,40 +212,43 @@ mod tests {
     }
 
     #[test]
-    fn sixty_projects_print_the_old_output_plus_one_rot_line_each() {
+    fn an_unbound_vault_prints_exactly_the_old_output() {
         let dir = tempfile::tempdir().unwrap();
         let work = sixty_project_vault(dir.path());
         let config = config(dir.path(), &dir.path().join("vault"), &[]);
+        assert_eq!(domain_context(&config, dir.path(), &work, now(), today()), old_output(&work));
+    }
+
+    #[test]
+    fn sixty_projects_with_four_bound_add_only_four_rot_lines_and_four_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = sixty_project_vault(dir.path());
+        let bound = ["proj00", "proj01", "proj02", "proj03"];
+        bound.iter().for_each(|p| pulled_mirror(&work.join(p)));
+        let keys: Vec<String> = bound.iter().map(|p| format!("work/{p}")).collect();
+        let config = config(dir.path(), &dir.path().join("vault"), &keys.iter().map(String::as_str).collect::<Vec<_>>());
         let new = domain_context(&config, dir.path(), &work, now(), today());
-        let rot = "  Last history entry 12 days ago. Last decision 3 days ago.";
+        let rot = "  Last history entry 12 days ago. Last decision 3 days ago.\n";
         let mut expected = String::new();
-        for line in old_output(&work).lines() {
-            if !expected.is_empty() && line.starts_with("**") {
+        let mut current: Option<String> = None;
+        let close = |expected: &mut String, current: &Option<String>| {
+            if current.as_deref().is_some_and(|p| bound.contains(&p)) {
                 expected.push_str(rot);
-                expected.push('\n');
+                expected.push_str(SECTION);
+            }
+        };
+        for line in old_output(&work).lines() {
+            if let Some(header) = line.strip_prefix("**work/") {
+                close(&mut expected, &current);
+                current = header.split("**").next().map(str::to_string);
             }
             expected.push_str(line);
             expected.push('\n');
         }
-        expected.push_str(rot);
-        expected.push('\n');
+        close(&mut expected, &current);
         assert_eq!(new, expected);
-        assert_eq!(new.matches(rot).count(), 60);
-        assert!(!new.contains("archive") && !new.contains("attachments") && !new.contains(".obsidian"));
-    }
-
-    #[test]
-    fn a_bound_project_adds_its_tracker_section_under_its_rot_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let work = sixty_project_vault(dir.path());
-        pulled_mirror(&work.join("proj03"));
-        let config = config(dir.path(), &dir.path().join("vault"), &["work/proj03"]);
-        let new = domain_context(&config, dir.path(), &work, now(), today());
-        let block = "**work/proj03** (active): Ship the thing number 3.\n  Next: Open the PR.\n  Last history entry 12 days ago. Last decision 3 days ago.\n  Tracker mirror. Last pulled 1 hour ago. Not authoritative.\n";
-        assert!(new.contains(block), "{new}");
-        assert_eq!(new.matches("Tracker mirror.").count(), 1);
-        let without: String = new.lines().filter(|l| !l.starts_with("  Tracker mirror.") && !l.starts_with("  Last history")).map(|l| format!("{l}\n")).collect();
-        assert_eq!(without, old_output(&work));
+        assert_eq!(new.matches("Last history entry").count(), 4);
+        assert_eq!(new.matches("Tracker mirror.").count(), 4);
     }
 
     #[test]
@@ -288,7 +292,7 @@ mod tests {
         pulled_mirror(&work.join("beta"));
         let config = config(dir.path(), &dir.path().join("vault"), &["work/beta"]);
         let new = domain_context(&config, dir.path(), &work, now(), today());
-        assert!(new.contains(&format!("**work/beta**\n{SECTION}")), "{new}");
-        assert!(!new.contains("**work/beta**\n  No history"), "no rot line for a project the summaries did not print");
+        assert!(new.contains(&format!("**work/beta**\n  No history entries. No decisions.\n{SECTION}")), "{new}");
+        assert!(!new.contains("Last history") && new.matches("No history").count() == 1, "only the bound project has a rot line: {new}");
     }
 }
