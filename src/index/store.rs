@@ -550,7 +550,7 @@ impl IndexStore {
         domains: Option<&[String]>,
     ) -> Result<Vec<(String, f64)>, IndexError> {
         let conn = self.lock()?;
-        let quoted_query = format!("\"{}\"", query.replace('"', "\"\""));
+        let quoted_query = crate::index::fts::match_expression(query);
 
         let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(domains) = domains {
             if domains.is_empty() {
