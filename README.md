@@ -342,6 +342,10 @@ trackers:
     readonly: true        # refuse kanban writes on this project
 ```
 
+A binding's team key may not equal a native kanban prefix set under
+`kanban.prefixes`. `config.yml` is rejected at load when it does, and the
+error names the binding, the team key and the project.
+
 Store the token (a Linear personal API key) from standard input. It is written to
 `~/.wardwell/trackers/<name>.json` with owner-only permissions and is never
 printed or logged:
