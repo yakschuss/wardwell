@@ -30,6 +30,8 @@ pub enum Action {
     /// A Wardwell-generated file replaced whole; nothing of the user's is in it.
     Update,
     Remove,
+    /// A Wardwell-generated file deleted; nothing of the user's is in it.
+    Delete,
     Unchanged,
     Off,
     Manual,
@@ -42,6 +44,7 @@ impl Action {
             Action::UpdateBackup => "UPDATE + BACKUP",
             Action::Update => "UPDATE",
             Action::Remove => "REMOVE + BACKUP",
+            Action::Delete => "REMOVE",
             Action::Unchanged => "UNCHANGED",
             Action::Off => "OFF",
             Action::Manual => "MANUAL",
@@ -284,7 +287,12 @@ fn manifest_change(config_dir: &Path, recorded: Option<(Vec<u8>, Manifest)>, nex
 
 fn pull_step(inputs: &Inputs, lines: &mut Vec<Line>) -> Pull {
     if inputs.trackers.is_empty() {
-        return Pull::Keep;
+        let plist = schedule::plist_path(inputs.home);
+        if !inputs.launchd || !plist.exists() {
+            return Pull::Keep;
+        }
+        lines.push(Line { action: Action::Delete, label: "Tracker pull service: no tracker binding".into(), path: Some(plist) });
+        return Pull::Remove { home: inputs.home.to_path_buf() };
     }
     // The path the hooks get, never resolved, so an upgrade keeps it valid.
     let binary = inputs.binary.to_path_buf();
@@ -341,7 +349,7 @@ pub fn uninstall_plan(home: &Path, config_dir: &Path) -> Result<Plan, String> {
     let plist = schedule::plist_path(home);
     let pull = match plist.exists() {
         true => {
-            lines.push(Line { action: Action::Remove, label: "Tracker pull service".into(), path: Some(plist) });
+            lines.push(Line { action: Action::Delete, label: "Tracker pull service".into(), path: Some(plist) });
             Pull::Remove { home: home.to_path_buf() }
         }
         false => Pull::Keep,
@@ -609,6 +617,23 @@ mod tests {
         assert_eq!(plan.lines.len(), 1);
         assert_eq!(plan.lines[0].action, Action::Manual);
         assert!(plan.lines[0].label.contains("0 * * * * /nonexistent-wardwell-test/bin/wardwell tracker pull"));
+    }
+
+    #[test]
+    fn removing_every_binding_removes_the_pull_service() {
+        let h = home();
+        let plist = schedule::plist_path(&h.home);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, schedule::launch_agent_plist(Path::new(BIN), 3600, &schedule::log_path(&h.cfg))).unwrap();
+        let plan = plan_for(&h, &BTreeMap::new(), true);
+        assert_eq!(action_of(&plan, "Tracker pull service"), Action::Delete);
+        assert!(rendered(&plan).contains("REMOVE          Tracker pull service: no tracker binding"), "{}", rendered(&plan));
+        assert!(!plan.is_noop());
+        let fake = Fake::new(&[]);
+        apply(&plan, &fake, &|| Ok(501)).unwrap();
+        assert_eq!(fake.verbs(), vec!["bootout"]);
+        assert!(!plist.exists());
+        assert!(plan_for(&h, &BTreeMap::new(), true).is_noop());
     }
 
     #[test]

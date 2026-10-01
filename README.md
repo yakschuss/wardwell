@@ -50,7 +50,8 @@ and a rename.
   list for destructive Linear tools. See [Linear gate](#linear-gate).
 
 When any binding exists, `setup` also installs the hourly tracker pull, a
-launchd agent on macOS. On other hosts it prints a crontab line.
+launchd agent on macOS. On other hosts it prints a crontab line. When no
+binding is left, `setup` removes the agent.
 
 Installed is not active. Claude Code reads hooks and permissions when a
 session starts. Sessions already running do not change. Start a new session,
