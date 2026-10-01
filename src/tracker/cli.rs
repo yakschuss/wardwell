@@ -32,12 +32,7 @@ pub fn pull(
     let mut failures = Vec::new();
     for (key, binding) in bindings {
         match pull_binding(&config.vault_path, config_dir, binding, full, now, connect) {
-            Ok(outcome) => lines.push(format!(
-                "{key}: {} pull appended {} events, {} removed",
-                if outcome.full { "full" } else { "incremental" },
-                outcome.appended,
-                outcome.removed,
-            )),
+            Ok(outcome) => lines.push(pull_line(key, &outcome)),
             Err(error) => failures.push(format!("{key}: {error}")),
         }
     }
@@ -45,6 +40,15 @@ pub fn pull(
         true => Ok(lines),
         false => Err(lines.into_iter().chain(failures).collect::<Vec<_>>().join("\n")),
     }
+}
+
+fn pull_line(key: &str, outcome: &crate::tracker::pull::PullOutcome) -> String {
+    let mode = match (outcome.full, outcome.resync_due) {
+        (true, Some(due)) => format!("full pull ({}, so this pull ran full)", due.describe()),
+        (true, None) => "full pull".to_string(),
+        (false, _) => "incremental pull".to_string(),
+    };
+    format!("{key}: {mode} appended {} events, {} removed", outcome.appended, outcome.removed)
 }
 
 /// Compact every bound project's log, or only `only`. One line per
@@ -237,6 +241,22 @@ mod tests {
     }
 
     #[test]
+    fn pull_line_says_when_a_due_full_resync_made_the_pull_full() {
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let first = pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        assert_eq!(first, vec!["work/claims: full pull (no full resync on record, so this pull ran full) appended 0 events, 0 removed"]);
+        let soon = now() + chrono::TimeDelta::hours(1);
+        let second = pull(&config, dir.path(), None, false, soon, &fake_connect).unwrap();
+        assert_eq!(second, vec!["work/claims: incremental pull appended 0 events, 0 removed"]);
+        let day_later = soon + crate::tracker::pull::FULL_RESYNC_MAX_AGE;
+        let third = pull(&config, dir.path(), None, false, day_later, &fake_connect).unwrap();
+        assert_eq!(third, vec!["work/claims: full pull (last full resync over 24 hours ago, so this pull ran full) appended 0 events, 0 removed"]);
+        let asked = pull(&config, dir.path(), None, true, day_later, &fake_connect).unwrap();
+        assert_eq!(asked, vec!["work/claims: full pull appended 0 events, 0 removed"]);
+    }
+
+    #[test]
     fn status_reads_the_last_pull_from_a_pull_that_found_nothing() {
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
@@ -245,7 +265,7 @@ mod tests {
         pull(&config, dir.path(), None, false, later, &fake_connect).unwrap();
         let line = &status(&config, later, None)[0];
         assert!(line.contains("last pull 2026-09-01T12:05:00Z (0m ago)"), "{line}");
-        assert!(line.contains("last full resync never"), "{line}");
+        assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "the first pull runs full: {line}");
     }
 
     #[test]
@@ -319,7 +339,7 @@ mod tests {
         let error = pull(&config, dir.path(), None, false, now(), &claims_breaks).unwrap_err();
         let lines: Vec<&str> = error.lines().collect();
         assert_eq!(lines.len(), 2, "{error}");
-        assert!(lines[0].starts_with("work/ops: incremental pull appended"), "{error}");
+        assert!(lines[0].starts_with("work/ops: full pull (no full resync on record, so this pull ran full) appended"), "{error}");
         assert_eq!(lines[1], "work/claims: Linear returned HTTP 500 (provider)");
         let ops = log::read(&log::path_for(&config.vault_path, "work", "ops")).unwrap();
         assert_eq!(ops.last_pull_at, Some(now()));

@@ -20,12 +20,47 @@ use std::time::Duration;
 /// Covers clock skew and updates that land while a pull is paging.
 pub const CURSOR_OVERLAP: TimeDelta = TimeDelta::hours(1);
 
+/// A pull runs full when the newest full resync is older than this, or
+/// absent. Linear does not timestamp every change (a new relation, an
+/// archive of an old issue), so an incremental pull alone can miss them.
+pub const FULL_RESYNC_MAX_AGE: TimeDelta = TimeDelta::hours(24);
+
+/// Why a pull that was not asked to be full ran full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResyncDue {
+    /// The log has no full_resync marker.
+    NeverRan,
+    /// The newest full_resync marker is older than `FULL_RESYNC_MAX_AGE`.
+    Stale,
+}
+
+impl ResyncDue {
+    /// The reason as the pull output line prints it.
+    pub fn describe(self) -> String {
+        match self {
+            Self::NeverRan => "no full resync on record".to_string(),
+            Self::Stale => format!("last full resync over {} hours ago", FULL_RESYNC_MAX_AGE.num_hours()),
+        }
+    }
+
+    /// Whether a pull at `now` must run full, given the newest full resync.
+    pub fn check(last_full_resync: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<Self> {
+        match last_full_resync {
+            None => Some(Self::NeverRan),
+            Some(at) if now - at > FULL_RESYNC_MAX_AGE => Some(Self::Stale),
+            Some(_) => None,
+        }
+    }
+}
+
 /// Result of pulling one project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullOutcome {
     pub appended: usize,
     pub removed: usize,
     pub full: bool,
+    /// Set when the pull ran full because a full resync was due.
+    pub resync_due: Option<ResyncDue>,
 }
 
 /// Builds the adapter for a binding. Injected so tests never reach a network.
@@ -76,7 +111,19 @@ pub fn pull_binding(
         .and_then(|path| credential::load(&path))
         .map_err(|message| PullError::new(FailureCode::Credential, message))?;
     let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
-    pull_project(vault_root, binding, adapter.as_ref(), full, now)
+    let resync_due = match full {
+        true => None,
+        false => resync_due(vault_root, binding, now)?,
+    };
+    let outcome = pull_project(vault_root, binding, adapter.as_ref(), full || resync_due.is_some(), now)?;
+    Ok(PullOutcome { resync_due, ..outcome })
+}
+
+/// Whether the binding's log is due a full resync at `now`.
+fn resync_due(vault_root: &Path, binding: &TrackerBinding, now: DateTime<Utc>) -> Result<Option<ResyncDue>, PullError> {
+    let path = log::path_for(vault_root, &binding.domain, &binding.project);
+    let summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    Ok(ResyncDue::check(summary.last_full_resync_at, now))
 }
 
 /// Pull one project through `adapter` and append what is new.
@@ -158,7 +205,7 @@ fn pull_locked(
     let removed = markers.len().saturating_sub(1);
     log::append_new(path, &markers, summary).map_err(|message| PullError::new(FailureCode::LogWrite, message))?;
     appended += removed;
-    Ok(PullOutcome { appended, removed, full })
+    Ok(PullOutcome { appended, removed, full, resync_due: None })
 }
 
 /// Marker for a pull that stopped early. The title names only the code.
@@ -574,6 +621,75 @@ mod tests {
         assert_eq!(error.code, FailureCode::Credential);
         assert!(!*called.borrow(), "no adapter without a credential");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// A config dir holding the binding's credential.
+    fn credential_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
+        crate::tracker::credential::save(&path, "t").unwrap();
+        dir
+    }
+
+    /// Pull an empty fake through `pull_binding` at `now`.
+    fn scheduled_pull(vault: &Path, config: &Path, full: bool, now: DateTime<Utc>) -> PullOutcome {
+        let connect = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
+        pull_binding(vault, config, &binding(), full, now, &connect).unwrap()
+    }
+
+    #[test]
+    fn pull_without_a_full_resync_on_record_runs_full() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let outcome = scheduled_pull(vault.path(), config.path(), false, at(12));
+        assert!(outcome.full);
+        assert_eq!(outcome.resync_due, Some(ResyncDue::NeverRan));
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_full_resync_at, Some(at(12)));
+    }
+
+    #[test]
+    fn pull_runs_full_once_the_last_full_resync_is_older_than_the_limit() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        scheduled_pull(vault.path(), config.path(), true, at(0));
+        let fresh = at(0) + FULL_RESYNC_MAX_AGE - TimeDelta::minutes(1);
+        let outcome = scheduled_pull(vault.path(), config.path(), false, fresh);
+        assert!(!outcome.full, "within the limit the pull stays incremental");
+        assert_eq!(outcome.resync_due, None);
+
+        let stale = at(0) + FULL_RESYNC_MAX_AGE + TimeDelta::minutes(1);
+        let outcome = scheduled_pull(vault.path(), config.path(), false, stale);
+        assert!(outcome.full);
+        assert_eq!(outcome.resync_due, Some(ResyncDue::Stale));
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_full_resync_at, Some(stale));
+    }
+
+    #[test]
+    fn a_requested_full_pull_has_no_resync_reason() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let outcome = scheduled_pull(vault.path(), config.path(), true, at(12));
+        assert!(outcome.full);
+        assert_eq!(outcome.resync_due, None);
+    }
+
+    #[test]
+    fn a_stale_resync_reaches_the_adapter_as_a_full_pull() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let adapter = std::rc::Rc::new(fake(vec![]));
+        let shared = adapter.clone();
+        struct Shared(std::rc::Rc<FakeAdapter>);
+        impl Adapter for Shared {
+            fn pull(&self, since: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
+                self.0.pull(since, full, sink)
+            }
+        }
+        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Shared(shared.clone()))) };
+        pull_binding(vault.path(), config.path(), &binding(), false, at(1), &connect).unwrap();
+        assert_eq!(adapter.calls.borrow()[0], (None, true));
     }
 
     #[test]

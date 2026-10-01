@@ -388,7 +388,12 @@ read but does not move the cursor; the next pull re-requests from the same
 point whatever order the provider returned pages in. With no marker, a pull
 starts from the beginning. `--full` re-pulls every issue (archived included),
 appends `issue_removed` for issues the tracker no longer returns, and ends with
-a `full_resync` marker that also sets the cursor. `status` reads the last pull
+a `full_resync` marker that also sets the cursor. Linear does not timestamp
+every change; a new relation or the archive of an old issue can leave the
+update time alone, so an incremental pull would miss it. A pull therefore runs
+full, and says so in its output line, when the newest `full_resync` marker is
+more than 24 hours old or there is none. With the hourly schedule that is one
+full pull a day. `status` reads the last pull
 time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 
