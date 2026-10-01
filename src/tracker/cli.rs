@@ -90,10 +90,15 @@ pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Resu
     }
 }
 
-/// Credential, auth and team checks for every binding, one line each.
-/// Fails with every line when any check failed.
-pub fn doctor(config: &WardwellConfig, config_dir: &Path, probe: &crate::tracker::doctor::Probe<'_>) -> Result<Vec<String>, String> {
-    match crate::tracker::doctor::run(config, config_dir, probe) {
+/// Credential, auth and team or repository checks for every binding, one
+/// line each. Fails with every line when any check failed.
+pub fn doctor(
+    config: &WardwellConfig,
+    config_dir: &Path,
+    probe: &crate::tracker::doctor::Probe<'_>,
+    github: &crate::tracker::doctor::GithubProbe<'_>,
+) -> Result<Vec<String>, String> {
+    match crate::tracker::doctor::run(config, config_dir, probe, github) {
         (lines, true) => Ok(lines),
         (lines, false) => Err(lines.join("\n")),
     }
@@ -406,6 +411,45 @@ mod tests {
         assert_eq!(claims.last_failure.map(|(_, code)| code.as_str()), Some("provider"));
     }
 
+    /// `work/claims` bound to Linear and to GitHub, with the Linear token stored.
+    fn linear_and_github() -> (tempfile::TempDir, WardwellConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: linear\n      team: COR\n      credential: corr-linear\n    - provider: github\n      repository: acme/app\n",
+            vault.display()
+        );
+        let config_path = dir.path().join("config.yml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let config = crate::config::loader::load(Some(&config_path)).unwrap();
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        (dir, config)
+    }
+
+    #[test]
+    fn a_failing_provider_does_not_stop_the_other_and_fails_the_run() {
+        for broken in ["github", "linear"] {
+            let (dir, config) = linear_and_github();
+            let connect = move |binding: &TrackerBinding, _: Option<&crate::tracker::credential::Credential>| -> Result<Box<dyn Adapter>, String> {
+                match binding.provider == broken {
+                    true => Ok(Box::new(Broken)),
+                    false => Ok(Box::new(Empty)),
+                }
+            };
+            let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &connect).unwrap_err();
+            let lines: Vec<&str> = error.lines().collect();
+            assert_eq!(lines.len(), 2, "{error}");
+            assert!(lines[0].starts_with("work/claims: ") && lines[0].contains("appended 0 events"), "the healthy binding pulled: {error}");
+            assert!(lines[1].starts_with("work/claims: ") && lines[1].ends_with("(provider)"), "{error}");
+            let path = log::path_for(&config.vault_path, "work", "claims");
+            let healthy = if broken == "github" { "linear" } else { "github" };
+            assert_eq!(log::read_for(&path, healthy).unwrap().last_pull_at, Some(now()), "{broken} broken");
+            assert_eq!(log::read_for(&path, healthy).unwrap().last_failure, None);
+            assert_eq!(log::read_for(&path, broken).unwrap().last_failure.map(|(_, c)| c), Some(FailureCode::Provider));
+        }
+    }
+
     #[test]
     fn status_lists_every_binding_with_its_last_error() {
         let (dir, config) = two_bindings();
@@ -460,7 +504,7 @@ mod tests {
         let unreachable = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn crate::tracker::linear::Transport>, String> {
             Err("never called without a credential".into())
         };
-        let error = doctor(&config, dir.path(), &unreachable).unwrap_err();
+        let error = doctor(&config, dir.path(), &unreachable, &crate::tracker::doctor::connect_github).unwrap_err();
         assert_eq!(error.lines().count(), 4, "{error}");
         assert!(error.starts_with("work/claims: credential failed (credential)"), "{error}");
     }

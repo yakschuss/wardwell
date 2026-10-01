@@ -301,19 +301,22 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// One row per tracker binding from the offline doctor checks (credential
-/// file and provider; no network). Each row names `wardwell tracker doctor`
-/// for the live check. The bool is false when any binding failed.
+/// file and provider; for github, a token or `gh` on PATH; no network, and
+/// `gh` never runs). Each row names `wardwell tracker doctor` for the live
+/// check. The bool is false when any binding failed.
 fn tracker_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
     let native = crate::tracker::doctor::native_prefixes(config, &config_dir.join("kanban.db"));
-    tracker_rows_with(config, config_dir, &native)
+    tracker_rows_with(config, config_dir, &native, crate::tracker::github::gh_on_path())
 }
 
-/// `tracker_rows` with each binding's native kanban prefix given by key. A
-/// team key equal to it fails the row with the collision sentence.
+/// `tracker_rows` with each binding's native kanban prefix given by key and
+/// whether `gh` is on PATH. A team key equal to the prefix fails the row
+/// with the collision sentence.
 fn tracker_rows_with(
     config: &crate::config::loader::WardwellConfig,
     config_dir: &Path,
     native: &std::collections::BTreeMap<String, String>,
+    gh_on_path: bool,
 ) -> (Vec<String>, bool) {
     const LIVE: &str = "live check: `wardwell tracker doctor`";
     let mut ok = true;
@@ -322,11 +325,19 @@ fn tracker_rows_with(
         .iter()
         .map(|binding| {
             let key = binding.key();
-            let label = format!("Tracker {key}");
+            let label = format!("Tracker {key} {}", binding.provider);
             let collision = crate::tracker::doctor::prefix_failure(binding, native.get(&key))
+                .filter(|_| crate::tracker::mirrors_issues(&binding.provider))
                 .map(|sentence| (crate::tracker::events::FailureCode::PrefixCollision, Some(sentence)));
-            match crate::tracker::doctor::check_offline(config_dir, binding).and(collision.map_or(Ok(()), Err)) {
-                Ok(()) => format!("  {label:<38} \u{2713} credential ok; {LIVE}"),
+            let passed = match crate::tracker::mirrors_issues(&binding.provider) {
+                true => "credential ok",
+                false => match gh_on_path {
+                    true => "gh on PATH or a token stored",
+                    false => "token stored",
+                },
+            };
+            match crate::tracker::doctor::check_offline_with(config_dir, binding, gh_on_path).and(collision.map_or(Ok(()), Err)) {
+                Ok(()) => format!("  {label:<38} \u{2713} {passed}; {LIVE}"),
                 Err((code, detail)) => {
                     ok = false;
                     let detail = detail.map(|d| format!(": {d}")).unwrap_or_default();
@@ -615,7 +626,7 @@ mod tests {
         let (rows, ok) = tracker_rows(&config, dir.path());
         assert!(!ok);
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].starts_with("  Tracker work/claims                    \u{2717} failed (credential): tracker credential not configured"), "{}", rows[0]);
+        assert!(rows[0].starts_with("  Tracker work/claims linear             \u{2717} failed (credential): tracker credential not configured"), "{}", rows[0]);
         assert!(rows[0].ends_with("; live check: `wardwell tracker doctor`"), "{}", rows[0]);
         assert_eq!(rows[0].find('\u{2717}'), "  Config                                 \u{2713}".find('\u{2713}'), "marks line up with the other rows");
 
@@ -623,7 +634,7 @@ mod tests {
         crate::tracker::credential::save(&path, "lin_api_secret").unwrap();
         let (rows, ok) = tracker_rows(&config, dir.path());
         assert!(ok);
-        assert_eq!(rows, vec!["  Tracker work/claims                    \u{2713} credential ok; live check: `wardwell tracker doctor`"]);
+        assert_eq!(rows, vec!["  Tracker work/claims linear             \u{2713} credential ok; live check: `wardwell tracker doctor`"]);
         assert!(!rows[0].contains("lin_api_secret"));
 
         let jira = tracker_config(dir.path(), "jira");
@@ -639,12 +650,37 @@ mod tests {
         let path = crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap();
         crate::tracker::credential::save(&path, "t").unwrap();
         let native = std::collections::BTreeMap::from([("work/claims".to_string(), "COR".to_string())]);
-        let (rows, ok) = tracker_rows_with(&config, dir.path(), &native);
+        let (rows, ok) = tracker_rows_with(&config, dir.path(), &native, false);
         assert!(!ok);
         assert_eq!(
             rows,
-            vec!["  Tracker work/claims                    \u{2717} failed (prefix_collision): Tracker team key COR of work/claims equals the native kanban prefix COR of project claims. Set a different native prefix for claims in kanban.prefixes.; live check: `wardwell tracker doctor`"]
+            vec!["  Tracker work/claims linear             \u{2717} failed (prefix_collision): Tracker team key COR of work/claims equals the native kanban prefix COR of project claims. Set a different native prefix for claims in kanban.prefixes.; live check: `wardwell tracker doctor`"]
         );
+    }
+
+    #[test]
+    fn each_binding_of_a_project_gets_its_row_and_github_names_the_connect_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: linear\n      team: COR\n      credential: corr-linear\n    - provider: github\n      repository: acme/app\n",
+            dir.path().join("vault").display()
+        );
+        let config = loader::parse(&yaml).unwrap();
+        crate::tracker::credential::save(&crate::tracker::credential::path_in(dir.path(), "corr-linear").unwrap(), "t").unwrap();
+        let native = std::collections::BTreeMap::from([("work/claims".to_string(), "COR".to_string())]);
+        let (rows, ok) = tracker_rows_with(&config, dir.path(), &native, false);
+        assert!(!ok);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("  Tracker work/claims linear             \u{2717} failed (prefix_collision)"), "{}", rows[0]);
+        assert_eq!(rows[1], "  Tracker work/claims github             \u{2717} failed (credential): github: unreachable, run `wardwell tracker connect github`; live check: `wardwell tracker doctor`");
+
+        let (rows, _) = tracker_rows_with(&config, dir.path(), &std::collections::BTreeMap::new(), true);
+        assert_eq!(rows[1], "  Tracker work/claims github             \u{2713} gh on PATH or a token stored; live check: `wardwell tracker doctor`");
+        crate::tracker::credential::save(&crate::tracker::credential::path_in(dir.path(), "github").unwrap(), "ghp_secret").unwrap();
+        let (rows, ok) = tracker_rows_with(&config, dir.path(), &std::collections::BTreeMap::new(), false);
+        assert!(ok, "{rows:?}");
+        assert_eq!(rows[1], "  Tracker work/claims github             \u{2713} token stored; live check: `wardwell tracker doctor`");
+        assert!(!rows.join("\n").contains("ghp_secret"));
     }
 
     #[test]

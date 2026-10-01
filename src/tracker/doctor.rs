@@ -1,12 +1,14 @@
 //! `wardwell tracker doctor`: per binding, checks the credential file, one
-//! cheap authenticated request, and that the bound team resolves. One line
-//! per check, a closed code on failure, never a token or provider text.
+//! cheap authenticated request, and that the bound team or repository
+//! resolves. One line per check, a closed code on failure, never a token or
+//! provider text.
 //!
 //! Does NOT pull or write anything.
 
 use crate::config::loader::{TrackerBinding, WardwellConfig};
 use crate::tracker::credential::{self, Credential};
 use crate::tracker::events::FailureCode;
+use crate::tracker::github::{GitHub, SystemGh};
 use crate::tracker::linear::{self, HttpTransport, Transport};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -14,6 +16,15 @@ use std::path::Path;
 /// Builds the provider transport for a binding. Injected so tests never
 /// reach a network.
 pub type Probe<'a> = dyn Fn(&TrackerBinding, &Credential) -> Result<Box<dyn Transport>, String> + 'a;
+
+/// Builds the GitHub reader for a binding. Injected so tests never start
+/// `gh` or reach a network.
+pub type GithubProbe<'a> = dyn Fn(&TrackerBinding, Option<&Credential>) -> GitHub + 'a;
+
+/// The production GitHub reader: `gh` on PATH, then the stored token.
+pub fn connect_github(binding: &TrackerBinding, credential: Option<&Credential>) -> GitHub {
+    crate::tracker::pull::github_for(binding, credential, Box::new(SystemGh))
+}
 
 /// The production transport for a binding's provider.
 pub fn connect_transport(binding: &TrackerBinding, credential: &Credential) -> Result<Box<dyn Transport>, String> {
@@ -23,16 +34,16 @@ pub fn connect_transport(binding: &TrackerBinding, credential: &Credential) -> R
     }
 }
 
-/// Three lines per bound project: credential, auth, team; `provider` takes
-/// the place of auth when the provider has no adapter. The bool is true when
+/// Per issue binding, four lines: credential, auth, team, kanban prefix;
+/// `provider` takes the place of auth when the provider has no adapter. Per
+/// github binding, two lines: token and repository. The bool is true when
 /// every check passed.
-pub fn run(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>) -> (Vec<String>, bool) {
-    run_with(config, config_dir, probe, &native_prefixes(config, &config_dir.join("kanban.db")))
+pub fn run(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, github: &GithubProbe<'_>) -> (Vec<String>, bool) {
+    run_with(config, config_dir, probe, github, &native_prefixes(config, &config_dir.join("kanban.db")))
 }
 
 /// `run`, with each binding's native kanban prefix given by binding key.
-/// Adds a fourth line per binding: whether the team key differs from it.
-pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, native: &BTreeMap<String, String>) -> (Vec<String>, bool) {
+pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, github: &GithubProbe<'_>, native: &BTreeMap<String, String>) -> (Vec<String>, bool) {
     if config.trackers.is_empty() {
         return (vec!["No trackers bound. Add a trackers section to config.yml.".to_string()], true);
     }
@@ -40,9 +51,15 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, n
     let mut healthy = true;
     for binding in &config.trackers {
         let key = binding.key();
-        let mut checks = check_binding(config_dir, binding, probe);
-        checks.push(("kanban prefix".to_string(), prefix_outcome(binding, native.get(&key))));
-        healthy &= checks.iter().all(|(_, outcome)| matches!(outcome, Outcome::Ok));
+        let checks = match crate::tracker::mirrors_issues(&binding.provider) {
+            true => {
+                let mut checks = check_binding(config_dir, binding, probe);
+                checks.push(("kanban prefix".to_string(), prefix_outcome(binding, native.get(&key))));
+                checks
+            }
+            false => check_github(config_dir, binding, github),
+        };
+        healthy &= checks.iter().all(|(_, outcome)| matches!(outcome, Outcome::Ok | Outcome::Found(_)));
         lines.extend(checks.into_iter().map(|(name, outcome)| format!("{key}: {name} {}", outcome.describe())));
     }
     (lines, healthy)
@@ -51,7 +68,20 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, n
 /// The checks that need no network: the credential file exists with
 /// owner-only permissions, and Wardwell has an adapter for the provider.
 /// The error is a closed code and, for the credential, the path and fix.
+/// A github binding passes without a token when `gh` is on PATH.
 pub fn check_offline(config_dir: &Path, binding: &TrackerBinding) -> Result<(), (FailureCode, Option<String>)> {
+    check_offline_with(config_dir, binding, crate::tracker::github::gh_on_path())
+}
+
+/// `check_offline`, told whether `gh` is on PATH.
+pub fn check_offline_with(config_dir: &Path, binding: &TrackerBinding, gh_on_path: bool) -> Result<(), (FailureCode, Option<String>)> {
+    if !crate::tracker::mirrors_issues(&binding.provider) {
+        let stored = crate::tracker::pull::load_credential(config_dir, binding).map_err(|e| (e.code, Some(e.message)))?;
+        return match (stored.is_some(), gh_on_path) {
+            (false, false) => Err((FailureCode::Credential, Some(crate::tracker::github::unreachable_line(&binding.credential)))),
+            _ => Ok(()),
+        };
+    }
     credential::path_in(config_dir, &binding.credential)
         .and_then(|path| credential::load(&path))
         .map_err(|message| (FailureCode::Credential, Some(message)))?;
@@ -85,6 +115,8 @@ fn prefix_outcome(binding: &TrackerBinding, native: Option<&String>) -> Outcome 
 
 enum Outcome {
     Ok,
+    /// Passed, with what the check found.
+    Found(String),
     Failed(FailureCode, Option<String>),
     Skipped,
 }
@@ -93,6 +125,7 @@ impl Outcome {
     fn describe(&self) -> String {
         match self {
             Outcome::Ok => "ok".to_string(),
+            Outcome::Found(text) => text.clone(),
             Outcome::Failed(code, Some(detail)) => format!("failed ({}): {detail}", code.as_str()),
             Outcome::Failed(code, None) => format!("failed ({})", code.as_str()),
             Outcome::Skipped => "skipped".to_string(),
@@ -102,6 +135,32 @@ impl Outcome {
     fn from(result: Result<(), FailureCode>) -> Self {
         result.map_or_else(|code| Outcome::Failed(code, None), |_| Outcome::Ok)
     }
+}
+
+/// Token and repository lines for a github binding. A missing token is not
+/// a failure while `gh` can read; a token that fails its checks is.
+fn check_github(config_dir: &Path, binding: &TrackerBinding, github: &GithubProbe<'_>) -> Vec<(String, Outcome)> {
+    let repository = format!("github repository {}", binding.scope());
+    let credential = match crate::tracker::pull::load_credential(config_dir, binding) {
+        Ok(credential) => credential,
+        Err(error) => {
+            return vec![
+                ("github token".to_string(), Outcome::Failed(error.code, Some(error.message))),
+                (repository, Outcome::Skipped),
+            ];
+        }
+    };
+    let token = match credential.is_some() {
+        true => Outcome::Ok,
+        false => Outcome::Found("not stored; gh reads alone".to_string()),
+    };
+    let reader = github(binding, credential.as_ref());
+    let reached = match reader.check() {
+        Ok(route) => Outcome::Found(format!("ok {}", route.describe())),
+        Err(FailureCode::Credential) => Outcome::Failed(FailureCode::Credential, Some(reader.unreachable_message())),
+        Err(code) => Outcome::Failed(code, None),
+    };
+    vec![("github token".to_string(), token), (repository, reached)]
 }
 
 fn check_binding(config_dir: &Path, binding: &TrackerBinding, probe: &Probe<'_>) -> Vec<(String, Outcome)> {
@@ -180,7 +239,13 @@ mod tests {
             assert_eq!(c.token(), "lin_api_secret");
             Ok(Box::new(Canned { viewer: viewer.clone(), teams: teams.clone() }))
         };
-        run(config, dir, &probe)
+        run(config, dir, &probe, &no_gh)
+    }
+
+    /// A GitHub reader whose `gh` is missing and which reads REST from `rest`.
+    fn no_gh(binding: &TrackerBinding, credential: Option<&Credential>) -> GitHub {
+        let (gh, _) = crate::tracker::github::tests::gh_with(crate::tracker::github::GhOutcome::Missing);
+        crate::tracker::pull::github_for(binding, credential, gh)
     }
 
     #[test]
@@ -247,7 +312,7 @@ mod tests {
     fn an_unknown_provider_is_a_provider_failure_not_a_credential_one() {
         let (dir, mut config) = setup(true);
         config.trackers[0].provider = "jira".into();
-        let (lines, healthy) = run(&config, dir.path(), &connect_transport);
+        let (lines, healthy) = run(&config, dir.path(), &connect_transport, &no_gh);
         assert_eq!(
             lines,
             vec!["work/claims: credential ok", "work/claims: provider failed (unsupported_provider)", "work/claims: team COR skipped", "work/claims: kanban prefix ok"]
@@ -276,14 +341,14 @@ mod tests {
         let probe = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Transport>, String> {
             Ok(Box::new(Canned { viewer: viewer_ok(), teams: json!([{"key": "COR"}]) }))
         };
-        let (lines, healthy) = run_with(&config, dir.path(), &probe, &native);
+        let (lines, healthy) = run_with(&config, dir.path(), &probe, &no_gh, &native);
         assert_eq!(
             lines.last().unwrap(),
             "work/claims: kanban prefix failed (prefix_collision): Tracker team key COR of work/claims equals the native kanban prefix COR of project claims. Set a different native prefix for claims in kanban.prefixes."
         );
         assert!(!healthy);
         let other = std::collections::BTreeMap::from([("work/claims".to_string(), "CL".to_string())]);
-        let (lines, healthy) = run_with(&config, dir.path(), &probe, &other);
+        let (lines, healthy) = run_with(&config, dir.path(), &probe, &no_gh, &other);
         assert_eq!(lines.last().unwrap(), "work/claims: kanban prefix ok");
         assert!(healthy);
     }
@@ -298,6 +363,89 @@ mod tests {
         store.create_item("t", "claims", "work", None, None, None, None, None, None, None, None, None, &std::collections::HashMap::new()).unwrap();
         drop(store);
         assert_eq!(native_prefixes(&config, &db)["work/claims"], "CL");
+    }
+
+    fn github_config(dir: &Path) -> WardwellConfig {
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    - provider: linear\n      team: COR\n      credential: corr-linear\n    - provider: github\n      repository: acme/app\n",
+            dir.join("vault").display()
+        );
+        crate::config::loader::parse(&yaml).unwrap()
+    }
+
+    /// A GitHub reader with `gh` giving `outcome` and REST answering `rest`.
+    fn github_probe(outcome: crate::tracker::github::GhOutcome, rest: Option<Result<Value, String>>) -> impl Fn(&TrackerBinding, Option<&Credential>) -> GitHub {
+        move |binding, credential| {
+            let (gh, _) = crate::tracker::github::tests::gh_with(outcome.clone());
+            let rest = credential.and(rest.clone()).map(|answer| {
+                Box::new(crate::tracker::github::tests::FakeRest { pages: vec![answer], calls: Default::default() }) as Box<dyn crate::tracker::github::Rest>
+            });
+            GitHub::new(binding.scope(), &binding.credential, gh, rest)
+        }
+    }
+
+    fn linear_ok(_: &TrackerBinding, _: &Credential) -> Result<Box<dyn Transport>, String> {
+        Ok(Box::new(Canned { viewer: viewer_ok(), teams: json!([{"key": "COR"}]) }))
+    }
+
+    #[test]
+    fn a_github_binding_gets_a_token_line_and_a_repository_line() {
+        use crate::tracker::github::GhOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        credential::save(&credential::path_in(dir.path(), "corr-linear").unwrap(), "lin_api_secret").unwrap();
+        let config = github_config(dir.path());
+        let native = BTreeMap::new();
+
+        let (lines, healthy) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::Output(b"{}".to_vec()), None), &native);
+        assert_eq!(lines[4..], ["work/claims: github token not stored; gh reads alone", "work/claims: github repository acme/app ok through gh"]);
+        assert_eq!(lines[0], "work/claims: credential ok", "the linear lines are unchanged");
+        assert!(healthy, "{lines:?}");
+
+        let (lines, healthy) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::Missing, None), &native);
+        assert_eq!(lines[5], "work/claims: github repository acme/app failed (credential): github: unreachable, run `wardwell tracker connect github`");
+        assert!(!healthy);
+
+        credential::save(&credential::path_in(dir.path(), "github").unwrap(), "ghp_secret").unwrap();
+        let cases = [
+            (Ok(json!({"full_name": "acme/app"})), "ok through the API token"),
+            (Err(format!("GitHub returned HTTP 401: {}", crate::tracker::adapter::AUTH_REFUSED)), "failed (auth)"),
+            (Err("GitHub returned HTTP 404".to_string()), "failed (team_not_found)"),
+        ];
+        for (answer, expected) in cases {
+            let (lines, _) = run_with(&config, dir.path(), &linear_ok, &github_probe(GhOutcome::Failed, Some(answer)), &native);
+            assert_eq!(lines[4], "work/claims: github token ok");
+            assert_eq!(lines[5], format!("work/claims: github repository acme/app {expected}"));
+            assert!(!lines.join("\n").contains("ghp_secret"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_github_token_with_loose_permissions_fails_and_skips_the_repository() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = credential::path_in(dir.path(), "github").unwrap();
+        credential::save(&path, "ghp_secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let config = github_config(dir.path());
+        let (lines, healthy) = run_with(&config, dir.path(), &linear_ok, &github_probe(crate::tracker::github::GhOutcome::Missing, None), &BTreeMap::new());
+        assert_eq!(lines[4], "work/claims: github token failed (credential): Tracker credential file permissions must be private");
+        assert_eq!(lines[5], "work/claims: github repository acme/app skipped");
+        assert!(!healthy);
+    }
+
+    #[test]
+    fn offline_check_for_github_needs_gh_on_path_or_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = github_config(dir.path());
+        let github = &config.trackers[1];
+        assert_eq!(check_offline_with(dir.path(), github, true), Ok(()));
+        assert_eq!(
+            check_offline_with(dir.path(), github, false),
+            Err((FailureCode::Credential, Some("github: unreachable, run `wardwell tracker connect github`".to_string())))
+        );
+        credential::save(&credential::path_in(dir.path(), "github").unwrap(), "ghp_secret").unwrap();
+        assert_eq!(check_offline_with(dir.path(), github, false), Ok(()));
     }
 
     #[test]

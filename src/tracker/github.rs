@@ -171,6 +171,31 @@ impl Adapter for GitHub {
     }
 }
 
+/// Whether an executable `gh` is in a directory on PATH. Reads the file
+/// system only; never starts `gh`.
+pub fn gh_on_path() -> bool {
+    gh_in(std::env::var_os("PATH").as_deref())
+}
+
+/// Whether an executable `gh` is in a directory of `path`, a PATH value.
+pub fn gh_in(path: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    std::env::split_paths(path).map(|dir| dir.join("gh")).any(|file| is_executable(&file))
+}
+
+#[cfg(unix)]
+fn is_executable(file: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(file: &std::path::Path) -> bool {
+    file.is_file()
+}
+
 /// The line doctor and a failed pull print when no reader is available.
 pub fn unreachable_line(credential: &str) -> String {
     format!("github: {UNREACHABLE} {credential}`")
@@ -571,6 +596,22 @@ pub(crate) mod tests {
         let error = collect(&GitHub::new("acme/app", "github", gh, Some(rest)), None, false).unwrap_err();
         assert!(error.contains("not a list"), "{error}");
         assert!(calls.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_on_path_looks_for_an_executable_file_without_running_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::join_paths([dir.path().join("none"), bin.clone()]).unwrap();
+        assert!(!gh_in(Some(&path)));
+        std::fs::write(bin.join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(!gh_in(Some(&path)), "not executable");
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(gh_in(Some(&path)));
+        assert!(!gh_in(None));
     }
 
     #[test]
