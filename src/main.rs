@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::path::Path;
 
 #[derive(Parser)]
 #[command(
@@ -655,37 +654,17 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     use wardwell::config::loader;
 
     let config = loader::load(None)?;
-    let vault_path = &config.vault_path;
-
-    if !vault_path.exists() {
+    if !config.vault_path.exists() {
         return Ok(());
     }
-
-    // Try to match cwd to a vault domain by checking if cwd directory name
-    // matches a subdirectory of the vault
-    let cwd_path = std::path::Path::new(cwd);
-    let cwd_name = cwd_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
-    let matched_domain = std::fs::read_dir(vault_path).ok().and_then(|entries| {
-        entries
-            .flatten()
-            .find(|e| e.path().is_dir() && e.file_name().to_string_lossy() == cwd_name)
-            .map(|e| e.path())
-    });
-
-    if let Some(domain_dir) = matched_domain {
-        // Found a matching domain — output its project summaries
-        inject_domain_context(&config, &domain_dir);
-    }
-    // No match = no output. Don't pollute non-project sessions.
-
-    Ok(())
-}
-
-/// Output context for a specific domain's projects.
-fn inject_domain_context(config: &wardwell::config::loader::WardwellConfig, domain_dir: &Path) {
+    let cwd = std::path::absolute(cwd)?;
     let today = chrono::Local::now().date_naive();
-    print!("{}", wardwell::inject::domain::domain_context(config, &wardwell::config::loader::config_dir(), domain_dir, chrono::Utc::now(), today));
+    // No match prints nothing. Don't pollute non-project sessions.
+    print!(
+        "{}",
+        wardwell::inject::start::output(&cwd, &config, &loader::config_dir(), wardwell::inject::git::dirs, chrono::Utc::now(), today)
+    );
+    Ok(())
 }
 
 fn run_resolve() -> Result<(), Box<dyn std::error::Error>> {
