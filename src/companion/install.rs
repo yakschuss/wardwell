@@ -232,31 +232,10 @@ fn merge_event(
     Ok(())
 }
 
-fn owned_command(command: &str) -> bool {
-    let command = command.trim();
-    let pair = if let Some(rest) = command.strip_prefix('\'') {
-        rest.split_once('\'').map(|(exe, args)| (exe, args.trim()))
-    } else {
-        command
-            .split_once(' ')
-            .map(|(exe, args)| (exe, args.trim()))
-    };
-    let Some((exe, args)) = pair else {
+pub(crate) fn owned_command(command: &str) -> bool {
+    let Some(args) = wardwell_args(command) else {
         return false;
     };
-    let Some(name) = Path::new(exe).file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    let owned = name == "wardwell"
-        || name.strip_prefix("wardwell-").is_some_and(|suffix| {
-            suffix.starts_with(|c: char| c.is_ascii_digit())
-                && suffix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
-        });
-    if !owned {
-        return false;
-    }
     if args == "resolve" {
         return true;
     }
@@ -269,7 +248,28 @@ fn owned_command(command: &str) -> bool {
     })
 }
 
-fn shell_quote(path: &Path) -> Result<String, String> {
+/// The arguments of a hook command whose executable is a Wardwell binary
+/// (`wardwell` or a versioned `wardwell-<digit>...`), quoted or not. None for
+/// any other executable, so ownership never rests on a substring.
+pub(crate) fn wardwell_args(command: &str) -> Option<&str> {
+    let command = command.trim();
+    let (exe, args) = if let Some(rest) = command.strip_prefix('\'') {
+        rest.split_once('\'')?
+    } else {
+        command.split_once(' ')?
+    };
+    let name = Path::new(exe).file_name().and_then(|s| s.to_str())?;
+    let owned = name == "wardwell"
+        || name.strip_prefix("wardwell-").is_some_and(|suffix| {
+            suffix.starts_with(|c: char| c.is_ascii_digit())
+                && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        });
+    owned.then(|| args.trim())
+}
+
+pub(crate) fn shell_quote(path: &Path) -> Result<String, String> {
     let text = path.to_str().ok_or("Wardwell binary path is not UTF-8")?;
     if text.chars().any(char::is_control) {
         return Err("Invalid binary path".into());

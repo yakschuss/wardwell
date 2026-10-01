@@ -1,5 +1,7 @@
 use crate::config::loader::config_dir;
 use crate::install::detect;
+use crate::install::installer;
+use crate::tracker::schedule::{SystemRunner, current_uid};
 use crate::install::mcp_config::{self, ChangeStatus, McpConfigPaths, ReconcileResult};
 use std::path::{Path, PathBuf};
 
@@ -179,10 +181,10 @@ fn preview_and_confirm(vault_path: &Path, config_path: &Path, binary_path: &Path
     println!("    RECONCILE  Codex MCP → {}", mcp_paths.codex.display());
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    println!(
-        "    INJECT  SessionStart hook → {}",
-        home.join(".claude/settings.json").display()
-    );
+    match hooks_plan(binary_path) {
+        Ok(plan) => plan.lines.iter().for_each(|line| println!("{}", line.render())),
+        Err(error) => println!("    BLOCKED  Claude Code hooks: {error}"),
+    }
     println!(
         "    INJECT  CLAUDE.md markers → {}",
         home.join(".claude/CLAUDE.md").display()
@@ -277,20 +279,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("  - Codex not installed; configuration unchanged");
     }
 
-    // 7. SessionStart hook
-    if prompt_pause("Install SessionStart hook?") {
-        match install_hook() {
-            Ok(()) => println!("  \u{2713} SessionStart hook installed"),
+    // 7. Claude Code hooks and permissions, through the same careful
+    // installer as `setup`.
+    if prompt_pause("Install Wardwell's Claude Code hooks?") {
+        match install_hooks(&binary_path) {
+            Ok(notes) => notes.iter().for_each(|note| println!("{note}")),
             Err(e) => {
                 println!("  \u{2717} Hook install failed: {e}");
-                skipped.push("SessionStart hook: manually register wardwell inject in ~/.claude/settings.json".to_string());
+                skipped.push("Hooks: run `wardwell setup` to install them".to_string());
             }
         }
     } else {
-        skipped.push(
-            "SessionStart hook: manually register wardwell inject in ~/.claude/settings.json"
-                .to_string(),
-        );
+        skipped.push("Hooks: run `wardwell setup` to install them".to_string());
     }
 
     // 8. CLAUDE.md injection
@@ -592,108 +592,28 @@ fn inject_claude_md_pointer() {
     }
 }
 
-fn install_hook() -> Result<(), Box<dyn std::error::Error>> {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let settings_path = home.join(".claude/settings.json");
-
-    let mut config: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let hooks = config
-        .as_object_mut()
-        .ok_or_else(|| std::io::Error::other("settings.json is not a JSON object"))?
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks
-        .as_object_mut()
-        .ok_or_else(|| std::io::Error::other("hooks is not a JSON object"))?;
-
-    let binary_path = detect::find_binary_path();
-
-    // SessionStart: fast inject (no index rebuild)
-    let inject_command = format!("{} inject \"$(pwd)\"", binary_path.display());
-    let start_hook = serde_json::json!({
-        "hooks": [{
-            "type": "command",
-            "command": inject_command
-        }]
-    });
-
-    // Install SessionStart hook
-    install_hook_entry(hooks_obj, "SessionStart", &start_hook)?;
-
-    // Stop: resolve session against last Desktop intent
-    let resolve_command = format!("{} resolve", binary_path.display());
-    let stop_hook = serde_json::json!({
-        "hooks": [{
-            "type": "command",
-            "command": resolve_command
-        }]
-    });
-    install_hook_entry(hooks_obj, "Stop", &stop_hook)?;
-
-    // Remove SessionEnd hook if present
-    hooks_obj.remove("SessionEnd");
-
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json =
-        serde_json::to_string_pretty(&config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(&settings_path, json)?;
-
-    Ok(())
+/// The installer's plan for this computer, with the bindings in config.yml.
+fn hooks_plan(binary_path: &Path) -> Result<installer::Plan, String> {
+    let home = dirs::home_dir().ok_or("Could not find the home directory")?;
+    let config_dir = config_dir();
+    let trackers = crate::install::setup::tracker_bindings(&config_dir)?;
+    installer::plan(&installer::Inputs {
+        home: &home,
+        config_dir: &config_dir,
+        binary: binary_path,
+        trackers: &trackers,
+        claude_code: true,
+        launchd: cfg!(target_os = "macos"),
+    })
 }
 
-/// Install or update a wardwell hook entry in a given hook event array.
-fn install_hook_entry(
-    hooks_obj: &mut serde_json::Map<String, serde_json::Value>,
-    event: &str,
-    hook: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = hooks_obj
-        .entry(event)
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .ok_or_else(|| std::io::Error::other(format!("{event} is not an array")))?;
-
-    let already_registered = entries.iter().any(is_wardwell_hook);
-
-    if already_registered {
-        for entry in entries.iter_mut() {
-            if is_wardwell_hook(entry) {
-                *entry = hook.clone();
-            }
-        }
-    } else {
-        entries.push(hook.clone());
-    }
-
-    Ok(())
-}
-
-/// Check if a hook entry is a wardwell hook (old or new format).
-fn is_wardwell_hook(entry: &serde_json::Value) -> bool {
-    // Old flat format: {type: "command", command: "...wardwell..."}
-    entry
-        .get("command")
-        .and_then(|c| c.as_str())
-        .is_some_and(|c| c.contains("wardwell"))
-        || entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c.contains("wardwell"))
-                })
-            })
+/// Apply the installer's plan; the lines to print, activation notes last.
+fn install_hooks(binary_path: &Path) -> Result<Vec<String>, String> {
+    let plan = hooks_plan(binary_path)?;
+    let mut lines = installer::apply(&plan, &SystemRunner, &current_uid)?;
+    lines.push("  \u{2713} Hooks installed".to_string());
+    lines.extend(plan.activation().into_iter().map(|note| format!("    {note}")));
+    Ok(lines)
 }
 
 #[cfg(test)]
@@ -735,24 +655,6 @@ mod tests {
     fn count_files_recursive_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(count_files_recursive(dir.path()), 0);
-    }
-
-    #[test]
-    fn is_wardwell_hook_old_flat_format() {
-        let entry = serde_json::json!({"type": "command", "command": "wardwell inject $(pwd)"});
-        assert!(is_wardwell_hook(&entry));
-    }
-
-    #[test]
-    fn is_wardwell_hook_new_nested_format() {
-        let entry = serde_json::json!({"hooks": [{"type": "command", "command": "/usr/bin/wardwell inject $(pwd)"}]});
-        assert!(is_wardwell_hook(&entry));
-    }
-
-    #[test]
-    fn is_wardwell_hook_non_wardwell() {
-        let entry = serde_json::json!({"type": "command", "command": "echo hello"});
-        assert!(!is_wardwell_hook(&entry));
     }
 
     #[test]

@@ -44,6 +44,11 @@ pub fn current_uid() -> Result<u32, String> {
         .map_err(|_| "could not read the current user id".to_string())
 }
 
+/// The log both of the agent's streams go to.
+pub fn log_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("tracker-pull.log")
+}
+
 /// Where the agent plist lives under `home`.
 pub fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
@@ -142,7 +147,7 @@ pub fn schedule(
     let path = plist_path(home);
     let parent = path.parent().ok_or("no LaunchAgents directory")?;
     std::fs::create_dir_all(parent).map_err(|error| format!("could not create the LaunchAgents directory: {error}"))?;
-    let body = launch_agent_plist(&binary, interval_seconds, &config_dir.join("tracker-pull.log"));
+    let body = launch_agent_plist(&binary, interval_seconds, &log_path(config_dir));
     std::fs::create_dir_all(config_dir).map_err(|error| format!("could not create the config directory: {error}"))?;
     let staged = path.with_extension("plist.tmp");
     std::fs::write(&staged, body).map_err(|error| format!("could not write {LABEL}.plist: {error}"))?;
@@ -192,22 +197,23 @@ pub fn schedule_status(home: &Path) -> Option<u32> {
     value.trim().parse().ok()
 }
 
+/// A launchctl runner that records each argv and fails the named verbs, so
+/// tests never invoke launchctl.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
+pub(crate) mod fake {
+    use super::LaunchctlRunner;
     use std::cell::RefCell;
 
-    struct Fake {
-        calls: RefCell<Vec<Vec<String>>>,
+    pub(crate) struct Fake {
+        pub(crate) calls: RefCell<Vec<Vec<String>>>,
         fail: Vec<&'static str>,
     }
 
     impl Fake {
-        fn new(fail: &[&'static str]) -> Self {
+        pub(crate) fn new(fail: &[&'static str]) -> Self {
             Fake { calls: RefCell::new(Vec::new()), fail: fail.to_vec() }
         }
-        fn verbs(&self) -> Vec<String> {
+        pub(crate) fn verbs(&self) -> Vec<String> {
             self.calls.borrow().iter().map(|call| call[1].clone()).collect()
         }
     }
@@ -221,6 +227,13 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::fake::Fake;
+    use super::*;
 
     #[test]
     fn plist_has_label_arguments_interval_runatload_and_both_logs() {
