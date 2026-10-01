@@ -36,11 +36,14 @@ fn match_dir(cwd: &Path, git: impl Fn(&Path) -> Option<GitDirs>) -> PathBuf {
     git(cwd).and_then(|dirs| dirs.in_main_worktree(cwd)).unwrap_or_else(|| cwd.to_path_buf())
 }
 
-/// The project whose configured path is the longest prefix of `dir`.
+/// The project whose configured path is the longest prefix of `dir`,
+/// among projects whose vault folder exists. A mapping to a missing folder
+/// is skipped, so it never silences the directory.
 fn mapped_project(dir: &Path, config: &WardwellConfig) -> Option<Resolution> {
     config
         .projects
         .values()
+        .filter(|m| config.vault_path.join(&m.domain).join(&m.project).is_dir())
         .flat_map(|m| m.paths.iter().map(move |p| (m, canonical(p))))
         .filter(|(_, path)| dir.starts_with(path))
         .max_by_key(|(_, path)| path.components().count())
@@ -68,6 +71,7 @@ mod tests {
         std::fs::create_dir_all(vault.join("work")).unwrap();
         let mut yaml = format!("vault_path: {}\nsession_sources: []\nprojects:\n", vault.display());
         for (key, paths) in projects {
+            std::fs::create_dir_all(vault.join(key)).unwrap();
             yaml.push_str(&format!("  {key}:\n    paths:\n"));
             paths.iter().for_each(|p| yaml.push_str(&format!("      - {}\n", p.display())));
         }
@@ -164,5 +168,19 @@ mod tests {
         git(&unmapped, &["worktree", "add", "-q", "-b", "f", feature.to_str().unwrap()]);
         let config = config(tmp.path(), &[("personal/corr-platform", &[&mapped])]);
         assert_eq!(resolve(&feature, &config, crate::inject::git::dirs), None);
+    }
+
+    #[test]
+    fn a_mapping_without_a_vault_folder_falls_through_to_the_next_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("checkouts");
+        let work = outer.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let config = config(tmp.path(), &[("personal/outer", &[&outer]), ("personal/gone", &[&work])]);
+        std::fs::remove_dir_all(tmp.path().join("vault/personal/gone")).unwrap();
+        assert_eq!(resolve(&work, &config, |_: &Path| None), project("personal/outer"), "the shorter mapping");
+        std::fs::remove_dir_all(tmp.path().join("vault/personal/outer")).unwrap();
+        let found = resolve(&work, &config, |_: &Path| None);
+        assert_eq!(found, Some(Resolution::Domain(tmp.path().join("vault/work"))), "then the domain-name match");
     }
 }

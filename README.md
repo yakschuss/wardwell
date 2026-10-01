@@ -165,6 +165,8 @@ When you open a Claude Code session, the hook runs `wardwell inject "$(pwd)"`. W
 2. The longest directory under `projects:` in config.yml that contains the directory wins.
 3. A directory named like a vault domain folder prints that domain's projects, as before.
 
+A mapping whose vault folder does not exist is skipped, and the next rule applies. `wardwell doctor` reports the missing folder.
+
 A mapped project prints its summary, a rot line with the age of its last history entry and last decision, and its tracker section when it has a binding. No match prints nothing.
 
 ### Link a repository to a project
