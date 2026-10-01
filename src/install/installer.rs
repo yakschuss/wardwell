@@ -154,12 +154,27 @@ struct Draft {
 
 impl Draft {
     fn read(path: PathBuf, removing: bool) -> Result<Draft, String> {
+        if let Ok(target) = std::fs::read_link(&path) {
+            return Err(format!(
+                "{} is a symbolic link to {}. Run setup against the real file, or replace the link with a regular file. No files changed.",
+                path.display(),
+                target.display()
+            ));
+        }
         let before = read_optional(&path)?;
         let value = match before.as_deref() {
+            Some(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => json!({}),
             Some(bytes) => serde_json::from_slice(bytes)
                 .map_err(|_| format!("Malformed JSON in {}; no files changed", path.display()))?,
             None => json!({}),
         };
+        if !value.is_object() {
+            return Err(format!(
+                "{} must be a JSON object, such as {{\"hooks\": {{}}}}; it holds {}. No files changed.",
+                path.display(),
+                kind(&value)
+            ));
+        }
         client_hooks::validate(&value).map_err(|error| format!("{error} in {}; no files changed", path.display()))?;
         Ok(Draft { path, before, original: value.clone(), value, removing })
     }
@@ -189,6 +204,17 @@ impl Draft {
         let mut after = serde_json::to_vec_pretty(&self.value).map_err(|_| "Could not encode Claude settings")?;
         after.push(b'\n');
         Ok(Some(Change { path: self.path, before: self.before, after }))
+    }
+}
+
+fn kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -598,6 +624,44 @@ mod tests {
         assert!(plan(&inputs).unwrap_err().contains("install record"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_empty_settings_file_is_an_empty_object() {
+        let h = home();
+        let path = settings_path(&h.home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, " \n").unwrap();
+        let plan = run(&h, &BTreeMap::new());
+        assert_eq!(action_of(&plan, "Session start hook"), Action::UpdateBackup);
+        assert_eq!(client_hooks::commands(&settings(&h), &STOP).len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_settings_file_is_refused_and_names_its_target() {
+        let h = home();
+        let real = h.home.join("dotfiles/settings.json");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "{}").unwrap();
+        fs::create_dir_all(h.home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&real, settings_path(&h.home)).unwrap();
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &BTreeMap::new(), claude_code: true, launchd: false };
+        let error = plan(&inputs).unwrap_err();
+        assert!(error.contains(&real.display().to_string()), "{error}");
+        assert!(error.contains("Run setup against the real file, or replace the link"), "{error}");
+        assert!(uninstall_plan(&h.home, &h.cfg).is_err());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "{}");
+    }
+
+    #[test]
+    fn settings_that_are_json_but_not_an_object_are_refused() {
+        let h = home();
+        put_settings(&h, json!([1, 2]));
+        let inputs = Inputs { home: &h.home, config_dir: &h.cfg, binary: Path::new(BIN), trackers: &BTreeMap::new(), claude_code: true, launchd: false };
+        let error = plan(&inputs).unwrap_err();
+        assert!(error.contains("must be a JSON object"), "{error}");
+        assert!(error.contains("an array"), "{error}");
     }
 
     #[test]
