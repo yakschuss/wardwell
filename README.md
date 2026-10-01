@@ -197,6 +197,15 @@ The session begins when the Companion lifecycle hooks first record it. The time 
 - It allows when the agent is already continuing from a Stop block.
 - It allows on any error or timeout, and when the project has no vault folder.
 - It reads only the local git repository. Merged pull requests are not counted.
+- An amend counts as the commit it replaces. A session that only amended counts one.
+- These do not count, because git records them as something other than a commit:
+  - a cherry-pick
+  - a revert
+  - `git am`
+  - a pull
+  - a checkout
+  - a rebase
+  - a merge, unless you finish it with your own `git commit`
 - Only a history entry in this project counts. An entry written to a different project does not satisfy the check for this one.
 - Two sessions that share one checkout cannot be told apart. A commit by either counts for both. Give each session its own worktree.
 - Each block is logged to `~/.wardwell/stop-check/blocks.jsonl`. `wardwell doctor` shows the last one per project.
