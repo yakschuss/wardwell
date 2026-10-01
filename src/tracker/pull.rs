@@ -8,7 +8,7 @@
 use crate::config::loader::TrackerBinding;
 use crate::tracker::adapter::Adapter;
 use crate::tracker::credential::{self, Credential};
-use crate::tracker::events::{Common, Event};
+use crate::tracker::events::{Common, Event, FailureCode};
 use crate::tracker::linear::{HttpTransport, Linear};
 use crate::tracker::{lock, log, provider_label};
 use chrono::{DateTime, TimeDelta, Utc};
@@ -42,6 +42,26 @@ pub fn connect_provider(binding: &TrackerBinding, credential: &Credential) -> Re
     }
 }
 
+/// Why a pull stopped: a closed code for the log and the status line, and a
+/// message for the person running it. Neither carries a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullError {
+    pub code: FailureCode,
+    pub message: String,
+}
+
+impl PullError {
+    fn new(code: FailureCode, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
+impl std::fmt::Display for PullError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.message, self.code.as_str())
+    }
+}
+
 /// Load the binding's credential, then pull. A missing or unreadable
 /// credential fails before the log is read or written.
 pub fn pull_binding(
@@ -51,9 +71,11 @@ pub fn pull_binding(
     full: bool,
     now: DateTime<Utc>,
     connect: &Connect<'_>,
-) -> Result<PullOutcome, String> {
-    let credential = credential::load(&credential::path_in(config_dir, &binding.credential)?)?;
-    let adapter = connect(binding, &credential)?;
+) -> Result<PullOutcome, PullError> {
+    let credential = credential::path_in(config_dir, &binding.credential)
+        .and_then(|path| credential::load(&path))
+        .map_err(|message| PullError::new(FailureCode::Credential, message))?;
+    let adapter = connect(binding, &credential).map_err(|message| PullError::new(FailureCode::UnsupportedProvider, message))?;
     pull_project(vault_root, binding, adapter.as_ref(), full, now)
 }
 
@@ -64,12 +86,13 @@ pub fn pull_project(
     adapter: &dyn Adapter,
     full: bool,
     now: DateTime<Utc>,
-) -> Result<PullOutcome, String> {
+) -> Result<PullOutcome, PullError> {
     pull_project_waiting(vault_root, binding, adapter, full, now, lock::DEFAULT_WAIT)
 }
 
 /// `pull_project`, waiting up to `wait` for a compaction holding the
-/// project lock.
+/// project lock. A failure after the lock is taken appends a pull_failed
+/// marker (best effort) before it returns.
 pub fn pull_project_waiting(
     vault_root: &Path,
     binding: &TrackerBinding,
@@ -77,10 +100,31 @@ pub fn pull_project_waiting(
     full: bool,
     now: DateTime<Utc>,
     wait: Duration,
-) -> Result<PullOutcome, String> {
+) -> Result<PullOutcome, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
-    let _lock = lock::acquire(&path, wait)?;
-    let mut summary = log::read(&path)?;
+    let _lock = lock::acquire(&path, wait).map_err(|message| {
+        let code = match message.contains(lock::LOCK_BUSY) {
+            true => FailureCode::LockBusy,
+            false => FailureCode::LogWrite,
+        };
+        PullError::new(code, message)
+    })?;
+    let mut summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
+    let result = pull_locked(&path, binding, adapter, full, now, &mut summary);
+    if let Err(error) = &result {
+        let _ = log::append_new(&path, &[pull_failed(binding, now, error.code)], &mut summary);
+    }
+    result
+}
+
+fn pull_locked(
+    path: &Path,
+    binding: &TrackerBinding,
+    adapter: &dyn Adapter,
+    full: bool,
+    now: DateTime<Utc>,
+    summary: &mut log::LogSummary,
+) -> Result<PullOutcome, PullError> {
     let since = match full {
         true => None,
         false => summary.cursor.map(|t| t - CURSOR_OVERLAP),
@@ -88,25 +132,49 @@ pub fn pull_project_waiting(
     let mut through = summary.cursor;
     let mut appended = 0;
     let mut returned: HashSet<String> = HashSet::new();
+    let mut write_failed = false;
     // Each page is appended as it arrives (event ids make re-pulls
     // idempotent), so a failure keeps the pages already read. The cursor
     // moves only through the marker below, so a failure leaves it alone
     // whatever order the provider delivers pages in.
-    adapter.pull(since, full, &mut |page| {
+    let pulled = adapter.pull(since, full, &mut |page| {
         returned.extend(upserted_keys(&page));
         through = page.iter().fold(through, |t, e| log::later(t, e.common().occurred_at));
-        appended += log::append_new(&path, &page, &mut summary)?;
+        appended += log::append_new(path, &page, summary).inspect_err(|_| write_failed = true)?;
         Ok(())
+    });
+    pulled.map_err(|message| {
+        let code = match write_failed {
+            true => FailureCode::LogWrite,
+            false => FailureCode::Provider,
+        };
+        PullError::new(code, message)
     })?;
     // Removals are only knowable after every page arrived.
     let markers = match full {
-        true => resync_markers(binding, &returned, &summary, now, through),
+        true => resync_markers(binding, &returned, summary, now, through),
         false => vec![pull_completed(binding, now, through)],
     };
     let removed = markers.len().saturating_sub(1);
-    log::append_new(&path, &markers, &mut summary)?;
+    log::append_new(path, &markers, summary).map_err(|message| PullError::new(FailureCode::LogWrite, message))?;
     appended += removed;
     Ok(PullOutcome { appended, removed, full })
+}
+
+/// Marker for a pull that stopped early. The title names only the code.
+fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode) -> Event {
+    let label = provider_label(&binding.provider);
+    Event::PullFailed {
+        common: local_common(
+            binding,
+            format!("wardwell:pull_failed:{}:{}", binding.team, now.to_rfc3339()),
+            &binding.team,
+            &binding.team,
+            now,
+            format!("{} pull from {label} failed: {}", binding.team, code.as_str()),
+        ),
+        code,
+    }
 }
 
 /// Cursor marker for an incremental pull that delivered every page.
@@ -277,7 +345,8 @@ mod tests {
             calls: RefCell::new(vec![]),
         };
         let error = pull_project(vault.path(), &binding(), &broken, true, at(14)).unwrap_err();
-        assert_eq!(error, "Linear request failed");
+        assert_eq!(error.message, "Linear request failed");
+        assert_eq!(error.code, FailureCode::Provider);
 
         let path = log::path_for(vault.path(), "work", "claims");
         let content = std::fs::read_to_string(&path).unwrap();
@@ -287,6 +356,44 @@ mod tests {
         let summary = log::read(&path).unwrap();
         assert!(summary.open_issues.contains_key("COR-1"));
         assert_eq!(summary.last_full_resync_at, None);
+    }
+
+    #[test]
+    fn provider_failure_appends_a_pull_failed_marker_with_a_closed_code() {
+        let vault = tempfile::tempdir().unwrap();
+        pull_project(vault.path(), &binding(), &fake(vec![snapshot("COR-1", 9)]), false, at(12)).unwrap();
+        let broken = FakeAdapter {
+            pages: vec![],
+            fail_after: Some("Linear returned an error: token lin_api_secret rejected"),
+            calls: RefCell::new(vec![]),
+        };
+        let error = pull_project(vault.path(), &binding(), &broken, false, at(13)).unwrap_err();
+        assert_eq!(error.code, FailureCode::Provider);
+
+        let path = log::path_for(vault.path(), "work", "claims");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let last: Event = serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        let Event::PullFailed { common, code } = last else { panic!("{content}") };
+        assert_eq!(code, FailureCode::Provider);
+        assert_eq!(common.title, "COR pull from Linear failed: provider");
+        assert!(!content.contains("lin_api_secret"), "no provider text in the log");
+        let summary = log::read(&path).unwrap();
+        assert_eq!(summary.last_failure, Some((at(13), FailureCode::Provider)));
+        assert_eq!(summary.last_pull_at, Some(at(12)), "a failure is not a pull");
+        assert_eq!(summary.cursor, Some(at(9)));
+    }
+
+    #[test]
+    fn a_failing_sink_is_a_log_write_failure() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        std::fs::create_dir_all(log::raw_path_for(&path)).unwrap();
+        let mut event = snapshot("COR-1", 9);
+        if let Event::IssueUpserted { common, .. } = &mut event {
+            common.raw = serde_json::json!({"id": "x"});
+        }
+        let error = pull_project(vault.path(), &binding(), &fake(vec![event]), false, at(12)).unwrap_err();
+        assert_eq!(error.code, FailureCode::LogWrite, "{error}");
     }
 
     #[test]
@@ -409,7 +516,8 @@ mod tests {
         let started = std::time::Instant::now();
         let error = pull_project_waiting(vault.path(), &binding(), &adapter, false, at(12), Duration::from_millis(150)).unwrap_err();
         assert!(started.elapsed() >= Duration::from_millis(150));
-        assert!(error.contains(lock::LOCK_BUSY), "{error}");
+        assert_eq!(error.code, FailureCode::LockBusy, "{error}");
+        assert!(error.to_string().ends_with("(lock_busy)"), "{error}");
         assert!(adapter.calls.borrow().is_empty(), "no provider call while locked");
         assert!(!path.exists());
         drop(held);
@@ -443,7 +551,8 @@ mod tests {
         let result = pull_project(vault.path(), &binding(), &fake(vec![]), false, at(13));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = result.unwrap_err();
-        assert!(error.contains("could not append"), "{error}");
+        assert!(error.message.contains("could not append"), "{error}");
+        assert_eq!(error.code, FailureCode::LogWrite);
     }
 
     #[test]
@@ -461,7 +570,8 @@ mod tests {
             Ok(Box::new(fake(vec![snapshot("COR-1", 9)])))
         };
         let error = pull_binding(vault.path(), config_dir.path(), &binding(), false, at(12), &connect).unwrap_err();
-        assert!(error.contains("not configured"), "{error}");
+        assert!(error.message.contains("not configured"), "{error}");
+        assert_eq!(error.code, FailureCode::Credential);
         assert!(!*called.borrow(), "no adapter without a credential");
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }

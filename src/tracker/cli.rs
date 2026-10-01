@@ -16,8 +16,9 @@ pub fn connect(config_dir: &Path, name: &str, token: &str) -> Result<String, Str
     Ok(format!("Saved tracker credential '{name}' to {}", path.display()))
 }
 
-/// Pull every bound project, or only `only`. Returns one line per project;
-/// fails with every project's error if any project failed.
+/// Pull every bound project, or only `only`. A project that fails does not
+/// stop the others. Returns one line per project; fails with every
+/// project's line, the errors ending in their closed code, if any failed.
 pub fn pull(
     config: &WardwellConfig,
     config_dir: &Path,
@@ -131,12 +132,16 @@ fn status_line(vault_root: &Path, key: &str, binding: &TrackerBinding, now: Date
         Ok(summary) => summary,
         Err(error) => return format!("{head}, {error}"),
     };
+    let failure = match summary.last_failure {
+        Some((at, code)) => format!(", last error {} at {}", code.as_str(), stamp(at)),
+        None => ", no errors".to_string(),
+    };
     let Some(pulled) = summary.last_pull_at else {
-        return format!("{head}, never pulled");
+        return format!("{head}, never pulled{failure}");
     };
     let resync = summary.last_full_resync_at.map_or("never".to_string(), stamp);
     format!(
-        "{head}, last pull {} ({} ago), last full resync {resync}, {} events",
+        "{head}, last pull {} ({} ago), last full resync {resync}, {} events{failure}",
         stamp(pulled),
         age(now - pulled),
         summary.event_count
@@ -267,6 +272,66 @@ mod tests {
         assert_eq!(compact(&config, Some("work/claims"), false).unwrap(), vec!["work/claims: already compact, 1 events"]);
         assert!(compact(&config, Some("work/nope"), false).unwrap_err().contains("work/nope"));
         drop(dir);
+    }
+
+    /// Fails every pull with provider text that must never reach the vault.
+    struct Broken;
+    impl Adapter for Broken {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            Err("Linear returned HTTP 500".to_string())
+        }
+    }
+
+    fn two_bindings() -> (tempfile::TempDir, WardwellConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let yaml = format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: corr-linear\n  work/ops:\n    provider: linear\n    team: OPS\n    credential: corr-linear\n",
+            vault.display()
+        );
+        let config_path = dir.path().join("config.yml");
+        std::fs::write(&config_path, yaml).unwrap();
+        let config = crate::config::loader::load(Some(&config_path)).unwrap();
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        (dir, config)
+    }
+
+    fn claims_breaks(binding: &TrackerBinding, _: &crate::tracker::credential::Credential) -> Result<Box<dyn Adapter>, String> {
+        match binding.team.as_str() {
+            "COR" => Ok(Box::new(Broken)),
+            _ => Ok(Box::new(Empty)),
+        }
+    }
+
+    #[test]
+    fn one_failing_binding_does_not_stop_the_others_and_fails_the_run() {
+        let (dir, config) = two_bindings();
+        let error = pull(&config, dir.path(), None, false, now(), &claims_breaks).unwrap_err();
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(lines.len(), 2, "{error}");
+        assert!(lines[0].starts_with("work/ops: incremental pull appended"), "{error}");
+        assert_eq!(lines[1], "work/claims: Linear returned HTTP 500 (provider)");
+        let ops = log::read(&log::path_for(&config.vault_path, "work", "ops")).unwrap();
+        assert_eq!(ops.last_pull_at, Some(now()));
+        let claims = log::read(&log::path_for(&config.vault_path, "work", "claims")).unwrap();
+        assert_eq!(claims.last_failure.map(|(_, code)| code.as_str()), Some("provider"));
+    }
+
+    #[test]
+    fn status_lists_every_binding_with_its_last_error() {
+        let (dir, config) = two_bindings();
+        pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        let later = now() + chrono::TimeDelta::minutes(10);
+        pull(&config, dir.path(), None, false, later, &claims_breaks).unwrap_err();
+        let lines = status(&config, later, None);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let claims = lines.iter().find(|l| l.starts_with("work/claims")).unwrap();
+        assert!(claims.contains("last pull 2026-09-01T12:00:00Z"), "{claims}");
+        assert!(claims.ends_with("last error provider at 2026-09-01T12:10:00Z"), "{claims}");
+        assert!(!claims.contains("HTTP 500"), "{claims}");
+        let ops = lines.iter().find(|l| l.starts_with("work/ops")).unwrap();
+        assert!(ops.ends_with("no errors"), "{ops}");
     }
 
     #[test]

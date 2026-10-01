@@ -96,6 +96,44 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         through: Option<DateTime<Utc>>,
     },
+    /// Marks a pull that stopped early, with a closed reason and no provider
+    /// text. Never moves the cursor.
+    PullFailed {
+        #[serde(flatten)]
+        common: Common,
+        code: FailureCode,
+    },
+}
+
+/// Closed reason a pull or a doctor check failed. Carries no provider text,
+/// so it can never leak a secret into the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    /// Credential file missing, unreadable, or with loose permissions.
+    Credential,
+    /// The binding names a provider Wardwell has no adapter for.
+    UnsupportedProvider,
+    /// A compaction or another pull held the project lock past the wait.
+    LockBusy,
+    LogRead,
+    LogWrite,
+    /// The provider could not be reached or answered with an error.
+    Provider,
+}
+
+impl FailureCode {
+    /// The code as written in the log and printed by the CLI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Credential => "credential",
+            Self::UnsupportedProvider => "unsupported_provider",
+            Self::LockBusy => "lock_busy",
+            Self::LogRead => "log_read",
+            Self::LogWrite => "log_write",
+            Self::Provider => "provider",
+        }
+    }
 }
 
 impl Event {
@@ -108,7 +146,8 @@ impl Event {
             | Event::LinkAdded { common, .. }
             | Event::IssueRemoved { common }
             | Event::FullResync { common, .. }
-            | Event::PullCompleted { common, .. } => common,
+            | Event::PullCompleted { common, .. }
+            | Event::PullFailed { common, .. } => common,
         }
     }
 }
@@ -306,6 +345,7 @@ mod tests {
             Event::IssueRemoved { common: common("e") },
             Event::FullResync { common: common("f"), issues: 3, removed: 1, through: None },
             Event::PullCompleted { common: common("g"), through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },
+            Event::PullFailed { common: common("h"), code: FailureCode::Provider },
         ];
         for event in events {
             let line = serde_json::to_string(&event).unwrap();
@@ -387,6 +427,17 @@ mod tests {
             edit(&mut changed);
             assert_ne!(changed.structure_digest().unwrap(), base, "edit {i}");
         }
+    }
+
+    #[test]
+    fn failure_codes_serialize_as_their_closed_names() {
+        for code in [
+            FailureCode::Credential, FailureCode::UnsupportedProvider, FailureCode::LockBusy, FailureCode::LogRead,
+            FailureCode::LogWrite, FailureCode::Provider,
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(code.as_str()));
+        }
+        assert_eq!(crate::tracker::lock::LOCK_BUSY, FailureCode::LockBusy.as_str());
     }
 
     #[test]

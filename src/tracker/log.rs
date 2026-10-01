@@ -35,6 +35,8 @@ pub struct LogSummary {
     pub open_issues: BTreeMap<String, OpenIssue>,
     pub event_count: usize,
     pub unreadable_lines: usize,
+    /// When the latest pull_failed marker was written, and its code.
+    pub last_failure: Option<(DateTime<Utc>, crate::tracker::events::FailureCode)>,
 }
 
 impl LogSummary {
@@ -51,6 +53,7 @@ impl LogSummary {
                 self.mark_pull(common.occurred_at, *through);
             }
             Event::PullCompleted { through, .. } => self.mark_pull(common.occurred_at, *through),
+            Event::PullFailed { code, .. } => self.last_failure = Some((common.occurred_at, *code)),
             Event::IssueUpserted { issue, .. } => {
                 self.open_issues.insert(common.external_key.clone(), OpenIssue {
                     external_id: common.external_id.clone(),
@@ -135,7 +138,8 @@ fn common_mut(event: &mut Event) -> &mut crate::tracker::events::Common {
         | Event::LinkAdded { common, .. }
         | Event::IssueRemoved { common }
         | Event::FullResync { common, .. }
-        | Event::PullCompleted { common, .. } => common,
+        | Event::PullCompleted { common, .. }
+        | Event::PullFailed { common, .. } => common,
     }
 }
 
