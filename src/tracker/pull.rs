@@ -791,6 +791,48 @@ mod tests {
         assert_eq!(log::read(&log::path_for(vault.path(), "work", "claims")).unwrap().open_issues.len(), 3);
     }
 
+    /// Three issues pulled, then removed by an allowed empty full pull.
+    fn removed_three(vault: &Path) {
+        let three = fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
+        pull_project(vault, &binding(), &three, true, at(10)).unwrap();
+        let removed = pull_project_waiting(vault, &binding(), &fake(vec![]), Mode::FullAllowEmpty, at(11), Duration::ZERO).unwrap();
+        assert_eq!(removed.removed, 3);
+        assert!(log::read(&log::path_for(vault, "work", "claims")).unwrap().open_issues.is_empty());
+    }
+
+    fn restored_ids(vault: &Path) -> Vec<String> {
+        let content = kinds(vault);
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+            .map(|event| event.common().id.clone())
+            .filter(|id| id.contains(":restored:"))
+            .collect()
+    }
+
+    #[test]
+    fn a_removed_issue_that_returns_reappears_once() {
+        for mode in [Mode::Incremental, Mode::Full] {
+            let vault = tempfile::tempdir().unwrap();
+            removed_three(vault.path());
+            let back = || fake(vec![snapshot("COR-1", 9), snapshot("COR-2", 9), snapshot("COR-3", 9)]);
+
+            let outcome = pull_project_waiting(vault.path(), &binding(), &back(), mode, at(12), Duration::ZERO).unwrap();
+            assert_eq!((outcome.appended, outcome.removed), (3, 0), "{mode:?}");
+            let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+            assert_eq!(summary.open_issues.keys().collect::<Vec<_>>(), vec!["COR-1", "COR-2", "COR-3"], "{mode:?}");
+            let ids = restored_ids(vault.path());
+            assert_eq!(ids.len(), 3, "{mode:?}");
+            assert!(ids.contains(&format!("linear:issue:COR-1:9:restored:{}", at(11).to_rfc3339())), "{ids:?}");
+
+            for again in [Mode::Incremental, Mode::Full] {
+                let outcome = pull_project_waiting(vault.path(), &binding(), &back(), again, at(13), Duration::ZERO).unwrap();
+                assert_eq!((outcome.appended, outcome.removed), (0, 0), "{mode:?} then {again:?}");
+            }
+            assert_eq!(restored_ids(vault.path()).len(), 3);
+        }
+    }
+
     #[test]
     fn unsupported_provider_is_rejected() {
         let mut b = binding();

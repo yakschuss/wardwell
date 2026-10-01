@@ -398,7 +398,9 @@ full pull a day. A full pull that returns no issues while the mirror holds
 open ones removes nothing: it fails with `empty_full_result`, since a renamed
 team key or a token that lost access looks the same as an emptied tracker.
 Only `--full --allow-empty` accepts an empty result; the automatic full pull
-never does. `status` reads the last pull
+never does. An issue that was removed and then comes back reappears: its
+snapshot is appended even though its id is in the log, under the id
+suffixed `:restored:<removal time>`. `status` reads the last pull
 time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 

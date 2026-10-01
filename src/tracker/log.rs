@@ -34,6 +34,8 @@ pub struct LogSummary {
     pub last_full_resync_at: Option<DateTime<Utc>>,
     pub event_ids: HashSet<String>,
     pub open_issues: BTreeMap<String, OpenIssue>,
+    /// Keys whose latest issue event is `issue_removed`, with its time.
+    pub removed_at: BTreeMap<String, DateTime<Utc>>,
     pub event_count: usize,
     pub unreadable_lines: usize,
     /// When the latest pull_failed marker was written, and its code.
@@ -48,6 +50,7 @@ impl LogSummary {
         match event {
             Event::IssueRemoved { .. } => {
                 self.open_issues.remove(&common.external_key);
+                self.removed_at.insert(common.external_key.clone(), common.occurred_at);
             }
             Event::FullResync { through, .. } => {
                 self.last_full_resync_at = later(self.last_full_resync_at, common.occurred_at);
@@ -56,6 +59,7 @@ impl LogSummary {
             Event::PullCompleted { through, .. } => self.mark_pull(common.occurred_at, *through),
             Event::PullFailed { code, .. } => self.last_failure = Some((common.occurred_at, *code)),
             Event::IssueUpserted { issue, .. } => {
+                self.removed_at.remove(&common.external_key);
                 self.open_issues.insert(common.external_key.clone(), OpenIssue {
                     external_id: common.external_id.clone(),
                     issue_title: issue.issue_title.clone(),
@@ -103,16 +107,20 @@ pub fn read(path: &Path) -> Result<LogSummary, String> {
 }
 
 /// Append events whose id is not already in `summary`, in order, and fold
-/// them into `summary`. Each event's raw payload goes to the sidecar first,
-/// then its light row to the log. Returns how many were written.
+/// them into `summary`. A snapshot of a removed issue is appended even when
+/// its id is known, under a restored id, so the issue reappears. Each
+/// event's raw payload goes to the sidecar first, then its light row to the
+/// log. Returns how many were written.
 pub fn append_new(path: &Path, events: &[Event], summary: &mut LogSummary) -> Result<usize, String> {
     let raw_path = raw_path_for(path);
     let mut written = 0;
     for event in events {
-        if summary.event_ids.contains(&event.common().id) {
-            continue;
-        }
-        let (light, raw) = split_raw(event.clone());
+        let event = match (summary.event_ids.contains(&event.common().id), restored(event, summary)) {
+            (false, _) => event.clone(),
+            (true, Some(restored)) if !summary.event_ids.contains(&restored.common().id) => restored,
+            (true, _) => continue,
+        };
+        let (light, raw) = split_raw(event);
         if !raw.is_null() {
             append_raw(&raw_path, &light.common().id, raw)?;
         }
@@ -122,6 +130,19 @@ pub fn append_new(path: &Path, events: &[Event], summary: &mut LogSummary) -> Re
         written += 1;
     }
     Ok(written)
+}
+
+/// A snapshot of an issue whose latest event is `issue_removed`, with its
+/// id suffixed `:restored:<removal time>` so it is unique. None otherwise.
+fn restored(event: &Event, summary: &LogSummary) -> Option<Event> {
+    let Event::IssueUpserted { common, .. } = event else {
+        return None;
+    };
+    let removed = summary.removed_at.get(&common.external_key)?;
+    let mut restored = event.clone();
+    let id = format!("{}:restored:{}", common.id, removed.to_rfc3339());
+    common_mut(&mut restored).id = id;
+    Some(restored)
 }
 
 /// The event without its raw payload, and the payload.
