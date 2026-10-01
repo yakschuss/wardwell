@@ -129,7 +129,32 @@ struct RawConfig {
     #[serde(default)]
     trackers: HashMap<String, RawTrackerBinding>,
     #[serde(default)]
-    projects: BTreeMap<String, serde_yaml::Value>,
+    projects: ProjectEntries,
+}
+
+/// The `projects:` entries in file order, duplicates kept so they can be
+/// refused by name instead of silently overwritten.
+#[derive(Debug, Default)]
+struct ProjectEntries(Vec<(String, serde_yaml::Value)>);
+
+impl<'de> Deserialize<'de> for ProjectEntries {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = ProjectEntries;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a mapping of <domain>/<project> to its paths")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<ProjectEntries, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry::<String, serde_yaml::Value>()? {
+                    entries.push(entry);
+                }
+                Ok(ProjectEntries(entries))
+            }
+        }
+        deserializer.deserialize_map(Entries)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,19 +313,27 @@ pub fn parse(contents: &str) -> Result<WardwellConfig, ConfigError> {
     })
 }
 
-fn project_mappings(
-    raw: BTreeMap<String, serde_yaml::Value>,
-) -> Result<BTreeMap<String, ProjectMapping>, ConfigError> {
+fn project_mappings(raw: ProjectEntries) -> Result<BTreeMap<String, ProjectMapping>, ConfigError> {
     let invalid = |key: &str, reason: String| ConfigError::InvalidProjectMapping { key: key.to_string(), reason };
-    let mut mappings = BTreeMap::new();
-    for (key, value) in raw {
+    let mut mappings: BTreeMap<String, ProjectMapping> = BTreeMap::new();
+    let mut owners: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for (key, value) in raw.0 {
+        if mappings.contains_key(&key) {
+            return Err(invalid(&key, "the key appears twice under `projects`; merge its paths into one entry".into()));
+        }
         let (domain, project) = split_project_key(&key).map_err(|_| invalid(&key, "key must be <domain>/<project>".into()))?;
         let entry: RawProjectEntry = serde_yaml::from_value(value)
             .map_err(|e| invalid(&key, format!("{e}; a project takes only `paths`")))?;
         if entry.paths.is_empty() {
             return Err(invalid(&key, "`paths` needs at least one path".into()));
         }
-        let paths = entry.paths.iter().map(|p| project_path(&key, p)).collect::<Result<_, _>>()?;
+        let paths: Vec<PathBuf> = entry.paths.iter().map(|p| project_path(&key, p)).collect::<Result<_, _>>()?;
+        for path in &paths {
+            if let Some(owner) = owners.insert(path.clone(), key.clone()) {
+                let place = if owner == key { "twice in this entry".to_string() } else { format!("under both {owner} and {key}") };
+                return Err(invalid(&key, format!("path {} is listed {place}; keep it under one project", path.display())));
+            }
+        }
         mappings.insert(key, ProjectMapping { domain, project, paths });
     }
     Ok(mappings)
@@ -370,13 +403,18 @@ fn reject_prefix_collisions(
     Ok(())
 }
 
+/// The domain and project of a `<domain>/<project>` key, or None when it
+/// has another number of segments, an empty segment, or a `.` or `..`.
+pub fn project_key_parts(key: &str) -> Option<(&str, &str)> {
+    let (domain, project) = key.split_once('/')?;
+    let ok = |s: &str| !s.is_empty() && s != "." && s != ".." && !s.contains('/');
+    (ok(domain) && ok(project)).then_some((domain, project))
+}
+
 fn split_project_key(key: &str) -> Result<(String, String), ConfigError> {
-    let parts: Vec<&str> = key.split('/').collect();
-    match parts.as_slice() {
-        [domain, project] if !domain.is_empty() && !project.is_empty() => {
-            Ok(((*domain).to_string(), (*project).to_string()))
-        }
-        _ => Err(ConfigError::InvalidTrackerBinding {
+    match project_key_parts(key) {
+        Some((domain, project)) => Ok((domain.to_string(), project.to_string())),
+        None => Err(ConfigError::InvalidTrackerBinding {
             key: key.to_string(),
             reason: "key must be <domain>/<project>".to_string(),
         }),
@@ -672,6 +710,32 @@ trackers:
             let f = write_config(&format!("vault_path: /tmp/v\nsession_sources: []\n{yaml}")).unwrap();
             let error = load(Some(f.path())).err().expect("rejected").to_string();
             assert!(error.contains(needle), "{error}");
+        }
+    }
+
+    #[test]
+    fn projects_reject_one_path_under_two_projects_naming_both() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/a:\n    paths: [/srv/code]\n  work/b:\n    paths: [/srv/code/]\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("shared path").to_string();
+        assert!(error.contains("work/a") && error.contains("work/b") && error.contains("/srv/code"), "{error}");
+    }
+
+    #[test]
+    fn projects_reject_a_duplicate_key_by_name() {
+        let yaml = "vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/a:\n    paths: [/srv/one]\n  work/a:\n    paths: [/srv/two]\n";
+        let f = write_config(yaml).unwrap();
+        let error = load(Some(f.path())).err().expect("duplicate key").to_string();
+        assert!(error.contains("work/a") && error.contains("twice"), "{error}");
+    }
+
+    #[test]
+    fn projects_reject_dot_and_empty_segments() {
+        for key in ["work/..", "../work", "./a", "work/.", "/a", "a/", "a//b"] {
+            let yaml = format!("vault_path: /tmp/v\nsession_sources: []\nprojects:\n  \"{key}\":\n    paths: [/srv/x]\n");
+            let f = write_config(&yaml).unwrap();
+            let error = load(Some(f.path())).err().unwrap_or_else(|| panic!("{key} accepted")).to_string();
+            assert!(error.contains("<domain>/<project>"), "{key}: {error}");
         }
     }
 }

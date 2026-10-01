@@ -155,10 +155,7 @@ fn subfolders(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn require_vault_folder(config: &WardwellConfig, key: &str) -> Result<(), String> {
-    let (domain, project) = key
-        .split_once('/')
-        .filter(|(d, p)| !d.is_empty() && !p.is_empty() && !p.contains('/'))
-        .ok_or_else(|| format!("{key} is not <domain>/<project>; nothing changed."))?;
+    let (domain, project) = crate::config::loader::project_key_parts(key).ok_or_else(|| format!("{key} is not <domain>/<project>; nothing changed."))?;
     let folder = config.vault_path.join(domain).join(project);
     if !folder.is_dir() {
         return Err(format!("{key} has no folder in the vault at {}. Create it with `wardwell seed {key}`, then link again. Nothing changed.", folder.display()));
@@ -366,5 +363,14 @@ mod tests {
 
     fn link_with_wait(cfg: &Path, request: &LinkRequest, wait: std::time::Duration) -> Result<(), String> {
         link_waiting(cfg, request, |_: &Path| None, || true, &mut Vec::new(), wait)
+    }
+
+    #[test]
+    fn a_key_with_dot_segments_is_refused() {
+        let f = fixture();
+        for key in ["personal/..", "../personal", "personal/corrtex/"] {
+            let error = run(&f, Some(key), &f.code, false, true).unwrap_err();
+            assert!(error.contains("is not <domain>/<project>"), "{key}: {error}");
+        }
     }
 }
