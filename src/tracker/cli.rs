@@ -51,6 +51,11 @@ fn pull_line(key: &str, outcome: &crate::tracker::pull::PullOutcome) -> String {
     format!("{key}: {mode} appended {} events, {} removed", outcome.appended, outcome.removed)
 }
 
+/// Compaction drops the rewritten log's vectors; the watcher re-adds its
+/// text without them.
+const SEARCH_BY_MEANING_RETURNS: &str =
+    "Search by meaning returns for this log after the next `wardwell reindex` or the next server start.";
+
 /// Compact every bound project's log, or only `only`. One line per
 /// project; fails with every project's error if any project failed.
 pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Result<Vec<String>, String> {
@@ -61,7 +66,7 @@ pub fn compact(config: &WardwellConfig, only: Option<&str>, force: bool) -> Resu
         match compact::compact(&path, force, lock::DEFAULT_WAIT) {
             Ok(outcome) if !outcome.changed => lines.push(format!("{key}: already compact, {} events", outcome.events)),
             Ok(outcome) => lines.push(format!(
-                "{key}: compacted to {} events, moved {} raw payloads to {}, removed {} duplicates, backup at {}",
+                "{key}: compacted to {} events, moved {} raw payloads to {}, removed {} duplicates, backup at {}. {SEARCH_BY_MEANING_RETURNS}",
                 outcome.events,
                 outcome.moved_raw,
                 crate::tracker::events::RAW_FILE_NAME,
@@ -298,6 +303,11 @@ mod tests {
         let lines = compact(&config, None, false).unwrap();
         assert!(lines[0].starts_with("work/claims: compacted to 1 events"), "{}", lines[0]);
         assert!(lines[0].contains("removed 1 duplicates"), "{}", lines[0]);
+        assert!(
+            lines[0].ends_with(". Search by meaning returns for this log after the next `wardwell reindex` or the next server start."),
+            "{}",
+            lines[0]
+        );
         assert_eq!(compact(&config, Some("work/claims"), false).unwrap(), vec!["work/claims: already compact, 1 events"]);
         assert!(compact(&config, Some("work/nope"), false).unwrap_err().contains("work/nope"));
         drop(dir);

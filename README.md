@@ -419,7 +419,9 @@ id and that every moved payload reads back from the sidecar, writes the new
 log beside the old one, keeps the old one as `tracker.jsonl.bak`, and renames
 the new one into place. If verification fails, the log is left as it was. The
 backup stays until the next compact, which refuses to run while it exists
-unless given `--force`. A log that is already compact is left alone.
+unless given `--force`. A log that is already compact is left alone. A
+compacted log is searchable by text at once; search by meaning returns for it
+after the next `wardwell reindex` or the next server start.
 
 With `readonly: true`, every kanban MCP action that appends to a file in that
 project's folder or its ticket audit log (create, update, move, note, attach,
