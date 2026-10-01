@@ -356,6 +356,7 @@ Then:
 wardwell tracker pull                          # every bound project
 wardwell tracker pull --project work/claims    # one project
 wardwell tracker pull --full                   # re-pull everything, record removals
+wardwell tracker pull --full --allow-empty     # accept an empty result and remove every issue
 wardwell tracker status                        # every binding: last pull, last error
 wardwell tracker doctor                        # credential, auth, team per binding
 wardwell tracker compact [--project work/claims] [--force]
@@ -393,14 +394,18 @@ every change; a new relation or the archive of an old issue can leave the
 update time alone, so an incremental pull would miss it. A pull therefore runs
 full, and says so in its output line, when the newest `full_resync` marker is
 more than 24 hours old or there is none. With the hourly schedule that is one
-full pull a day. `status` reads the last pull
+full pull a day. A full pull that returns no issues while the mirror holds
+open ones removes nothing: it fails with `empty_full_result`, since a renamed
+team key or a token that lost access looks the same as an emptied tracker.
+Only `--full --allow-empty` accepts an empty result; the automatic full pull
+never does. `status` reads the last pull
 time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 
 One binding that fails does not stop the others. A failure after the log is
 open appends a `pull_failed` marker with a closed `code` and no provider text.
 The codes are `auth` when the provider refuses the token, `provider` for any
-other provider failure, `log_read` and `log_write`. Three failures write
+other provider failure, `empty_full_result`, `log_read` and `log_write`. Three failures write
 nothing to the log: a missing credential is `credential`, an unknown provider
 is `unsupported_provider`, and a held lock is `lock_busy`. `status` lists every
 binding with its last error. It also checks, without a network call, that the

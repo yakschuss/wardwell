@@ -3,7 +3,7 @@
 //! returns or formats a token.
 
 use crate::config::loader::{TrackerBinding, WardwellConfig};
-use crate::tracker::pull::{Connect, pull_binding};
+use crate::tracker::pull::{Connect, Mode, pull_binding};
 use crate::tracker::schedule::{self, LaunchctlRunner};
 use crate::tracker::events::FailureCode;
 use crate::tracker::{compact, credential, lock, log};
@@ -24,7 +24,7 @@ pub fn pull(
     config: &WardwellConfig,
     config_dir: &Path,
     only: Option<&str>,
-    full: bool,
+    mode: Mode,
     now: DateTime<Utc>,
     connect: &Connect<'_>,
 ) -> Result<Vec<String>, String> {
@@ -32,7 +32,7 @@ pub fn pull(
     let mut lines = Vec::new();
     let mut failures = Vec::new();
     for (key, binding) in bindings {
-        match pull_binding(&config.vault_path, config_dir, binding, full, now, connect) {
+        match pull_binding(&config.vault_path, config_dir, binding, mode, now, connect) {
             Ok(outcome) => lines.push(pull_line(key, &outcome)),
             Err(error) => failures.push(format!("{key}: {error}")),
         }
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn pull_rejects_an_unbound_project() {
         let (dir, config) = setup(false);
-        let error = pull(&config, dir.path(), Some("work/nope"), false, now(), &fake_connect).unwrap_err();
+        let error = pull(&config, dir.path(), Some("work/nope"), Mode::Incremental, now(), &fake_connect).unwrap_err();
         assert!(error.contains("work/nope"), "{error}");
     }
 
@@ -252,11 +252,11 @@ mod tests {
     fn pull_reports_each_project_and_fails_when_any_fails() {
         let (dir, config) = setup(false);
         // No credential yet: the project fails and the run reports failure.
-        let error = pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap_err();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap_err();
         assert!(error.contains("work/claims") && error.contains("not configured"), "{error}");
 
         connect(dir.path(), "corr-linear", "t").unwrap();
-        let lines = pull(&config, dir.path(), Some("work/claims"), true, now(), &fake_connect).unwrap();
+        let lines = pull(&config, dir.path(), Some("work/claims"), Mode::Full, now(), &fake_connect).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("work/claims") && lines[0].contains("full"), "{}", lines[0]);
     }
@@ -265,15 +265,15 @@ mod tests {
     fn pull_line_says_when_a_due_full_resync_made_the_pull_full() {
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
-        let first = pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        let first = pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         assert_eq!(first, vec!["work/claims: full pull (no full resync on record, so this pull ran full) appended 0 events, 0 removed"]);
         let soon = now() + chrono::TimeDelta::hours(1);
-        let second = pull(&config, dir.path(), None, false, soon, &fake_connect).unwrap();
+        let second = pull(&config, dir.path(), None, Mode::Incremental, soon, &fake_connect).unwrap();
         assert_eq!(second, vec!["work/claims: incremental pull appended 0 events, 0 removed"]);
         let day_later = soon + crate::tracker::pull::FULL_RESYNC_MAX_AGE;
-        let third = pull(&config, dir.path(), None, false, day_later, &fake_connect).unwrap();
+        let third = pull(&config, dir.path(), None, Mode::Incremental, day_later, &fake_connect).unwrap();
         assert_eq!(third, vec!["work/claims: full pull (last full resync over 24 hours ago, so this pull ran full) appended 0 events, 0 removed"]);
-        let asked = pull(&config, dir.path(), None, true, day_later, &fake_connect).unwrap();
+        let asked = pull(&config, dir.path(), None, Mode::Full, day_later, &fake_connect).unwrap();
         assert_eq!(asked, vec!["work/claims: full pull appended 0 events, 0 removed"]);
     }
 
@@ -281,9 +281,9 @@ mod tests {
     fn status_reads_the_last_pull_from_a_pull_that_found_nothing() {
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
-        pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(5);
-        pull(&config, dir.path(), None, false, later, &fake_connect).unwrap();
+        pull(&config, dir.path(), None, Mode::Incremental, later, &fake_connect).unwrap();
         let line = &status(&config, dir.path(), later, None)[0];
         assert!(line.contains("last pull 2026-09-01T12:05:00Z (0m ago)"), "{line}");
         assert!(line.contains("last full resync 2026-09-01T12:00:00Z"), "the first pull runs full: {line}");
@@ -296,7 +296,7 @@ mod tests {
         assert!(before[0].contains("never pulled"), "{}", before[0]);
 
         connect(dir.path(), "corr-linear", "lin_api_secret").unwrap();
-        pull(&config, dir.path(), None, true, now(), &fake_connect).unwrap();
+        pull(&config, dir.path(), None, Mode::Full, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(90);
         let lines = status(&config, dir.path(), later, None);
         let line = &lines[0];
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn one_failing_binding_does_not_stop_the_others_and_fails_the_run() {
         let (dir, config) = two_bindings();
-        let error = pull(&config, dir.path(), None, false, now(), &claims_breaks).unwrap_err();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &claims_breaks).unwrap_err();
         let lines: Vec<&str> = error.lines().collect();
         assert_eq!(lines.len(), 2, "{error}");
         assert!(lines[0].starts_with("work/ops: full pull (no full resync on record, so this pull ran full) appended"), "{error}");
@@ -376,9 +376,9 @@ mod tests {
     #[test]
     fn status_lists_every_binding_with_its_last_error() {
         let (dir, config) = two_bindings();
-        pull(&config, dir.path(), None, false, now(), &fake_connect).unwrap();
+        pull(&config, dir.path(), None, Mode::Incremental, now(), &fake_connect).unwrap();
         let later = now() + chrono::TimeDelta::minutes(10);
-        pull(&config, dir.path(), None, false, later, &claims_breaks).unwrap_err();
+        pull(&config, dir.path(), None, Mode::Incremental, later, &claims_breaks).unwrap_err();
         let lines = status(&config, dir.path(), later, None);
         assert_eq!(lines.len(), 3, "{lines:?}");
         let claims = lines.iter().find(|l| l.starts_with("work/claims")).unwrap();
@@ -415,7 +415,7 @@ mod tests {
         let revoked = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(Revoked)) };
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
-        let error = pull(&config, dir.path(), None, false, now(), &revoked).unwrap_err();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &revoked).unwrap_err();
         assert!(error.ends_with("(auth)"), "{error}");
         let line = &status(&config, dir.path(), now(), None)[0];
         assert!(line.ends_with("last error auth at 2026-09-01T12:00:00Z"), "{line}");

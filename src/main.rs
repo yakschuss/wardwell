@@ -82,6 +82,9 @@ enum TrackerCommand {
         /// Re-pull every issue and record removals
         #[arg(long)]
         full: bool,
+        /// With --full, accept an empty result and remove every open issue
+        #[arg(long, requires = "full")]
+        allow_empty: bool,
     },
     /// Show last pull, last full resync, event count and readonly flag per project
     Status,
@@ -205,10 +208,16 @@ fn run_tracker(command: TrackerCommand) -> Result<(), Box<dyn std::error::Error>
             let token = String::from_utf8(bytes).map_err(|_| "Tracker token must be UTF-8")?;
             vec![cli::connect(&config_dir, &name, &token)?]
         }
-        TrackerCommand::Pull { project, full } => {
+        TrackerCommand::Pull { project, full, allow_empty } => {
+            use wardwell::tracker::pull::Mode;
             let config = wardwell::config::loader::load(None)?;
             let now = chrono::Utc::now();
-            cli::pull(&config, &config_dir, project.as_deref(), full, now, &connect_provider)?
+            let mode = match (full, allow_empty) {
+                (false, _) => Mode::Incremental,
+                (true, false) => Mode::Full,
+                (true, true) => Mode::FullAllowEmpty,
+            };
+            cli::pull(&config, &config_dir, project.as_deref(), mode, now, &connect_provider)?
         }
         TrackerCommand::Status => {
             let config = wardwell::config::loader::load(None)?;
@@ -975,4 +984,20 @@ fn run_migrate_attachments() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_empty_needs_full() {
+        assert!(Cli::try_parse_from(["wardwell", "tracker", "pull", "--allow-empty"]).is_err());
+        let cli = Cli::try_parse_from(["wardwell", "tracker", "pull", "--full", "--allow-empty"]).unwrap();
+        let Commands::Tracker { command: TrackerCommand::Pull { full, allow_empty, .. } } = cli.command else {
+            panic!("tracker pull");
+        };
+        assert!(full && allow_empty);
+    }
 }

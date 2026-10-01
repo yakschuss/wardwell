@@ -124,6 +124,8 @@ pub enum FailureCode {
     Auth,
     /// The bound team or project key does not exist at the provider.
     TeamNotFound,
+    /// A full pull returned no issues while the mirror held open ones.
+    EmptyFullResult,
 }
 
 impl FailureCode {
@@ -138,6 +140,7 @@ impl FailureCode {
             Self::Provider => "provider",
             Self::Auth => "auth",
             Self::TeamNotFound => "team_not_found",
+            Self::EmptyFullResult => "empty_full_result",
         }
     }
 }
