@@ -418,10 +418,13 @@ cheap request, and whether the team key resolves. A failure names one code:
 of record. It moves inline `raw` into the sidecar and removes exact duplicate
 events. It takes a per-project lock file, `tracker.lock`, that `pull` also
 takes. A pull that finds the lock held waits up to 30 seconds, then fails with
-`lock_busy`. It writes the sidecar first, verifies that one event remains per
-id and that every moved payload reads back from the sidecar, writes the new
-log beside the old one, keeps the old one as `tracker.jsonl.bak`, and renames
-the new one into place. If verification fails, the log is left as it was. The
+`lock_busy`. Before it writes anything it refuses a log in which two rows
+share an id but differ; it names the id, `--force` does not override it, and
+the two rows must be resolved by hand. It then writes the sidecar, verifies
+that every moved payload reads back from it, writes the new log beside the old
+one, links the old one to `tracker.jsonl.bak.new`, renames the new log into
+place, and only then renames `.bak.new` over `tracker.jsonl.bak`. If any step
+fails, the log and the previous backup are left as they were. The
 backup stays until the next compact, which refuses to run while it exists
 unless given `--force`. A log that is already compact is left alone. A
 compacted log is searchable by text at once; search by meaning returns for it

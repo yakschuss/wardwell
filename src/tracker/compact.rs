@@ -3,16 +3,17 @@
 //!
 //! The only code that rewrites a tracker log, and only `tracker.jsonl`: the
 //! log is a re-pullable mirror, not a system of record. Under the project
-//! lock it writes the sidecar first, verifies, writes the new log beside the
-//! old one, links the old one to `tracker.jsonl.bak.new`, renames the new
-//! log into place, then renames `.bak.new` over `tracker.jsonl.bak`.
+//! lock it refuses rows that share an id but differ, writes the sidecar,
+//! verifies, writes the new log beside the old one, links the old one to
+//! `tracker.jsonl.bak.new`, renames the new log into place, then renames
+//! `.bak.new` over `tracker.jsonl.bak`.
 //! Does NOT pull, and does NOT touch any other vault file.
 
 use crate::kanban::jsonl::retry_transient;
 use crate::tracker::events::Event;
 use crate::tracker::{lock, log};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -57,6 +58,7 @@ fn compact_with(log_path: &Path, force: bool, wait: Duration, rename: &Rename<'_
     };
     let raw_path = log::raw_path_for(log_path);
     let plan = Plan::build(&original, &log::read_raw(&raw_path)?)?;
+    plan.refuse_conflicts(log_path)?;
     if plan.content == original {
         return Ok(unchanged(plan.events));
     }
@@ -89,7 +91,8 @@ fn unchanged(events: usize) -> CompactOutcome {
 struct Plan {
     content: String,
     events: usize,
-    unique_ids: usize,
+    /// The first id, in file order, carried by rows that differ.
+    conflict: Option<String>,
     duplicates: usize,
     /// Every inline payload, by event id, that must be readable afterwards.
     inline_raw: HashMap<String, Value>,
@@ -102,25 +105,26 @@ impl Plan {
         let mut plan = Plan {
             content: String::new(),
             events: 0,
-            unique_ids: 0,
+            conflict: None,
             duplicates: 0,
             inline_raw: HashMap::new(),
             to_move: Vec::new(),
         };
         let mut kept: HashMap<String, Vec<(Value, Value)>> = HashMap::new();
-        let mut ids: HashSet<String> = HashSet::new();
         for line in original.lines() {
             let Some((id, light, inline)) = parse_row(line) else {
                 // Headers, blank and unreadable lines are kept as they are.
                 plan.push_line(line);
                 continue;
             };
-            ids.insert(id.clone());
             let raw = inline.clone().unwrap_or(Value::Null);
             let same_id = kept.entry(id.clone()).or_default();
             if same_id.iter().any(|(l, r)| *l == light && *r == raw) {
                 plan.duplicates += 1;
                 continue;
+            }
+            if !same_id.is_empty() && plan.conflict.is_none() {
+                plan.conflict = Some(id.clone());
             }
             same_id.push((light.clone(), raw));
             match inline {
@@ -134,7 +138,6 @@ impl Plan {
             }
             plan.events += 1;
         }
-        plan.unique_ids = ids.len();
         Ok(plan)
     }
 
@@ -153,15 +156,21 @@ impl Plan {
         self.inline_raw.insert(id.to_string(), raw);
     }
 
-    /// One event per id after dedup, and every inline payload readable from
-    /// the sidecar by its event id with the same content.
-    fn verify(&self, sidecar: &HashMap<String, Value>) -> Result<(), String> {
-        if self.events != self.unique_ids {
-            return Err(format!(
-                "compact stopped: {} events remain for {} ids; rows that share an id differ, so the log is left as it was",
-                self.events, self.unique_ids
-            ));
+    /// Rows that share an id but differ cannot be deduplicated safely.
+    /// Checked before anything is written; `--force` does not override it.
+    fn refuse_conflicts(&self, log_path: &Path) -> Result<(), String> {
+        match &self.conflict {
+            None => Ok(()),
+            Some(id) => Err(format!(
+                "compact stopped: rows with id {id} differ; resolve them by hand in {}, --force does not override this; the log is left as it was",
+                log_path.display()
+            )),
         }
+    }
+
+    /// Every inline payload readable from the sidecar by its event id with
+    /// the same content.
+    fn verify(&self, sidecar: &HashMap<String, Value>) -> Result<(), String> {
         let unreadable = self.inline_raw.iter().filter(|(id, raw)| sidecar.get(*id) != Some(*raw)).count();
         match unreadable {
             0 => Ok(()),
@@ -349,6 +358,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
         assert!(!backup_path_for(&path).exists());
         assert!(!dir.path().join("work/claims/tracker.jsonl.compact").exists());
+    }
+
+    #[test]
+    fn rows_that_share_an_id_but_differ_stop_before_any_write_even_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = log::path_for(dir.path(), "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = [
+            SCHEMA_HEADER.to_string(),
+            row("e2", "COR-2", json!({"v": 3})),
+            row("e1", "COR-1", json!({"v": 1})),
+            row("e1", "COR-1", json!({"v": 2})),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, &original).unwrap();
+        for force in [false, true] {
+            let error = compact(&path, force, Duration::ZERO).unwrap_err();
+            assert!(error.contains("e1"), "names the id: {error}");
+            assert!(!error.contains("e2"), "{error}");
+            assert!(error.contains("by hand"), "{error}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(!log::raw_path_for(&path).exists(), "nothing written to the sidecar");
+            assert!(!backup_path_for(&path).exists());
+            assert!(leftovers(&path).is_empty());
+        }
     }
 
     #[test]
