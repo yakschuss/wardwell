@@ -178,7 +178,9 @@ wardwell reindex              Rebuild the vault search index from scratch
 wardwell seed <path>          Create domain or project folders
 wardwell tracker connect <name> --token-stdin   Store a tracker API token
 wardwell tracker pull [--project <d/p>] [--full] Mirror tracker events into the vault
-wardwell tracker status       Last pull, last full resync, event count per project
+wardwell tracker status       Last pull, last error, last full resync, event count per project
+wardwell tracker doctor       Check each binding's credential, auth and team
+wardwell tracker compact [--project <d/p>] [--force]   Move raw payloads to the sidecar, drop duplicates
 ```
 
 ### wardwell init
@@ -318,8 +320,8 @@ exclude:
 
 ## Tracker mirror
 
-Wardwell can mirror an external issue tracker into the vault as a read-only,
-append-only event log. Each bound project gets `<domain>/<project>/tracker.jsonl`
+Wardwell can mirror an external issue tracker into the vault as a read-only
+event log that pulls only append to. Each bound project gets `<domain>/<project>/tracker.jsonl`
 (header `{"_schema":"tracker","_version":"1.0"}`), indexed like any other JSONL,
 so `wardwell_search` finds tracker history. A ticket key in a query, such as
 `COR-12` or `COR-12 OR COR-13`, is matched as a key. Linear is the first
@@ -359,10 +361,10 @@ wardwell tracker doctor                        # credential, auth, team per bind
 wardwell tracker compact [--project work/claims] [--force]
 ```
 
-Each event carries `kind` (`issue_upserted`, `comment_upserted`, `state_changed`,
-`link_added`, `issue_removed`, `full_resync`, `pull_completed`, `pull_failed`),
-`provider`, `external_key` (e.g. `COR-12`), `external_id`, `actor`,
-`occurred_at`, and a readable `title`. An `issue_upserted` snapshot holds the
+Each event carries `kind`, which is one of `issue_upserted`, `comment_upserted`,
+`state_changed`, `link_added`, `issue_removed`, `full_resync`, `pull_completed`
+or `pull_failed`. It also carries `provider`, `external_key` such as `COR-12`,
+`external_id`, `actor`, `occurred_at`, and a readable `title`. An `issue_upserted` snapshot holds the
 issue's fields in provider-neutral names: `issue_title`, `description`,
 `state`, `state_category`, `priority`, `team`, `project`, `assignee`,
 `creator`, `labels`, `url`, `created_at`, `archived_at`, `parent_key`,
@@ -391,22 +393,22 @@ time from the latest marker. The mirror is not authoritative; if the
 tracker goes away, the log stays as a searchable archive.
 
 One binding that fails does not stop the others. A failure after the log is
-open appends a `pull_failed` marker with a closed `code` (`provider`,
-`log_read`, `log_write`) and no provider text. A missing credential
-(`credential`), an unknown provider (`unsupported_provider`) or a held lock
-(`lock_busy`) fails without writing to the log. `status` lists every binding with its
-last error, and `pull` exits non-zero when any binding failed.
+open appends a `pull_failed` marker with a closed `code` and no provider text.
+The codes are `provider`, `log_read` and `log_write`. Three failures write
+nothing to the log: a missing credential is `credential`, an unknown provider
+is `unsupported_provider`, and a held lock is `lock_busy`. `status` lists every
+binding with its last error. `pull` exits non-zero when any binding failed.
 
 `doctor` prints three lines per binding: whether the credential file exists
 with owner-only permissions, whether the provider accepts the token on one
-cheap request, and whether the team key resolves. A failure names a code
-(`credential`, `auth`, `provider`, `team_not_found`). It never prints a token.
+cheap request, and whether the team key resolves. A failure names one code:
+`credential`, `auth`, `provider` or `team_not_found`. It never prints a token.
 
 `compact` is the only command that rewrites a tracker log, and only
 `tracker.jsonl`; it may because the log is a re-pullable mirror, not a system
 of record. It moves inline `raw` into the sidecar and removes exact duplicate
-events. It takes a per-project lock (`tracker.lock`) that `pull` also takes; a
-pull that finds the lock held waits up to 30 seconds, then fails with
+events. It takes a per-project lock file, `tracker.lock`, that `pull` also
+takes. A pull that finds the lock held waits up to 30 seconds, then fails with
 `lock_busy`. It writes the sidecar first, verifies that one event remains per
 id and that every moved payload reads back from the sidecar, writes the new
 log beside the old one, keeps the old one as `tracker.jsonl.bak`, and renames
