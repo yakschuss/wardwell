@@ -180,8 +180,9 @@ pub fn reconcile(original: &Node, edited: &Value) -> Node {
     match (original, edited) {
         (Node::Object(entries), Value::Object(map)) => {
             let mut out = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for (raw, key, node) in entries {
-                if out.iter().any(|(_, seen, _): &(String, String, Node)| seen == key) {
+                if !seen.insert(key.as_str()) {
                     continue;
                 }
                 if let Some(value) = map.get(key) {
@@ -189,7 +190,7 @@ pub fn reconcile(original: &Node, edited: &Value) -> Node {
                 }
             }
             for (key, value) in map {
-                if !entries.iter().any(|(_, seen, _)| seen == key) {
+                if !seen.contains(key.as_str()) {
                     out.push((serde_json::to_string(key).unwrap_or_default(), key.clone(), from_value(value)));
                 }
             }
@@ -208,15 +209,24 @@ pub fn reconcile(original: &Node, edited: &Value) -> Node {
 /// changed element never takes the text of a removed one.
 fn reconcile_list(items: &[Node], values: &[Value]) -> Node {
     let originals: Vec<Value> = items.iter().map(to_value).collect();
+    // Equal elements are found through their canonical text (serde_json
+    // sorts object keys), each in the order it appears: linear, not quadratic.
+    let mut by_text: std::collections::HashMap<String, std::collections::VecDeque<usize>> = std::collections::HashMap::new();
+    for (j, original) in originals.iter().enumerate() {
+        by_text.entry(original.to_string()).or_default().push_back(j);
+    }
     let mut used = vec![false; items.len()];
     let mut slots: Vec<Option<usize>> = values
         .iter()
         .map(|value| {
-            let j = (0..items.len()).find(|&j| !used[j] && originals[j] == *value)?;
+            let j = by_text.get_mut(&value.to_string())?.pop_front()?;
             used[j] = true;
             Some(j)
         })
         .collect();
+    let unmatched = slots.iter().filter(|slot| slot.is_none()).count();
+    let unused = used.iter().filter(|u| !**u).count();
+    let search = unmatched.saturating_mul(unused) <= SIMILARITY_BUDGET;
     let same_length = items.len() == values.len();
     for (index, value) in values.iter().enumerate() {
         if slots[index].is_some() || !value.is_object() {
@@ -224,7 +234,8 @@ fn reconcile_list(items: &[Node], values: &[Value]) -> Node {
         }
         let pick = match same_length {
             true => (!used[index] && originals[index].is_object()).then_some(index),
-            false => most_similar(&originals, &used, value),
+            false if search => most_similar(&originals, &used, value),
+            false => None,
         };
         if let Some(j) = pick {
             used[j] = true;
@@ -243,6 +254,10 @@ fn reconcile_list(items: &[Node], values: &[Value]) -> Node {
             .collect(),
     )
 }
+
+/// Most pairs the similarity search compares; past it, edited elements get
+/// fresh text. Settings files are far below it.
+const SIMILARITY_BUDGET: usize = 10_000;
 
 /// The unused original object sharing the most equal entries with `value`.
 fn most_similar(originals: &[Value], used: &[bool], value: &Value) -> Option<usize> {
@@ -330,6 +345,24 @@ mod tests {
         let doc = parse(text).unwrap();
         let reconciled = reconcile(&doc, &json!([{"k": 1}, {"k": 3}]));
         assert_eq!(to_value(&reconciled), json!([{"k": 1}, {"k": 3}]));
+    }
+
+    #[test]
+    fn forty_thousand_identical_entries_reconcile_quickly() {
+        let n = 40_000;
+        let text = format!("{{\"list\": [{}], \"keys\": {{{}}}}}", vec!["{\"a\": 1e0}"; n].join(", "),
+            (0..n).map(|i| format!("\"k{i}\": {i}")).collect::<Vec<_>>().join(", "));
+        let doc = parse(&text).unwrap();
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value["list"].as_array_mut().unwrap().push(json!({"a": 2}));
+        value["list"].as_array_mut().unwrap().remove(0);
+        value["keys"]["new"] = json!(true);
+        let started = std::time::Instant::now();
+        let out = reconcile(&doc, &value);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(to_value(&out), value);
+        assert!(render(&out).contains("\"a\": 1e0"));
     }
 
     #[test]
