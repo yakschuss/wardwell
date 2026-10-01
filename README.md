@@ -479,10 +479,15 @@ true when a pull completed, and `refresh_reason`: `found_after_pull`,
 incremental pull with no cursor would read the whole team. Run `wardwell
 tracker pull` first. `list`, `query` and `search` never pull.
 
-At session start, `wardwell inject` prints a rot line for each project
-folder in the matched domain. It reads like this: Last history entry 12 days
-ago. Last decision 3 days ago. A bound project also gets a tracker section.
-Its first line is "Tracker mirror. Last pulled 2 hours ago. Not
+At session start, `wardwell inject` prints what it printed before: the
+domain's `current_state.md` when it has one, else a summary of each project
+that has its own. Under each project summary it adds one rot line. It reads
+like this: Last history entry 12 days ago. Last decision 3 days ago. The
+history age comes from the last entry at the end of `history.jsonl`. A bound
+project also gets a tracker section. When the domain's own state file is
+printed, only the bound projects follow it, each under its own header.
+Folders that are hidden or start with an underscore get no added lines. The
+section's first line is "Tracker mirror. Last pulled 2 hours ago. Not
 authoritative." Up to ten issues in a started state follow, each with key,
 title and state. When the last pull failed or is more than 24 hours old, the
 section shows only the age and that notice.

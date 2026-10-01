@@ -16,15 +16,17 @@ pub const STALE_AFTER: TimeDelta = TimeDelta::hours(24);
 /// At most this many started issues in the tracker section.
 pub const MAX_STARTED: usize = 10;
 
-/// The rot line and, when the project is bound, the tracker section.
-pub fn project_lines(config: &WardwellConfig, domain: &str, project_dir: &Path, now: DateTime<Utc>, today: NaiveDate) -> Vec<String> {
-    let mut lines = vec![rot_line(last_history_date(project_dir), last_decision_date(project_dir), today)];
+/// The rot line for a project folder.
+pub fn project_rot_line(project_dir: &Path, today: NaiveDate) -> String {
+    rot_line(last_history_date(project_dir), last_decision_date(project_dir), today)
+}
+
+/// The tracker section for a project folder, or None when it is not bound.
+pub fn project_tracker_lines(config: &WardwellConfig, domain: &str, project_dir: &Path, now: DateTime<Utc>) -> Option<Vec<String>> {
     let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    if config.tracker_for(domain, project).is_some() {
-        let view = MirrorView::read(&project_dir.join(crate::tracker::events::FILE_NAME)).unwrap_or_default();
-        lines.extend(tracker_section(&view, now));
-    }
-    lines
+    config.tracker_for(domain, project)?;
+    let view = MirrorView::read(&project_dir.join(crate::tracker::events::FILE_NAME)).unwrap_or_default();
+    Some(tracker_section(&view, now))
 }
 
 /// `Last history entry 12 days ago. Last decision 3 days ago.`
@@ -68,14 +70,35 @@ pub fn tracker_section(view: &MirrorView, now: DateTime<Utc>) -> Vec<String> {
     lines
 }
 
-/// Local date of the newest `date` in `history.jsonl`.
+/// Local date of the last entry in `history.jsonl`, read from the file's
+/// tail: the last line with a `date`. The window grows only when the tail
+/// holds no such line.
 pub fn last_history_date(project_dir: &Path) -> Option<NaiveDate> {
-    let content = std::fs::read_to_string(project_dir.join("history.jsonl")).ok()?;
-    content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter_map(|entry| entry.get("date").and_then(|d| d.as_str()).and_then(local_date))
-        .max()
+    use std::io::{Read, Seek, SeekFrom};
+    const FIRST_WINDOW: u64 = 64 * 1024;
+    const MAX_WINDOW: u64 = 4 * 1024 * 1024;
+    let mut file = std::fs::File::open(project_dir.join("history.jsonl")).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut window = FIRST_WINDOW;
+    loop {
+        let start = len.saturating_sub(window);
+        let mut tail = Vec::new();
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_to_end(&mut tail).ok()?;
+        let text = String::from_utf8_lossy(&tail);
+        // A window that starts mid-file may begin mid-line; drop that piece.
+        let whole = text.lines().skip(usize::from(start > 0));
+        let found = whole.collect::<Vec<_>>().into_iter().rev().find_map(entry_date);
+        if found.is_some() || start == 0 || window >= MAX_WINDOW {
+            return found;
+        }
+        window *= 4;
+    }
+}
+
+fn entry_date(line: &str) -> Option<NaiveDate> {
+    let entry = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    entry.get("date").and_then(|d| d.as_str()).and_then(local_date)
 }
 
 /// Newest `## YYYY-MM-DD` heading date in `decisions.md`.
@@ -189,11 +212,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("history.jsonl"),
-            "{\"_schema\":\"history\"}\n{\"date\":\"2026-09-20\",\"title\":\"a\"}\n{\"date\":\"2026-09-18T15:00:00+00:00\",\"title\":\"b\"}\nnot json\n",
+            "{\"_schema\":\"history\"}\n{\"date\":\"2026-09-20\",\"title\":\"a\"}\n{\"date\":\"2026-09-18\",\"title\":\"b\"}\nnot json\n",
         )
         .unwrap();
         std::fs::write(dir.path().join("decisions.md"), "# p Decisions\n\n## 2026-09-27 — Pick\n\nbody\n\n## 2026-09-01 — Old\n").unwrap();
-        assert_eq!(last_history_date(dir.path()), Some(date(20)));
+        assert_eq!(last_history_date(dir.path()), Some(date(18)), "the last entry, not the newest date");
         assert_eq!(last_decision_date(dir.path()), Some(date(27)));
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(last_history_date(empty.path()), None);
@@ -201,21 +224,24 @@ mod tests {
     }
 
     #[test]
-    fn project_lines_add_the_tracker_section_only_for_a_bound_project() {
+    fn the_last_history_entry_is_read_from_a_large_file_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().join("vault");
-        std::fs::create_dir_all(vault.join("work/claims")).unwrap();
-        std::fs::create_dir_all(vault.join("work/ops")).unwrap();
-        let yaml = format!(
-            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: c\n",
-            vault.display()
-        );
-        let config_path = dir.path().join("config.yml");
-        std::fs::write(&config_path, yaml).unwrap();
-        let config = crate::config::loader::load(Some(&config_path)).unwrap();
-        let bound = project_lines(&config, "work", &vault.join("work/claims"), now(), date(30));
-        assert_eq!(bound, vec!["No history entries. No decisions.", "Tracker mirror. Never pulled. Not authoritative.", "The mirror is more than 24 hours old. Run `wardwell tracker pull`."]);
-        let unbound = project_lines(&config, "work", &vault.join("work/ops"), now(), date(30));
-        assert_eq!(unbound, vec!["No history entries. No decisions."]);
+        let mut body = String::from("{\"_schema\":\"history\"}\n");
+        for _ in 0..3000 {
+            body.push_str(&format!("{{\"date\":\"2026-09-01\",\"title\":\"{}\"}}\n", "x".repeat(800)));
+        }
+        body.push_str("{\"date\":\"2026-09-25T10:00:00+00:00\",\"title\":\"last\"}\n");
+        body.push_str("not json\n");
+        std::fs::write(dir.path().join("history.jsonl"), &body).unwrap();
+        assert!(body.len() > 2_000_000);
+        assert_eq!(last_history_date(dir.path()), Some(date(25)));
+    }
+
+    #[test]
+    fn a_history_line_longer_than_the_first_window_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("{{\"date\":\"2026-09-21\",\"title\":\"{}\"}}\n", "x".repeat(200_000));
+        std::fs::write(dir.path().join("history.jsonl"), body).unwrap();
+        assert_eq!(last_history_date(dir.path()), Some(date(21)));
     }
 }
