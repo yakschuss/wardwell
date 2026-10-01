@@ -398,7 +398,11 @@ full pull a day. A full pull that returns no issues while the mirror holds
 open ones removes nothing: it fails with `empty_full_result`, since a renamed
 team key or a token that lost access looks the same as an emptied tracker.
 Only `--full --allow-empty` accepts an empty result; the automatic full pull
-never does. An issue that was removed and then comes back reappears: its
+never does. When an automatic full pull fails, the same run goes on with
+an incremental pull and the output line reports both; the run still exits
+non-zero. No automatic full is tried again for 6 hours after that failure,
+so incremental pulls keep the mirror moving meanwhile. An explicit `--full`
+is never held back. An issue that was removed and then comes back reappears: its
 snapshot is appended even though its id is in the log, under the id
 suffixed `:restored:<removal time>`. `status` reads the last pull
 time from the latest marker. The mirror is not authoritative; if the

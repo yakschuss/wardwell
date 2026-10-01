@@ -102,7 +102,15 @@ pub enum Event {
         #[serde(flatten)]
         common: Common,
         code: FailureCode,
+        /// True when the pull was a full pull Wardwell started because a
+        /// full resync was due, not one a person asked for.
+        #[serde(default, skip_serializing_if = "is_false")]
+        automatic_full: bool,
     },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Closed reason a pull or a doctor check failed. Carries no provider text,
@@ -354,7 +362,7 @@ mod tests {
             Event::IssueRemoved { common: common("e") },
             Event::FullResync { common: common("f"), issues: 3, removed: 1, through: None },
             Event::PullCompleted { common: common("g"), through: Some(Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap()) },
-            Event::PullFailed { common: common("h"), code: FailureCode::Provider },
+            Event::PullFailed { common: common("h"), code: FailureCode::Provider, automatic_full: false },
         ];
         for event in events {
             let line = serde_json::to_string(&event).unwrap();

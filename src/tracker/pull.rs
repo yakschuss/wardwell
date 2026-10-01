@@ -25,6 +25,11 @@ pub const CURSOR_OVERLAP: TimeDelta = TimeDelta::hours(1);
 /// archive of an old issue), so an incremental pull alone can miss them.
 pub const FULL_RESYNC_MAX_AGE: TimeDelta = TimeDelta::hours(24);
 
+/// After an automatic full pull fails, no automatic full is tried again for
+/// this long; incremental pulls carry on meanwhile. An explicit `--full` is
+/// never held back.
+pub const AUTOMATIC_FULL_RETRY_AFTER: TimeDelta = TimeDelta::hours(6);
+
 /// What a pull was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -36,6 +41,9 @@ pub enum Mode {
     /// `Full` that accepts an empty result and removes every open issue.
     /// Only a person asks for this; an automatic full pull never does.
     FullAllowEmpty,
+    /// `Full` started by `pull_binding` because a full resync was due. Its
+    /// failure marker holds back the next automatic full.
+    AutomaticFull,
 }
 
 impl Mode {
@@ -62,9 +70,14 @@ impl ResyncDue {
         }
     }
 
-    /// Whether a pull at `now` must run full, given the newest full resync.
-    pub fn check(last_full_resync: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<Self> {
-        match last_full_resync {
+    /// Whether a pull at `now` must run full, given the log: a full resync
+    /// is missing or stale, and no automatic full failed within
+    /// `AUTOMATIC_FULL_RETRY_AFTER`.
+    pub fn check(summary: &log::LogSummary, now: DateTime<Utc>) -> Option<Self> {
+        if summary.last_automatic_full_failure.is_some_and(|at| now - at < AUTOMATIC_FULL_RETRY_AFTER) {
+            return None;
+        }
+        match summary.last_full_resync_at {
             None => Some(Self::NeverRan),
             Some(at) if now - at > FULL_RESYNC_MAX_AGE => Some(Self::Stale),
             Some(_) => None,
@@ -78,8 +91,11 @@ pub struct PullOutcome {
     pub appended: usize,
     pub removed: usize,
     pub full: bool,
-    /// Set when the pull ran full because a full resync was due.
+    /// Set when a full resync was due, so a full pull was attempted.
     pub resync_due: Option<ResyncDue>,
+    /// Why the due full pull failed; the outcome is then the incremental
+    /// pull that ran after it.
+    pub failed_full: Option<PullError>,
 }
 
 /// Builds the adapter for a binding. Injected so tests never reach a network.
@@ -134,19 +150,25 @@ pub fn pull_binding(
         Mode::Incremental => resync_due(vault_root, binding, now)?,
         _ => None,
     };
-    let mode = match resync_due {
-        Some(_) => Mode::Full,
-        None => mode,
+    let Some(due) = resync_due else {
+        return pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
     };
-    let outcome = pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT)?;
-    Ok(PullOutcome { resync_due, ..outcome })
+    let pull = |mode| pull_project_waiting(vault_root, binding, adapter.as_ref(), mode, now, lock::DEFAULT_WAIT);
+    match pull(Mode::AutomaticFull) {
+        Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), ..outcome }),
+        // A failed automatic full must not stop the mirror moving.
+        Err(failed) => match pull(Mode::Incremental) {
+            Ok(outcome) => Ok(PullOutcome { resync_due: Some(due), failed_full: Some(failed), ..outcome }),
+            Err(error) => Err(PullError::new(error.code, format!("automatic full pull failed: {failed}; incremental pull: {}", error.message))),
+        },
+    }
 }
 
 /// Whether the binding's log is due a full resync at `now`.
 fn resync_due(vault_root: &Path, binding: &TrackerBinding, now: DateTime<Utc>) -> Result<Option<ResyncDue>, PullError> {
     let path = log::path_for(vault_root, &binding.domain, &binding.project);
     let summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
-    Ok(ResyncDue::check(summary.last_full_resync_at, now))
+    Ok(ResyncDue::check(&summary, now))
 }
 
 /// Pull one project through `adapter` and append what is new.
@@ -186,7 +208,7 @@ pub fn pull_project_waiting(
     let mut summary = log::read(&path).map_err(|message| PullError::new(FailureCode::LogRead, message))?;
     let result = pull_locked(&path, binding, adapter, mode, now, &mut summary);
     if let Err(error) = &result {
-        let _ = log::append_new(&path, &[pull_failed(binding, now, error.code)], &mut summary);
+        let _ = log::append_new(&path, &[pull_failed(binding, now, error.code, mode == Mode::AutomaticFull)], &mut summary);
     }
     result
 }
@@ -245,22 +267,26 @@ fn pull_locked(
     let removed = markers.len().saturating_sub(1);
     log::append_new(path, &markers, summary).map_err(|message| PullError::new(FailureCode::LogWrite, message))?;
     appended += removed;
-    Ok(PullOutcome { appended, removed, full, resync_due: None })
+    Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None })
 }
 
 /// Marker for a pull that stopped early. The title names only the code.
-fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode) -> Event {
+fn pull_failed(binding: &TrackerBinding, now: DateTime<Utc>, code: FailureCode, automatic_full: bool) -> Event {
     let label = provider_label(&binding.provider);
     Event::PullFailed {
         common: local_common(
             binding,
-            format!("wardwell:pull_failed:{}:{}", binding.team, now.to_rfc3339()),
+            match automatic_full {
+                true => format!("wardwell:pull_failed:{}:{}:automatic_full", binding.team, now.to_rfc3339()),
+                false => format!("wardwell:pull_failed:{}:{}", binding.team, now.to_rfc3339()),
+            },
             &binding.team,
             &binding.team,
             now,
             format!("{} pull from {label} failed: {}", binding.team, code.as_str()),
         ),
         code,
+        automatic_full,
     }
 }
 
@@ -460,7 +486,7 @@ mod tests {
         let path = log::path_for(vault.path(), "work", "claims");
         let content = std::fs::read_to_string(&path).unwrap();
         let last: Event = serde_json::from_str(content.lines().last().unwrap()).unwrap();
-        let Event::PullFailed { common, code } = last else { panic!("{content}") };
+        let Event::PullFailed { common, code, .. } = last else { panic!("{content}") };
         assert_eq!(code, FailureCode::Provider);
         assert_eq!(common.title, "COR pull from Linear failed: provider");
         assert!(!content.contains("lin_api_secret"), "no provider text in the log");
@@ -784,7 +810,8 @@ mod tests {
 
         let empty = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(fake(vec![]))) };
         let later = at(10) + FULL_RESYNC_MAX_AGE + TimeDelta::hours(1);
-        let _ = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, later, &empty);
+        let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, later, &empty).unwrap();
+        assert_eq!(outcome.failed_full.map(|e| e.code), Some(FailureCode::EmptyFullResult));
         let content = kinds(vault.path());
         assert!(!content.contains("\"issue_removed\""), "{content}");
         assert!(content.contains("\"code\":\"empty_full_result\""), "{content}");
@@ -831,6 +858,56 @@ mod tests {
             }
             assert_eq!(restored_ids(vault.path()).len(), 3);
         }
+    }
+
+    /// Fails every full pull; incremental pulls succeed. Records `full` per call.
+    struct FullFails(std::rc::Rc<RefCell<Vec<bool>>>);
+    impl Adapter for FullFails {
+        fn pull(&self, _: Option<DateTime<Utc>>, full: bool, sink: &mut Sink<'_>) -> Result<(), String> {
+            self.0.borrow_mut().push(full);
+            sink(vec![snapshot("COR-1", 1)])?;
+            match full {
+                true => Err("Linear request failed".to_string()),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_automatic_full_runs_the_incremental_and_waits_before_trying_again() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = credential_dir();
+        let hour = |h: i64| at(0) + TimeDelta::hours(h);
+        let first = fake(vec![snapshot("COR-1", 0)]);
+        pull_project(vault.path(), &binding(), &first, true, hour(0)).unwrap();
+
+        let calls = std::rc::Rc::new(RefCell::new(vec![]));
+        let shared = calls.clone();
+        let connect = move |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails(shared.clone()))) };
+        let failed = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, hour(25), &connect).unwrap();
+        assert_eq!(failed.resync_due, Some(ResyncDue::Stale));
+        assert!(!failed.full, "the outcome is the incremental pull's");
+        assert_eq!(failed.failed_full.as_ref().map(|e| e.code), Some(FailureCode::Provider));
+        for h in 26..=29 {
+            let outcome = pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, hour(h), &connect).unwrap();
+            assert_eq!((outcome.full, outcome.resync_due, outcome.failed_full), (false, None, None), "hour {h}");
+        }
+        assert_eq!(*calls.borrow(), vec![true, false, false, false, false, false], "one full attempt, five incrementals");
+
+        let summary = log::read(&log::path_for(vault.path(), "work", "claims")).unwrap();
+        assert_eq!(summary.last_pull_at, Some(hour(29)), "incrementals kept the mirror moving");
+
+        // An explicit full is never held back.
+        calls.borrow_mut().clear();
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Full, hour(30), &connect).unwrap_err();
+        assert_eq!(*calls.borrow(), vec![true]);
+
+        // Once the hold since the last automatic failure passes, it tries again.
+        calls.borrow_mut().clear();
+        let held_until = hour(25) + AUTOMATIC_FULL_RETRY_AFTER;
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, held_until - TimeDelta::minutes(1), &connect).unwrap();
+        pull_binding(vault.path(), config.path(), &binding(), Mode::Incremental, held_until + TimeDelta::minutes(1), &connect).unwrap();
+        assert_eq!(*calls.borrow(), vec![false, true, false]);
     }
 
     #[test]

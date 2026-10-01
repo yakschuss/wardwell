@@ -33,7 +33,14 @@ pub fn pull(
     let mut failures = Vec::new();
     for (key, binding) in bindings {
         match pull_binding(&config.vault_path, config_dir, binding, mode, now, connect) {
-            Ok(outcome) => lines.push(pull_line(key, &outcome)),
+            Ok(outcome) => match (&outcome.failed_full, outcome.resync_due) {
+                (Some(failed), Some(due)) => failures.push(format!(
+                    "{key}: automatic full pull failed ({}): {failed}; {}",
+                    due.describe(),
+                    pull_summary(&outcome)
+                )),
+                _ => lines.push(format!("{key}: {}", pull_summary(&outcome))),
+            },
             Err(error) => failures.push(format!("{key}: {error}")),
         }
     }
@@ -43,13 +50,13 @@ pub fn pull(
     }
 }
 
-fn pull_line(key: &str, outcome: &crate::tracker::pull::PullOutcome) -> String {
+fn pull_summary(outcome: &crate::tracker::pull::PullOutcome) -> String {
     let mode = match (outcome.full, outcome.resync_due) {
         (true, Some(due)) => format!("full pull ({}, so this pull ran full)", due.describe()),
         (true, None) => "full pull".to_string(),
         (false, _) => "incremental pull".to_string(),
     };
-    format!("{key}: {mode} appended {} events, {} removed", outcome.appended, outcome.removed)
+    format!("{mode} appended {} events, {} removed", outcome.appended, outcome.removed)
 }
 
 /// Compaction drops the rewritten log's vectors; the watcher re-adds its
@@ -278,6 +285,29 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_automatic_full_reports_both_pulls_and_fails_the_run() {
+        struct FullFails;
+        impl Adapter for FullFails {
+            fn pull(&self, _: Option<DateTime<Utc>>, full: bool, _: &mut Sink<'_>) -> Result<(), String> {
+                match full {
+                    true => Err("Linear request failed".to_string()),
+                    false => Ok(()),
+                }
+            }
+        }
+        let full_fails = |_: &TrackerBinding, _: &crate::tracker::credential::Credential| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(FullFails)) };
+        let (dir, config) = setup(false);
+        connect(dir.path(), "corr-linear", "t").unwrap();
+        let error = pull(&config, dir.path(), None, Mode::Incremental, now(), &full_fails).unwrap_err();
+        assert_eq!(
+            error,
+            "work/claims: automatic full pull failed (no full resync on record): Linear request failed (provider); incremental pull appended 0 events, 0 removed"
+        );
+        let next = pull(&config, dir.path(), None, Mode::Incremental, now() + chrono::TimeDelta::hours(1), &full_fails).unwrap();
+        assert_eq!(next, vec!["work/claims: incremental pull appended 0 events, 0 removed"]);
+    }
+
+    #[test]
     fn status_reads_the_last_pull_from_a_pull_that_found_nothing() {
         let (dir, config) = setup(false);
         connect(dir.path(), "corr-linear", "t").unwrap();
@@ -366,7 +396,10 @@ mod tests {
         let lines: Vec<&str> = error.lines().collect();
         assert_eq!(lines.len(), 2, "{error}");
         assert!(lines[0].starts_with("work/ops: full pull (no full resync on record, so this pull ran full) appended"), "{error}");
-        assert_eq!(lines[1], "work/claims: Linear returned HTTP 500 (provider)");
+        assert_eq!(
+            lines[1],
+            "work/claims: automatic full pull failed: Linear returned HTTP 500 (provider); incremental pull: Linear returned HTTP 500 (provider)"
+        );
         let ops = log::read(&log::path_for(&config.vault_path, "work", "ops")).unwrap();
         assert_eq!(ops.last_pull_at, Some(now()));
         let claims = log::read(&log::path_for(&config.vault_path, "work", "claims")).unwrap();

@@ -40,6 +40,8 @@ pub struct LogSummary {
     pub unreadable_lines: usize,
     /// When the latest pull_failed marker was written, and its code.
     pub last_failure: Option<(DateTime<Utc>, crate::tracker::events::FailureCode)>,
+    /// When the latest pull_failed marker from an automatic full pull was written.
+    pub last_automatic_full_failure: Option<DateTime<Utc>>,
 }
 
 impl LogSummary {
@@ -57,7 +59,12 @@ impl LogSummary {
                 self.mark_pull(common.occurred_at, *through);
             }
             Event::PullCompleted { through, .. } => self.mark_pull(common.occurred_at, *through),
-            Event::PullFailed { code, .. } => self.last_failure = Some((common.occurred_at, *code)),
+            Event::PullFailed { code, automatic_full, .. } => {
+                self.last_failure = Some((common.occurred_at, *code));
+                if *automatic_full {
+                    self.last_automatic_full_failure = later(self.last_automatic_full_failure, common.occurred_at);
+                }
+            }
             Event::IssueUpserted { issue, .. } => {
                 self.removed_at.remove(&common.external_key);
                 self.open_issues.insert(common.external_key.clone(), OpenIssue {
