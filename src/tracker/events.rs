@@ -160,6 +160,8 @@ pub enum FailureCode {
     PrefixCollision,
     /// The pull ran past its hard deadline and was stopped.
     Timeout,
+    /// A refresh could not start the detached pull process.
+    Spawn,
 }
 
 impl FailureCode {
@@ -177,6 +179,7 @@ impl FailureCode {
             Self::EmptyFullResult => "empty_full_result",
             Self::PrefixCollision => "prefix_collision",
             Self::Timeout => "timeout",
+            Self::Spawn => "spawn",
         }
     }
 }
@@ -532,7 +535,7 @@ mod tests {
         for code in [
             FailureCode::Credential, FailureCode::UnsupportedProvider, FailureCode::LockBusy, FailureCode::LogRead,
             FailureCode::LogWrite, FailureCode::Provider, FailureCode::Auth, FailureCode::TeamNotFound,
-            FailureCode::Timeout,
+            FailureCode::Timeout, FailureCode::Spawn,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(code.as_str()));
         }

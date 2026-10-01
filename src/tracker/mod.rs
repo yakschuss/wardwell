@@ -20,6 +20,7 @@ pub mod log;
 pub mod pull;
 pub mod refresh;
 pub mod schedule;
+pub mod trigger;
 pub mod view;
 
 /// Provider ids Wardwell has an adapter for.
