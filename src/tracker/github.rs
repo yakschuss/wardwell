@@ -793,11 +793,35 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_system_runner_reports_each_outcome_of_a_stub() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = std::cell::Cell::new(0);
+        let run = |body: &str, limit: usize| {
+            count.set(count.get() + 1);
+            let stub = stub_gh(&dir.path().join(count.get().to_string()), body);
+            SystemGh::at(Some(stub)).with_limits(Duration::from_secs(1), limit).run(&strings(&["pr", "list"]))
+        };
+        assert_eq!(run("echo \"$1 $2\"", 1024), GhOutcome::Output(b"pr list\n".to_vec()), "arguments reach gh");
+        assert_eq!(run("echo '[{\"number\":1}]'\nexit 1", 1024), GhOutcome::Exited(Some(1)), "JSON on stdout does not hide a failed exit");
+        assert_eq!(run("echo '[]'\nexit 4", 1024), GhOutcome::SignedOut);
+        assert_eq!(run("kill -TERM $$", 1024), GhOutcome::Exited(None));
+        let big = "head -c 4096 /dev/zero | tr '\\0' 'x'";
+        assert_eq!(run(big, 1024), GhOutcome::Oversize(1024));
+        assert_eq!(run(big, 4096), GhOutcome::Output(vec![b'x'; 4096]), "exactly the limit is not oversize");
+        let started = Instant::now();
+        assert_eq!(run("sleep 30", 1024), GhOutcome::TimedOut(Duration::from_secs(1)));
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+        assert_eq!(SystemGh::at(None).run(&[]), GhOutcome::Missing);
+        assert_eq!(SystemGh::at(Some(dir.path().join("absent"))).run(&[]), GhOutcome::Missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_child_of_gh_holding_stdout_does_not_outlast_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let timeout = Duration::from_secs(1);
-        for body in ["sleep 30 &\necho '[]'\nexit 0", "echo '['\nsleep 30 &\nsleep 30"] {
-            let stub = stub_gh(dir.path(), body);
+        for (n, body) in ["sleep 30 &\necho '[]'\nexit 0", "echo '['\nsleep 30 &\nsleep 30"].into_iter().enumerate() {
+            let stub = stub_gh(&dir.path().join(n.to_string()), body);
             let runner = SystemGh::at(Some(stub)).with_limits(timeout, RESPONSE_LIMIT);
             let started = Instant::now();
             assert_eq!(runner.run(&[]), GhOutcome::TimedOut(timeout), "{body}");
