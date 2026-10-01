@@ -47,10 +47,10 @@ pub struct Ruleset {
 
 const FILE_EXTENSIONS: &str = r"\b\w+\.(?:rb|py|ts|tsx|js|jsx|md|yml|yaml|json|erb|css|scss|html|sql|csv|pdf|txt|lock|sh|toml|rake)\b";
 
-/// The rules in corrtex `docs/operations/LINEAR_UPDATES.md`, version 2.
+/// The rules in corrtex `docs/operations/LINEAR_UPDATES.md`, version 3. A created issue needs a parent issue, a Linear project, or a template (the owner's rule of 2026-10-01).
 pub const LINEAR_UPDATES: Ruleset = Ruleset {
     name: "linear-updates",
-    version: 2,
+    version: 3,
     team_heading: "for the team",
     divider: "---",
     comment_shapes: &[

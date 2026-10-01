@@ -138,8 +138,8 @@ fn check_issue(rules: &Ruleset, input: &Map<String, Value>) -> Verdict {
     if let Some(problem) = style_problem(rules, &team)? {
         return Ok(Some(format!("{problem}. Required fields: {fields}")));
     }
-    if !(input.get("parentId").is_some_and(truthy) || input.get("template").is_some_and(truthy)) {
-        return Ok(Some(format!("a created issue needs parentId or template. Description fields required: {fields}")));
+    if !(input.get("parentId").is_some_and(truthy) || input.get("template").is_some_and(truthy) || input.get("project").is_some_and(truthy)) {
+        return Ok(Some(format!("a created issue needs parentId, project, or template. Description fields required: {fields}")));
     }
     Ok(None)
 }
@@ -497,9 +497,24 @@ Display only.";
     }
 
     #[test]
-    fn create_without_parent_or_template() {
-        let reason = denied(ISSUE_TOOL, json!({"title": "x", "description": ISSUE_BODY}), "parentId or template");
-        assert!(reason.contains("Done when"), "{reason}");
+    fn create_without_parent_project_or_template() {
+        let reason = denied(ISSUE_TOOL, json!({"title": "x", "description": ISSUE_BODY}), "a created issue needs parentId, project, or template");
+        assert!(reason.contains("Description fields required: Asked by"), "{reason}");
+    }
+
+    #[test]
+    fn create_with_project_is_allowed() {
+        allowed(ISSUE_TOOL, json!({"title": "x", "team": "COR", "description": ISSUE_BODY, "project": "Billing"}));
+    }
+
+    #[test]
+    fn create_with_template_is_allowed() {
+        allowed(ISSUE_TOOL, json!({"title": "x", "team": "COR", "description": ISSUE_BODY, "template": "Bug"}));
+    }
+
+    #[test]
+    fn create_with_empty_project_is_denied() {
+        denied(ISSUE_TOOL, json!({"title": "x", "description": ISSUE_BODY, "project": ""}), "project");
     }
 
     #[test]
@@ -641,6 +656,6 @@ Display only.";
 
     #[test]
     fn ruleset_is_named_and_versioned() {
-        assert_eq!((LINEAR_UPDATES.name, LINEAR_UPDATES.version), ("linear-updates", 2));
+        assert_eq!((LINEAR_UPDATES.name, LINEAR_UPDATES.version), ("linear-updates", 3));
     }
 }
