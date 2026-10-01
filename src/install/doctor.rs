@@ -301,16 +301,16 @@ fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// One row per tracker binding from the offline doctor checks (credential
-/// file and provider; for github, a token or `gh` on PATH; no network, and
+/// file and provider; for github, a token or a `gh` that `locate_gh` finds; no network, and
 /// `gh` never runs). Each row names `wardwell tracker doctor` for the live
 /// check. The bool is false when any binding failed.
 fn tracker_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path) -> (Vec<String>, bool) {
     let native = crate::tracker::doctor::native_prefixes(config, &config_dir.join("kanban.db"));
-    tracker_rows_with(config, config_dir, &native, crate::tracker::github::gh_on_path())
+    tracker_rows_with(config, config_dir, &native, crate::tracker::github::gh_available())
 }
 
 /// `tracker_rows` with each binding's native kanban prefix given by key and
-/// whether `gh` is on PATH. A team key equal to the prefix fails the row
+/// whether a `gh` was found. A team key equal to the prefix fails the row
 /// with the collision sentence.
 fn tracker_rows_with(
     config: &crate::config::loader::WardwellConfig,
@@ -332,7 +332,7 @@ fn tracker_rows_with(
             let passed = match crate::tracker::mirrors_issues(&binding.provider) {
                 true => "credential ok",
                 false => match gh_on_path {
-                    true => "gh on PATH or a token stored",
+                    true => "gh found or a token stored",
                     false => "token stored",
                 },
             };
@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(rows[1], "  Tracker work/claims github             \u{2717} failed (credential): github: unreachable, run `wardwell tracker connect github`; live check: `wardwell tracker doctor`");
 
         let (rows, _) = tracker_rows_with(&config, dir.path(), &std::collections::BTreeMap::new(), true);
-        assert_eq!(rows[1], "  Tracker work/claims github             \u{2713} gh on PATH or a token stored; live check: `wardwell tracker doctor`");
+        assert_eq!(rows[1], "  Tracker work/claims github             \u{2713} gh found or a token stored; live check: `wardwell tracker doctor`");
         crate::tracker::credential::save(&crate::tracker::credential::path_in(dir.path(), "github").unwrap(), "ghp_secret").unwrap();
         let (rows, ok) = tracker_rows_with(&config, dir.path(), &std::collections::BTreeMap::new(), false);
         assert!(ok, "{rows:?}");

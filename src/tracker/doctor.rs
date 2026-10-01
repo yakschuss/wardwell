@@ -21,9 +21,9 @@ pub type Probe<'a> = dyn Fn(&TrackerBinding, &Credential) -> Result<Box<dyn Tran
 /// `gh` or reach a network.
 pub type GithubProbe<'a> = dyn Fn(&TrackerBinding, Option<&Credential>) -> GitHub + 'a;
 
-/// The production GitHub reader: `gh` on PATH, then the stored token.
+/// The production GitHub reader: the `gh` that `locate_gh` finds, then the stored token.
 pub fn connect_github(binding: &TrackerBinding, credential: Option<&Credential>) -> GitHub {
-    crate::tracker::pull::github_for(binding, credential, Box::new(SystemGh))
+    crate::tracker::pull::github_for(binding, credential, Box::new(SystemGh::located()))
 }
 
 /// The production transport for a binding's provider.
@@ -68,12 +68,12 @@ pub fn run_with(config: &WardwellConfig, config_dir: &Path, probe: &Probe<'_>, g
 /// The checks that need no network: the credential file exists with
 /// owner-only permissions, and Wardwell has an adapter for the provider.
 /// The error is a closed code and, for the credential, the path and fix.
-/// A github binding passes without a token when `gh` is on PATH.
+/// A github binding passes without a token when a `gh` is found.
 pub fn check_offline(config_dir: &Path, binding: &TrackerBinding) -> Result<(), (FailureCode, Option<String>)> {
-    check_offline_with(config_dir, binding, crate::tracker::github::gh_on_path())
+    check_offline_with(config_dir, binding, crate::tracker::github::gh_available())
 }
 
-/// `check_offline`, told whether `gh` is on PATH.
+/// `check_offline`, told whether a `gh` was found.
 pub fn check_offline_with(config_dir: &Path, binding: &TrackerBinding, gh_on_path: bool) -> Result<(), (FailureCode, Option<String>)> {
     if !crate::tracker::mirrors_issues(&binding.provider) {
         let stored = crate::tracker::pull::load_credential(config_dir, binding).map_err(|e| (e.code, Some(e.message)))?;

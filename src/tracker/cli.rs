@@ -124,10 +124,10 @@ fn selected<'a>(config: &'a WardwellConfig, only: Option<&str>) -> Result<Vec<(S
 /// failed, each read from that provider's own events; then one line on the
 /// pull schedule (`scheduled` is the interval from the installed plist, if any).
 pub fn status(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>) -> Vec<String> {
-    status_with(config, config_dir, now, scheduled, crate::tracker::github::gh_on_path())
+    status_with(config, config_dir, now, scheduled, crate::tracker::github::gh_available())
 }
 
-/// `status`, told whether `gh` is on PATH.
+/// `status`, told whether a `gh` was found.
 fn status_with(config: &WardwellConfig, config_dir: &Path, now: DateTime<Utc>, scheduled: Option<u32>, gh_on_path: bool) -> Vec<String> {
     let mut lines = match config.trackers.is_empty() {
         true => vec!["No trackers bound. Add a trackers section to config.yml.".to_string()],
@@ -166,7 +166,7 @@ pub fn unschedule(home: &Path, runner: &dyn LaunchctlRunner, uid: u32) -> Result
 }
 
 /// Read-only check that a pull could start: a known provider and a
-/// readable credential, or for github `gh` on PATH. Never opens the network
+/// readable credential, or for github a `gh` that `locate_gh` finds. Never opens the network
 /// and never runs `gh`.
 fn cannot_pull(config_dir: &Path, binding: &TrackerBinding, gh_on_path: bool) -> Option<FailureCode> {
     if !crate::tracker::SUPPORTED_PROVIDERS.contains(&binding.provider.as_str()) {

@@ -115,7 +115,7 @@ pub fn connect_provider(binding: &TrackerBinding, credential: Option<&Credential
             &binding.team,
         ))),
         ("linear", None) => Err("a linear binding needs its credential".to_string()),
-        (GITHUB, credential) => Ok(Box::new(github_for(binding, credential, Box::new(SystemGh)))),
+        (GITHUB, credential) => Ok(Box::new(github_for(binding, credential, Box::new(SystemGh::located())))),
         (other, _) => Err(format!("unsupported tracker provider '{other}'")),
     }
 }
@@ -866,6 +866,39 @@ mod tests {
         assert_eq!(summary.last_failure, Some((at(12), FailureCode::Credential)));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("acme/app pull from GitHub failed: credential"), "{content}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_a_bare_path_the_pull_and_doctor_use_gh_at_a_candidate_path() {
+        use crate::tracker::github::{SystemGh, locate_gh, tests::stub_gh};
+        let dir = tempfile::tempdir().unwrap();
+        let node = crate::tracker::github::tests::gh_node(42, "COR-12 Fix the inbox", 10);
+        let stub = stub_gh(&dir.path().join("homebrew"), &format!(
+            "if [ \"$1\" = repo ]; then echo '{{\"nameWithOwner\":\"acme/app\"}}'; exit 0; fi\necho '[{node}]'"
+        ));
+        let bare = std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+        let found = locate_gh(Some(&bare), std::slice::from_ref(&stub));
+        assert_eq!(found.as_deref(), Some(stub.as_path()));
+
+        let vault = tempfile::tempdir().unwrap();
+        let adapter = github_for(&github(), None, Box::new(SystemGh::at(found.clone())));
+        let outcome = pull_project(vault.path(), &github(), &adapter, false, at(12)).unwrap();
+        assert_eq!(outcome.appended, 1);
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "github").unwrap().last_failure, None);
+
+        let config = crate::config::loader::parse(&format!(
+            "vault_path: {}\nsession_sources: []\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
+            vault.path().display()
+        ))
+        .unwrap();
+        let probe = |b: &TrackerBinding, c: Option<&Credential>| github_for(b, c, Box::new(SystemGh::at(found.clone())));
+        let linear = |_: &TrackerBinding, _: &Credential| -> Result<Box<dyn crate::tracker::linear::Transport>, String> { Err("unused".into()) };
+        let (lines, healthy) = crate::tracker::doctor::run_with(&config, dir.path(), &linear, &probe, &Default::default());
+        assert!(healthy, "{lines:?}");
+        assert_eq!(lines[1], "work/claims: github repository acme/app ok through gh");
+        assert_eq!(crate::tracker::doctor::check_offline_with(dir.path(), &config.trackers[0], found.is_some()), Ok(()));
     }
 
     #[test]

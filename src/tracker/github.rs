@@ -173,18 +173,28 @@ impl Adapter for GitHub {
     }
 }
 
-/// Whether an executable `gh` is in a directory on PATH. Reads the file
-/// system only; never starts `gh`.
-pub fn gh_on_path() -> bool {
-    gh_in(std::env::var_os("PATH").as_deref())
+/// Where `gh` is looked for after PATH, in order. launchd runs the hourly
+/// pull with PATH `/usr/bin:/bin:/usr/sbin:/sbin`, which holds neither.
+pub const GH_CANDIDATES: [&str; 2] = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"];
+
+/// The `gh` to run: the first executable `gh` in a directory of `path`, a
+/// PATH value, else the first executable path in `candidates`. Reads the
+/// file system only; never starts `gh`. The adapter, `tracker doctor` and
+/// `doctor` all find `gh` through this.
+pub fn locate_gh(path: Option<&std::ffi::OsStr>, candidates: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    let on_path = path.into_iter().flat_map(std::env::split_paths).map(|dir| dir.join("gh"));
+    on_path.chain(candidates.iter().cloned()).find(|file| is_executable(file))
 }
 
-/// Whether an executable `gh` is in a directory of `path`, a PATH value.
-pub fn gh_in(path: Option<&std::ffi::OsStr>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    std::env::split_paths(path).map(|dir| dir.join("gh")).any(|file| is_executable(&file))
+/// `locate_gh` with this process's PATH and `GH_CANDIDATES`.
+pub fn find_gh() -> Option<std::path::PathBuf> {
+    let candidates: Vec<std::path::PathBuf> = GH_CANDIDATES.iter().map(std::path::PathBuf::from).collect();
+    locate_gh(std::env::var_os("PATH").as_deref(), &candidates)
+}
+
+/// Whether `find_gh` finds a `gh`.
+pub fn gh_available() -> bool {
+    find_gh().is_some()
 }
 
 #[cfg(unix)]
@@ -282,13 +292,30 @@ fn time(node: &Value, key: &str) -> Option<DateTime<Utc>> {
 /// Error text when the API answers 404, so doctor can name a missing repository.
 const NOT_FOUND: &str = "GitHub returned HTTP 404";
 
-/// Runs the `gh` on PATH. Standard error is discarded and nothing is
-/// echoed; a run past `GH_TIMEOUT` is killed and counts as failed.
-pub struct SystemGh;
+/// Runs the `gh` that `locate_gh` found. Standard error is discarded and
+/// nothing is echoed; a run past `GH_TIMEOUT` is killed and counts as failed.
+pub struct SystemGh {
+    program: Option<std::path::PathBuf>,
+}
+
+impl SystemGh {
+    /// The runner for the `gh` at `program`; None runs nothing and answers `Missing`.
+    pub fn at(program: Option<std::path::PathBuf>) -> Self {
+        Self { program }
+    }
+
+    /// The runner for the `gh` that `find_gh` finds.
+    pub fn located() -> Self {
+        Self::at(find_gh())
+    }
+}
 
 impl GhRunner for SystemGh {
     fn run(&self, args: &[String]) -> GhOutcome {
-        let spawned = std::process::Command::new("gh")
+        let Some(program) = &self.program else {
+            return GhOutcome::Missing;
+        };
+        let spawned = std::process::Command::new(program)
             .args(args)
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -600,20 +627,40 @@ pub(crate) mod tests {
         assert!(calls.borrow().is_empty());
     }
 
+    /// An executable `gh` script in `dir` with `body` after the shebang.
+    #[cfg(unix)]
+    pub(crate) fn stub_gh(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("gh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     #[cfg(unix)]
     #[test]
-    fn gh_on_path_looks_for_an_executable_file_without_running_it() {
+    fn gh_is_found_on_path_then_at_the_candidates_without_running_it() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let path = std::env::join_paths([dir.path().join("none"), bin.clone()]).unwrap();
-        assert!(!gh_in(Some(&path)));
-        std::fs::write(bin.join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
-        assert!(!gh_in(Some(&path)), "not executable");
-        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(gh_in(Some(&path)));
-        assert!(!gh_in(None));
+        let on_path = dir.path().join("bin");
+        let homebrew = dir.path().join("homebrew");
+        let local = dir.path().join("local");
+        let candidates = vec![homebrew.join("gh"), local.join("gh")];
+        let bare = std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+        let path = std::env::join_paths([dir.path().join("none"), on_path.clone()]).unwrap();
+        assert_eq!(locate_gh(Some(&bare), &candidates), None);
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("gh"), "#!/bin/sh\nexit 1\n").unwrap();
+        assert_eq!(locate_gh(Some(&bare), &candidates), None, "not executable");
+        std::fs::set_permissions(local.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(locate_gh(Some(&bare), &candidates), Some(local.join("gh")));
+        stub_gh(&homebrew, "exit 1");
+        assert_eq!(locate_gh(Some(&bare), &candidates), Some(homebrew.join("gh")), "the Homebrew path comes first");
+        stub_gh(&on_path, "exit 1");
+        assert_eq!(locate_gh(Some(&path), &candidates), Some(on_path.join("gh")), "PATH comes before the candidates");
+        assert_eq!(locate_gh(None, &candidates), Some(homebrew.join("gh")));
+        assert_eq!(GH_CANDIDATES, ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
     }
 
     #[test]
