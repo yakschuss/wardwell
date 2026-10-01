@@ -29,7 +29,14 @@ pub fn project_rot_line(project_dir: &Path, today: NaiveDate) -> String {
 /// credentials in `config_dir`.
 pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain: &str, project_dir: &Path, now: DateTime<Utc>) -> Option<Vec<String>> {
     let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    let bindings = config.bindings_for(domain, project);
+    let bindings: Vec<crate::config::loader::TrackerBinding> = config.bindings_for(domain, project).into_iter().cloned().collect();
+    tracker_lines_for(&bindings, config_dir, domain, project_dir, now)
+}
+
+/// `project_tracker_lines` for the project's `bindings`, so a helper thread
+/// can run it without the whole config.
+pub fn tracker_lines_for(bindings: &[crate::config::loader::TrackerBinding], config_dir: &Path, domain: &str, project_dir: &Path, now: DateTime<Utc>) -> Option<Vec<String>> {
+    let project = project_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     if bindings.is_empty() {
         return None;
     }
@@ -40,7 +47,7 @@ pub fn project_tracker_lines(config: &WardwellConfig, config_dir: &Path, domain:
         Err(error) => Err(error.clone()),
     };
     let mut lines = Vec::new();
-    for binding in &bindings {
+    for binding in bindings {
         let view = view_of(&binding.provider);
         let local = crate::tracker::state::provider(&crate::tracker::state::path(config_dir, domain, project), &binding.provider);
         let fresh = freshness::assess_read(&view, local.as_ref(), now, &freshness::process_alive);

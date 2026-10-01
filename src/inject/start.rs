@@ -17,26 +17,53 @@ use std::path::Path;
 /// started a background refresh.
 pub type Refresh<'a> = dyn Fn(&str, &str) -> bool + 'a;
 
+/// The sentence when the mirror log does not answer within the bound.
+pub const LOG_NOT_IN_TIME: &str = "Could not read the mirror log in time.";
+
 /// The session-start output for `cwd` at `now` and local date `today`,
-/// as `write` emits it.
+/// as `write` emits it with a generous bound.
 pub fn output(cwd: &Path, config: &WardwellConfig, config_dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>, now: DateTime<Utc>, today: NaiveDate, refresh: &Refresh<'_>) -> String {
     let mut out = Vec::new();
-    let _ = write(&mut out, cwd, config, config_dir, git, now, today, refresh);
+    let _ = write(&mut out, cwd, config, config_dir, git, now, today, refresh, std::time::Duration::from_secs(30));
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Write the session-start output to `out`: the project context with its
-/// tracker section first, flushed, then the refresh trigger last, and its
-/// one line when it started a pull. `refresh` runs only for a resolved
-/// project with a vault folder.
+/// Write the session-start output to `out`. For a resolved project: its
+/// header and rot line first, flushed; then the tracker section, read on a
+/// helper thread within `bound`, or one sentence past it; then the refresh
+/// trigger last, and its one line when it started a pull. A helper still
+/// blocked on the log is left behind and ends with the process. `refresh`
+/// runs only for a resolved project with a vault folder.
 #[allow(clippy::too_many_arguments)]
-pub fn write(out: &mut dyn std::io::Write, cwd: &Path, config: &WardwellConfig, config_dir: &Path, git: impl Fn(&Path) -> Option<GitDirs>, now: DateTime<Utc>, today: NaiveDate, refresh: &Refresh<'_>) -> std::io::Result<()> {
+pub fn write(
+    out: &mut dyn std::io::Write,
+    cwd: &Path,
+    config: &WardwellConfig,
+    config_dir: &Path,
+    git: impl Fn(&Path) -> Option<GitDirs>,
+    now: DateTime<Utc>,
+    today: NaiveDate,
+    refresh: &Refresh<'_>,
+    bound: std::time::Duration,
+) -> std::io::Result<()> {
     match resolve(cwd, config, git) {
         Some(Resolution::Project { domain, project }) => {
-            let context = crate::inject::domain::project_context(config, config_dir, &domain, &project, now, today);
-            out.write_all(context.as_bytes())?;
+            let head = crate::inject::domain::project_head(config, &domain, &project, today);
+            if head.is_empty() {
+                return Ok(());
+            }
+            out.write_all(head.as_bytes())?;
             out.flush()?;
-            if !context.is_empty() && refresh(&domain, &project) {
+            let bindings: Vec<_> = config.bindings_for(&domain, &project).into_iter().cloned().collect();
+            if !bindings.is_empty() {
+                let (dir, cfg, d) = (config.vault_path.join(&domain).join(&project), config_dir.to_path_buf(), domain.clone());
+                match crate::tracker::bounded::run(bound, move || crate::inject::session::tracker_lines_for(&bindings, &cfg, &d, &dir, now)) {
+                    Some(lines) => lines.unwrap_or_default().iter().try_for_each(|line| writeln!(out, "  {line}"))?,
+                    None => writeln!(out, "  {LOG_NOT_IN_TIME}")?,
+                }
+                out.flush()?;
+            }
+            if refresh(&domain, &project) {
                 writeln!(out, "  {}", crate::tracker::trigger::STARTED_LINE)?;
             }
             Ok(())

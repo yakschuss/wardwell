@@ -786,7 +786,7 @@ fn run_inject(cwd: &str) -> Result<(), Box<dyn std::error::Error>> {
     // No match prints nothing. Don't pollute non-project sessions. The
     // context is printed and flushed before the trigger runs.
     let mut stdout = std::io::stdout().lock();
-    wardwell::inject::start::write(&mut stdout, &cwd, &config, &config_dir, wardwell::inject::git::dirs, now, today, &refresh)?;
+    wardwell::inject::start::write(&mut stdout, &cwd, &config, &config_dir, wardwell::inject::git::dirs, now, today, &refresh, wardwell::tracker::bounded::VAULT_BOUND)?;
     Ok(())
 }
 

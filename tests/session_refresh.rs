@@ -249,3 +249,42 @@ fn a_pull_blocked_reading_the_log_records_its_start_and_status_says_it_did_not_f
     let status = String::from_utf8_lossy(&run(&["tracker", "status"]).stdout).to_string();
     assert!(status.contains("Stale. Reason: A pull started at ") && status.contains(" and did not finish."), "{status}");
 }
+
+#[cfg(unix)]
+#[test]
+fn session_start_never_hangs_on_a_mirror_log_that_does_not_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let (home, cfg, stub, code, project) = (root.join("home"), root.join("cfg"), root.join("stub"), root.join("code/app"), root.join("vault/work/claims"));
+    for dir in [&home, &cfg, &stub, &code, &project] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    script(&stub.join("gh"), "#!/bin/sh\necho '[]'\n");
+    std::fs::write(cfg.join("config.yml"), format!(
+        "vault_path: {}\nsession_sources: []\nprojects:\n  work/claims:\n    paths:\n      - {}\ntrackers:\n  work/claims:\n    provider: github\n    repository: acme/app\n",
+        root.join("vault").display(),
+        code.display()
+    )).unwrap();
+    assert!(Command::new("/usr/bin/mkfifo").arg(project.join("tracker.jsonl")).status().unwrap().success());
+    // A first run of a freshly built binary can wait on the system's scan of
+    // it; run it once so the timing below is session start's own.
+    Command::new(env!("CARGO_BIN_EXE_wardwell")).arg("--version").output().unwrap();
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_wardwell"))
+        .args(["inject", code.to_str().unwrap()])
+        .env_clear()
+        .env("HOME", &home)
+        .env("WARDWELL_CONFIG_DIR", &cfg)
+        .env("PATH", &stub)
+        .env("WARDWELL_GH_CANDIDATES", "")
+        .env("WARDWELL_PULL_DEADLINE_SECONDS", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(took < Duration::from_secs(1), "session start took {took:?}: {text}");
+    assert!(text.starts_with("**work/claims**\n  No history entries. No decisions.\n"), "{text}");
+    assert!(text.contains("  Could not read the mirror log in time.\n"), "{text}");
+}

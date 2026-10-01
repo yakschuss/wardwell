@@ -5,6 +5,7 @@
 //! tracker; the kanban readonly lock enforces that on the vault side.
 
 pub mod adapter;
+pub mod bounded;
 pub mod cli;
 pub mod compact;
 pub mod credential;
