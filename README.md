@@ -785,7 +785,7 @@ wardwell tracker unschedule
 ```
 
 `schedule` stays as an explicit choice for a vault outside the protected
-folders. It installs a launchd agent (macOS) that runs `wardwell tracker pull`
+folders. It installs a launchd agent on macOS that runs `wardwell tracker pull`
 at load and every interval, using the binary you ran it with, and replaces any
 existing agent of the same label; output goes to `~/.wardwell/tracker-pull.log`.
 The interval must be 60 to 2147483647 seconds. On a vault under a protected
