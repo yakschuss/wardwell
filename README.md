@@ -197,6 +197,7 @@ The session begins when the Companion lifecycle hooks first record it. The time 
 - It allows when the agent is already continuing from a Stop block.
 - It allows on any error or timeout, and when the project has no vault folder.
 - It reads only the local git repository. Merged pull requests are not counted.
+- Only a history entry in this project counts. An entry written to a different project does not satisfy the check for this one.
 - Two sessions that share one checkout cannot be told apart. A commit by either counts for both. Give each session its own worktree.
 - Each block is logged to `~/.wardwell/stop-check/blocks.jsonl`. `wardwell doctor` shows the last one per project.
 - `WARDWELL_STOP_CHECK=off` turns it off. So does `stop_hook: false` in config.yml.

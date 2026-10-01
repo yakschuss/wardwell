@@ -124,7 +124,7 @@ Records which directories belong to a vault project, so session start finds it.
 
 ## Stop check
 
-Runs inside the Stop hook: `wardwell companion lifecycle stop` when the Companion hooks are installed, and `wardwell resolve` otherwise.
+Runs inside the Stop hook: `wardwell companion lifecycle stop`, and `wardwell resolve` too. The check needs the Companion lifecycle hooks for a session start time. `wardwell resolve` alone has none, so without those hooks it always allows.
 
 - Resolves the project with the same mapping as session start. Allows when there is no mapped project or no vault folder.
 - Start time: `opened_at` in the session's own lifecycle file, written once when the lifecycle hooks first record the session. Claude Code's Stop payload carries no start time. A file without it allows.
