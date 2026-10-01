@@ -1,8 +1,8 @@
 //! Decides which vault project or domain a working directory belongs to, for
 //! session start and the Stop check. Order: the git common directory's work
-//! tree, so a linked worktree counts as its main checkout; then the longest
-//! configured `projects:` path that contains the directory; then a vault
-//! domain folder named like the directory, as before.
+//! tree, so a linked worktree counts as its main checkout and only as that;
+//! then the longest configured `projects:` path that contains the
+//! directory; then a vault domain folder named like the directory, as before.
 //!
 //! Does NOT print, read project files, or run git itself: the caller passes
 //! the git lookup in.
@@ -24,16 +24,16 @@ pub enum Resolution {
 /// repository directories for a path, or None outside a repository.
 pub fn resolve(cwd: &Path, config: &WardwellConfig, git: impl Fn(&Path) -> Option<GitDirs>) -> Option<Resolution> {
     let cwd = canonical(cwd);
-    candidates(&cwd, git)
-        .iter()
-        .find_map(|dir| mapped_project(dir, config))
+    mapped_project(&match_dir(&cwd, git), config)
         .or_else(|| domain_named(&cwd, &config.vault_path))
 }
 
-/// The directory as seen from the main checkout first, then as it is.
-fn candidates(cwd: &Path, git: impl Fn(&Path) -> Option<GitDirs>) -> Vec<PathBuf> {
-    let in_main = git(cwd).and_then(|dirs| dirs.in_main_worktree(cwd));
-    in_main.into_iter().chain(std::iter::once(cwd.to_path_buf())).collect()
+/// The directory to match: inside a git work tree, the same place in the
+/// main checkout only, so a linked worktree never borrows a mapping from
+/// whatever folder it happens to sit in. Outside git, or for a bare
+/// repository's worktree, the directory itself.
+fn match_dir(cwd: &Path, git: impl Fn(&Path) -> Option<GitDirs>) -> PathBuf {
+    git(cwd).and_then(|dirs| dirs.in_main_worktree(cwd)).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// The project whose configured path is the longest prefix of `dir`.
@@ -151,5 +151,18 @@ mod tests {
         std::fs::create_dir_all(&work).unwrap();
         let config = config(tmp.path(), &[("personal/notes", &[&work])]);
         assert_eq!(resolve(&work, &config, |_: &Path| None), project("personal/notes"));
+    }
+
+    #[test]
+    fn a_worktree_of_an_unmapped_repo_inside_a_mapped_tree_resolves_to_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mapped = tmp.path().join("code/corrtex");
+        repo(&mapped);
+        let unmapped = tmp.path().join("code/unmapped");
+        repo(&unmapped);
+        let feature = mapped.join(".worktrees/feature");
+        git(&unmapped, &["worktree", "add", "-q", "-b", "f", feature.to_str().unwrap()]);
+        let config = config(tmp.path(), &[("personal/corr-platform", &[&mapped])]);
+        assert_eq!(resolve(&feature, &config, crate::inject::git::dirs), None);
     }
 }

@@ -130,4 +130,17 @@ mod tests {
         std::fs::remove_dir_all(tmp.path().join("vault/personal/corr-platform")).unwrap();
         assert_eq!(output(&code, &config, tmp.path(), crate::inject::git::dirs, now(), today()), "");
     }
+
+    #[test]
+    fn a_worktree_of_an_unmapped_repo_inside_a_mapped_repo_prints_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code/corrtex");
+        repo(&code);
+        let unmapped = tmp.path().join("code/unmapped");
+        repo(&unmapped);
+        let feature = code.join(".worktrees/feature");
+        git(&unmapped, &["worktree", "add", "-q", "-b", "f", feature.to_str().unwrap()]);
+        let config = setup(tmp.path(), &code, true);
+        assert_eq!(output(&feature, &config, tmp.path(), crate::inject::git::dirs, now(), today()), "");
+    }
 }

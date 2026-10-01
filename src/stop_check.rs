@@ -344,4 +344,17 @@ mod tests {
         let companion = json!({"decision":"block","reason":"theirs"});
         assert_eq!(merge(companion.clone(), None), companion);
     }
+
+    #[test]
+    fn a_worktree_of_an_unmapped_repo_inside_the_mapped_tree_is_allowed() {
+        let f = fixture();
+        let unmapped = f.code.parent().unwrap().join("unmapped");
+        crate::inject::git::testing::repo(&unmapped);
+        let feature = f.code.join(".worktrees/feature");
+        git(&unmapped, &["worktree", "add", "-q", "-b", "f", feature.to_str().unwrap()]);
+        commit_at(&feature, "unmapped repo work", None);
+        let mut p = payload(&f, "s-1", false);
+        p["cwd"] = json!(feature);
+        assert_eq!(check(&f, true).evaluate(&p, |_| Some(start())), None);
+    }
 }
