@@ -741,14 +741,14 @@ No background service pulls the mirror. Two things start a pull instead.
 
 - Session start. The session-start hook prints the project context and the
   tracker section first. Then it reads the project's local refresh state
-  file, `~/.wardwell/refresh/<domain>__<project>.json`. It never reads the
+  file, `~/.wardwell/refresh/<domain>/<project>.json`. It never reads the
   vault. A provider is due when its last completed pull is more than one
   hour old, or when the file is missing or unreadable. A provider whose last
   pull failed less than one hour ago is held. Nothing starts while a pull of
   the project runs, or while any start, completion or failure is younger
   than 60 seconds. A time stamped in the future counts as old.
 - When a provider is due, the hook takes the project's claim file,
-  `<domain>__<project>.claim` beside the state file, which only one process
+  `<project>.claim` beside the state file, which only one process
   can create. A claim younger than 20 minutes stops any other start; an
   older one is replaced. The hook then starts `wardwell tracker pull
   --project <domain>/<project> --provider <provider>` for the due providers
@@ -768,7 +768,7 @@ So the mirror refreshes while a session or the server runs, not on a clock
 when nothing runs.
 
 A pull records its start, completion and failure in a local state file,
-`~/.wardwell/refresh/<domain>__<project>.json`. It also writes a
+`~/.wardwell/refresh/<domain>/<project>.json`. It also writes a
 `pull_started` marker with its process id to the log before it calls the
 provider. A pull stops after 15 minutes. It always records the timeout in the
 local state, and it writes a `pull_failed` marker with the code `timeout`

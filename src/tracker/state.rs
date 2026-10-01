@@ -1,5 +1,5 @@
 //! Local refresh state: one small JSON file per project under the config
-//! dir, `refresh/<domain>__<project>.json`, never in the vault. Per provider
+//! dir, `refresh/<domain>/<project>.json`, never in the vault. Per provider
 //! it holds the last start time and process id, the last completion time,
 //! and the last failure time and code, all in wall-clock time. A pull
 //! writes it at start, completion, failure and timeout; the refresh
@@ -73,14 +73,15 @@ pub enum Record {
     Failed(FailureCode),
 }
 
-/// `<config dir>/refresh/<domain>__<project>.json`.
+/// `<config dir>/refresh/<domain>/<project>.json`: a folder per domain, so
+/// no two projects share a file whatever their names hold.
 pub fn path(config_dir: &Path, domain: &str, project: &str) -> PathBuf {
-    config_dir.join(DIR).join(format!("{domain}__{project}.json"))
+    config_dir.join(DIR).join(domain).join(format!("{project}.json"))
 }
 
-/// The claim file beside the state file.
+/// The claim file beside the state file: `refresh/<domain>/<project>.claim`.
 pub fn claim_path(config_dir: &Path, domain: &str, project: &str) -> PathBuf {
-    config_dir.join(DIR).join(format!("{domain}__{project}.claim"))
+    config_dir.join(DIR).join(domain).join(format!("{project}.claim"))
 }
 
 /// A claim younger than this stops another start; an older one is replaced.
@@ -197,7 +198,7 @@ mod tests {
     fn records_round_trip_per_provider_and_leave_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
         let file = path(dir.path(), "work", "claims");
-        assert_eq!(file, dir.path().join("refresh/work__claims.json"));
+        assert_eq!(file, dir.path().join("refresh/work/claims.json"));
         assert_eq!(read(&file), Read::Missing);
         record(&file, "linear", Record::Started(42), at(1)).unwrap();
         record(&file, "github", Record::Failed(FailureCode::Provider), at(2)).unwrap();
@@ -205,7 +206,29 @@ mod tests {
         let Read::Found(state) = read(&file) else { panic!() };
         assert_eq!(state.providers["linear"], ProviderState { started_at: Some(at(1)), pid: Some(42), completed_at: Some(at(3)), ..Default::default() });
         assert_eq!(state.providers["github"].open_failure(), Some((at(2), FailureCode::Provider)));
-        assert_eq!(std::fs::read_dir(dir.path().join(DIR)).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(dir.path().join(DIR).join("work")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn names_with_the_old_separator_keep_separate_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = path(dir.path(), "a", "b__c");
+        let second = path(dir.path(), "a__b", "c");
+        assert_ne!(first, second);
+        assert_ne!(claim_path(dir.path(), "a", "b__c"), claim_path(dir.path(), "a__b", "c"));
+        record(&first, "linear", Record::Completed, at(1)).unwrap();
+        record(&second, "linear", Record::Completed, at(2)).unwrap();
+        assert_eq!(provider(&first, "linear").unwrap().completed_at, Some(at(1)));
+        assert_eq!(provider(&second, "linear").unwrap().completed_at, Some(at(2)));
+    }
+
+    #[test]
+    fn a_state_file_at_the_old_flat_path_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join(DIR).join("work__claims.json");
+        std::fs::create_dir_all(flat.parent().unwrap()).unwrap();
+        std::fs::write(&flat, r#"{"providers":{"linear":{"completed_at":"2026-10-01T09:01:00Z"}}}"#).unwrap();
+        assert_eq!(read(&path(dir.path(), "work", "claims")), Read::Missing);
     }
 
     #[test]

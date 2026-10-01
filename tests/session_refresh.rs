@@ -169,7 +169,7 @@ fn twenty_session_starts_in_one_second_start_one_pull_and_one_provider_read() {
     let kinds: Vec<String> = rows(&log).into_iter().map(|(kind, _)| kind).collect();
     assert_eq!(kinds.iter().filter(|k| *k == "pull_started").count(), 1, "{kinds:?}");
     assert_eq!(std::fs::read_to_string(&reads).unwrap().lines().count(), 1, "one provider read");
-    assert!(!cfg.join("refresh/work__claims.claim").exists(), "the pull released its claim");
+    assert!(!cfg.join("refresh/work/claims.claim").exists(), "the pull released its claim");
 }
 
 #[cfg(unix)]
@@ -201,7 +201,7 @@ fn a_pull_past_its_deadline_is_stopped_and_records_the_timeout() {
     assert!(!out.status.success(), "{text}");
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     assert!(text.contains("tracker pull stopped after 2 seconds; recorded timeout for work/claims github"), "{text}");
-    let state = std::fs::read_to_string(cfg.join("refresh/work__claims.json")).unwrap();
+    let state = std::fs::read_to_string(cfg.join("refresh/work/claims.json")).unwrap();
     assert!(state.contains("\"code\":\"timeout\""), "{state}");
     let kinds: Vec<String> = rows(&project.join("tracker.jsonl")).into_iter().map(|(kind, _)| kind).collect();
     assert_eq!(kinds, vec!["pull_started", "pull_failed"], "the timeout marker follows the start");
