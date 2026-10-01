@@ -770,7 +770,9 @@ when nothing runs.
 A pull records its start, completion and failure in a local state file,
 `~/.wardwell/refresh/<domain>/<project>.json`. It also writes a
 `pull_started` marker with its process id to the log before it calls the
-provider. A pull stops after 15 minutes. It always records the timeout in the
+provider. A pull stops after 15 minutes. `WARDWELL_PULL_DEADLINE_SECONDS` exists for
+tests; a value from 1 to 3600 is honoured, and any other value uses the
+15 minutes. It always records the timeout in the
 local state, and it writes a `pull_failed` marker with the code `timeout`
 when the vault can be written. `status` then says "A pull started at <time>
 and did not finish." A refresh that cannot start the pull records the code

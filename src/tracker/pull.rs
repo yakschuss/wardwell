@@ -340,20 +340,15 @@ fn pull_held(
         }
     };
     let skipped = Ok(PullOutcome { appended: 0, removed: 0, full: false, resync_due: None, failed_full: None, skipped: true });
-    if recording.is_some_and(|r| overtaken(r, &binding.provider, None, mode)) {
+    // A skipped pull writes nothing: the state already holds the real
+    // completion, and a failure hold is left as it is.
+    if recording.is_some_and(|r| overtaken(r, &binding.provider, mode)) {
         return skipped;
     }
     // The start goes to the local state before the log is read, so a read
     // that never returns still leaves a start the deadline can close.
     record(state::Record::Started(std::process::id()));
-    let summary = log::read_for(path, &binding.provider);
-    if let (Some(recording), Ok(summary)) = (recording, &summary)
-        && overtaken(recording, &binding.provider, Some(summary), mode)
-    {
-        record(state::Record::Completed);
-        return skipped;
-    }
-    let result = summary
+    let result = log::read_for(path, &binding.provider)
         .map_err(|message| PullError::new(FailureCode::LogRead, message))
         .and_then(|mut summary| {
             let started = pull_started(binding, now, std::process::id(), mode == Mode::AutomaticFull);
@@ -430,11 +425,12 @@ fn pull_locked(
     Ok(PullOutcome { appended, removed, full, resync_due: None, failed_full: None, skipped: false })
 }
 
-/// True when a pull of `provider` completed after this one began and not
-/// later than this pull's clock now, by the
-/// refresh state or by the log re-read under the lock. A full pull a person
-/// asked for is never overtaken.
-fn overtaken(recording: &Recording<'_>, provider: &str, summary: Option<&log::LogSummary>, mode: Mode) -> bool {
+/// True when the local refresh state shows a completion of `provider` later
+/// than this pull's start and not later than its clock now. A log row never
+/// decides it: a row's time is the writing pull's start, and another clock's
+/// row can stand ahead of this one. A full pull a person asked for is never
+/// overtaken.
+fn overtaken(recording: &Recording<'_>, provider: &str, mode: Mode) -> bool {
     if matches!(mode, Mode::Full | Mode::FullAllowEmpty) {
         return false;
     }
@@ -443,8 +439,7 @@ fn overtaken(recording: &Recording<'_>, provider: &str, summary: Option<&log::Lo
     // One stamped later than the clock is from a skewed or future clock and
     // never stops a pull.
     let after_start = |at: DateTime<Utc>| at > recording.began && at <= clock;
-    let in_state = state::provider(recording.state, provider).and_then(|s| s.completed_at).is_some_and(after_start);
-    in_state || summary.and_then(|s| s.last_pull_at).is_some_and(after_start)
+    state::provider(recording.state, provider).and_then(|s| s.completed_at).is_some_and(after_start)
 }
 
 /// Marker for a pull about to call the provider, in process `pid`. An
@@ -789,6 +784,51 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// Counts provider reads across threads, waits `hold`, then fails.
+    struct SlowFails(std::sync::Arc<std::sync::atomic::AtomicUsize>, Duration);
+
+    impl Adapter for SlowFails {
+        fn pull(&self, _: Option<DateTime<Utc>>, _: bool, _: &mut Sink<'_>) -> Result<(), String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.1);
+            Err("Linear request failed".to_string())
+        }
+    }
+
+    #[test]
+    fn a_foreign_log_completion_never_makes_a_waiting_pull_skip_or_clear_a_hold() {
+        let vault = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        crate::tracker::credential::save(&crate::tracker::credential::path_in(config.path(), "corr-linear").unwrap(), "t").unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let ahead = (Utc::now() + TimeDelta::seconds(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let resync = format!(r#"{{"kind":"full_resync","id":"r","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{ahead}","title":"r","issues":0,"removed":0}}"#);
+        let foreign = format!(r#"{{"kind":"pull_completed","id":"foreign","provider":"linear","external_key":"COR","external_id":"COR","occurred_at":"{ahead}","title":"foreign"}}"#);
+        std::fs::write(&path, format!("{}\n{resync}\n{foreign}\n", crate::tracker::events::SCHEMA_HEADER)).unwrap();
+        let state_path = state::path(config.path(), "work", "claims");
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pull_in_thread = |hold: Duration| {
+            let (vault_dir, config_dir, counter) = (vault.path().to_path_buf(), config.path().to_path_buf(), std::sync::Arc::clone(&reads));
+            std::thread::spawn(move || {
+                let connect = move |_: &TrackerBinding, _: Option<&Credential>| -> Result<Box<dyn Adapter>, String> { Ok(Box::new(SlowFails(std::sync::Arc::clone(&counter), hold))) };
+                pull_binding(&vault_dir, &config_dir, &binding(), Mode::IncrementalOnly, Utc::now(), &connect)
+            })
+        };
+        let a = pull_in_thread(Duration::from_millis(2500));
+        std::thread::sleep(Duration::from_millis(200));
+        let b = pull_in_thread(Duration::ZERO);
+        let a = a.join().unwrap().unwrap_err();
+        assert_eq!(a.code, FailureCode::Provider);
+        let b = b.join().unwrap();
+        assert!(!matches!(&b, Ok(outcome) if outcome.skipped), "B must not skip: {b:?}");
+        assert_eq!(b.unwrap_err().code, FailureCode::Provider, "B failed on its own terms");
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2, "B read the provider");
+        let local = state::provider(&state_path, "linear").unwrap();
+        assert_eq!(local.completed_at, None, "no pull recorded a completion");
+        assert!(local.open_failure().is_some(), "the failure hold stays: {local:?}");
     }
 
     #[test]
