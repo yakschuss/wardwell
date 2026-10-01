@@ -1,5 +1,7 @@
 use crate::config::loader::{self, config_dir};
 use crate::install::detect;
+use crate::install::installer;
+use crate::tracker::schedule::{SystemRunner, current_uid};
 use crate::install::mcp_config::{self, McpConfigPaths, RemovalResult};
 
 /// Clean removal. Reverse of init.
@@ -45,16 +47,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. Remove hooks from settings.json
+    // 3. Remove Wardwell's hooks, the deny entries it added, and the pull
+    // service, matched exactly, with a backup. The Wardwell folder stays.
     let home = dirs::home_dir().unwrap_or_default();
-    let settings_path = home.join(".claude/settings.json");
-    for event in &["SessionStart", "SessionEnd"] {
-        print!("  Removing {event} hook...  ");
-        match remove_hook(&settings_path, event) {
-            Ok(true) => println!("removed"),
-            Ok(false) => println!("not found (ok)"),
-            Err(e) => println!("error: {e}"),
+    println!("  Removing hooks, Wardwell's deny entries, and the tracker pull...");
+    match installer::uninstall_plan(&home, &config_dir()) {
+        Ok(plan) => {
+            for line in &plan.lines {
+                println!("{}", line.render());
+            }
+            match installer::apply(&plan, &SystemRunner, &current_uid) {
+                Ok(report) => report.iter().for_each(|line| println!("{line}")),
+                Err(error) => println!("    unchanged: {error}"),
+            }
         }
+        Err(error) => println!("    unchanged: {error}"),
     }
 
     // Also clean up legacy hook script if it exists
@@ -92,7 +99,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("  Removed MCP entries, hooks, markers, and databases.");
+    println!("  Removed MCP entries, hooks, deny entries Wardwell added, the tracker pull, markers, and databases.");
+    println!("  Sessions already running keep their hooks until they end.");
     println!(
         "  Your vault and config preserved at {}.",
         config_dir().display()
@@ -116,52 +124,6 @@ fn print_removal(label: &str, result: Result<RemovalResult, std::io::Error>) {
         Ok(RemovalResult { removed: false, .. }) => println!("not found (ok)"),
         Err(error) => println!("unchanged: {error}"),
     }
-}
-
-/// Remove wardwell hooks from a given event in settings.json.
-fn remove_hook(settings_path: &std::path::Path, event: &str) -> Result<bool, std::io::Error> {
-    if !settings_path.exists() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(settings_path)?;
-    let mut config: serde_json::Value =
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
-
-    let removed = if let Some(hooks) = config.get_mut("hooks")
-        && let Some(event_hooks) = hooks.get_mut(event)
-        && let Some(entries) = event_hooks.as_array_mut()
-    {
-        let before = entries.len();
-        entries.retain(|entry| {
-            let is_wardwell = entry
-                .get("command")
-                .and_then(|c| c.as_str())
-                .is_some_and(|c| c.contains("wardwell"))
-                || entry
-                    .get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| c.contains("wardwell"))
-                        })
-                    });
-            !is_wardwell
-        });
-        entries.len() < before
-    } else {
-        false
-    };
-
-    if removed {
-        let json = serde_json::to_string_pretty(&config)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        std::fs::write(settings_path, json)?;
-    }
-
-    Ok(removed)
 }
 
 /// Remove wardwell markers and content between them from a CLAUDE.md file.

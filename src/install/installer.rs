@@ -673,4 +673,15 @@ mod tests {
         let again = uninstall_plan(&h.home, &h.cfg).unwrap();
         assert!(again.is_noop(), "{}", rendered(&again));
     }
+
+    #[test]
+    fn uninstall_on_a_clean_home_writes_nothing() {
+        let h = home();
+        let plan = uninstall_plan(&h.home, &h.cfg).unwrap();
+        assert!(plan.is_noop());
+        assert!(plan.lines.iter().all(|l| l.action == Action::Unchanged));
+        apply(&plan, &Fake::new(&[]), &|| Ok(501)).unwrap();
+        assert!(!h.home.join(".claude").exists());
+        assert!(!manifest::path(&h.cfg).exists());
+    }
 }
