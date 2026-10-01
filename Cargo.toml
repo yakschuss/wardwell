@@ -1,6 +1,6 @@
 [package]
 name = "wardwell"
-version = "0.11.1+tracker.mirror.6"
+version = "0.12.0"
 edition = "2024"
 description = "Persistent project memory for Claude Code — MCP server + CLI"
 license = "BSL-1.1"
