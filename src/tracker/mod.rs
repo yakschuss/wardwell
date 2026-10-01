@@ -6,11 +6,11 @@
 
 pub mod adapter;
 pub mod cli;
+pub mod compact;
 pub mod credential;
 pub mod doctor;
 pub mod events;
 pub mod items;
-pub mod compact;
 pub mod linear;
 pub mod lock;
 pub mod log;
