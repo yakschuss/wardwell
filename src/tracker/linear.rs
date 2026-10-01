@@ -714,6 +714,56 @@ mod tests {
     }
 
     #[test]
+    fn old_id_log_re_pulled_with_branches_appends_one_snapshot_per_issue_and_removes_nothing() {
+        use crate::config::TrackerBinding;
+        use crate::tracker::{log, pull::pull_project};
+        let updated = "2026-09-01T14:00:00.000Z";
+        let nodes = |branch: bool| -> Vec<Value> {
+            (1..=3)
+                .map(|n| {
+                    let mut node = issue(&format!("i{n}"), &format!("COR-{n}"), "T", updated, None);
+                    if branch {
+                        node["branchName"] = json!(format!("jane/cor-{n}"));
+                    }
+                    node
+                })
+                .collect()
+        };
+        let binding = TrackerBinding {
+            domain: "work".into(),
+            project: "claims".into(),
+            provider: "linear".into(),
+            team: "COR".into(),
+            credential: "corr-linear".into(),
+            readonly: true,
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let path = log::path_for(vault.path(), "work", "claims");
+        let at = |h| Utc.with_ymd_and_hms(2026, 9, 2, h, 0, 0).unwrap();
+        let upserts = || {
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Event>(line).ok())
+                .filter(|event| matches!(event, Event::IssueUpserted { .. }))
+                .count()
+        };
+
+        // Written by the adapter before branch names: legacy ids.
+        let old = FakeTransport::new(vec![page(nodes(false), None)]);
+        pull_project(vault.path(), &binding, &Linear::new(&old, "COR"), true, at(1)).unwrap();
+        assert_eq!(upserts(), 3);
+
+        let new = FakeTransport::new(vec![page(nodes(true), None)]);
+        let outcome = pull_project(vault.path(), &binding, &Linear::new(&new, "COR"), true, at(2)).unwrap();
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(upserts(), 6, "exactly one new snapshot per issue");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("issue_removed"), "{content}");
+        assert_eq!(log::read(&path).unwrap().open_issues.len(), 3);
+    }
+
+    #[test]
     fn archived_issue_is_a_snapshot_with_archived_at() {
         let transport = FakeTransport::new(vec![page(
             vec![issue("i2", "COR-13", "Old export", "2026-09-02T09:00:00.000Z", Some("2026-09-02T09:00:00.000Z"))],

@@ -128,5 +128,7 @@ mod tests {
         assert!(!watches(Path::new("/v/work/claims/tracker.raw.jsonl")));
         assert!(!watches(Path::new("/v/work/claims/tracker.jsonl.bak")));
         assert!(!watches(Path::new("/v/work/claims/tracker.lock")));
+        assert!(!watches(Path::new("/v/work/claims/tracker.jsonl.compact")), "the compact temp file");
+        assert!(!watches(Path::new("/v/work/claims/tracker.jsonl.bak.new")), "the next backup");
     }
 }
