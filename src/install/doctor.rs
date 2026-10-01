@@ -96,6 +96,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                // Mapped projects: paths, ages, last Stop-check block
+                let (rows, projects_ok) = project_rows(&config, &config_dir(), chrono::Utc::now());
+                for row in rows {
+                    println!("{row}");
+                }
+                all_ok &= projects_ok;
+
                 // Tracker bindings: offline checks only
                 let (rows, trackers_ok) = tracker_rows(&config, &config_dir());
                 for row in rows {
@@ -247,6 +254,49 @@ fn tracker_rows_with(
         })
         .collect();
     (rows, ok)
+}
+
+/// One row per mapped project: whether each path exists, the age of the
+/// last history entry and decision, the last pull when bound, and the last
+/// Stop-check block. A missing path or vault folder fails the row.
+fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path, now: chrono::DateTime<chrono::Utc>) -> (Vec<String>, bool) {
+    let mut ok = true;
+    let rows = config
+        .projects
+        .iter()
+        .map(|(key, mapping)| {
+            let label = format!("Project {key}");
+            let folder = config.vault_path.join(&mapping.domain).join(&mapping.project);
+            let paths: Vec<String> = mapping.paths.iter().map(|p| format!("{} {}", p.display(), if p.is_dir() { "exists" } else { "missing" })).collect();
+            let row_ok = folder.is_dir() && mapping.paths.iter().all(|p| p.is_dir());
+            ok &= row_ok;
+            let mark = if row_ok { '\u{2713}' } else { '\u{2717}' };
+            if !folder.is_dir() {
+                return format!("  {label:<38} {mark} {}. No vault folder; run `wardwell seed {key}`.", paths.join(", "));
+            }
+            let today = now.with_timezone(&chrono::Local).date_naive();
+            let rot = crate::inject::session::project_rot_line(&folder, today);
+            format!("  {label:<38} {mark} {}. {rot}{} {}", paths.join(", "), last_pull(config, mapping, &folder, now), last_block(config_dir, key, now))
+        })
+        .collect();
+    (rows, ok)
+}
+
+/// ` Last pull 2 hours ago.` for a bound project, empty otherwise.
+fn last_pull(config: &crate::config::loader::WardwellConfig, mapping: &crate::config::loader::ProjectMapping, folder: &Path, now: chrono::DateTime<chrono::Utc>) -> String {
+    if config.tracker_for(&mapping.domain, &mapping.project).is_none() {
+        return String::new();
+    }
+    let view = crate::tracker::view::MirrorView::read(&folder.join(crate::tracker::events::FILE_NAME)).unwrap_or_default();
+    view.last_pull_at.map_or(" Never pulled.".to_string(), |at| format!(" Last pull {} ago.", crate::tracker::view::age_words(now - at)))
+}
+
+fn last_block(config_dir: &Path, key: &str, now: chrono::DateTime<chrono::Utc>) -> String {
+    let state = crate::stop_check::state_dir(config_dir);
+    crate::stop_check::last_block(&state, key).map_or("No stop-check blocks.".to_string(), |(at, commits)| {
+        let noun = if commits == 1 { "commit" } else { "commits" };
+        format!("Last stop-check block {} ago, {commits} {noun}.", crate::tracker::view::age_words(now - at))
+    })
 }
 
 fn check_session_start_hook(settings_path: &std::path::Path) -> bool {
@@ -512,5 +562,72 @@ mod tests {
         assert!(!check_session_start_hook(std::path::Path::new(
             "/nonexistent"
         )));
+    }
+
+    fn project_config(dir: &Path, paths: &[&Path], bound: bool) -> crate::config::loader::WardwellConfig {
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(vault.join("personal/corr")).unwrap();
+        let list: Vec<String> = paths.iter().map(|p| format!("\"{}\"", p.display())).collect();
+        let mut yaml = format!("vault_path: {}\nsession_sources: []\nprojects:\n  personal/corr:\n    paths: [{}]\n", vault.display(), list.join(", "));
+        if bound {
+            yaml.push_str("trackers:\n  personal/corr:\n    provider: linear\n    team: COR\n    credential: c\n");
+        }
+        loader::parse(&yaml).unwrap()
+    }
+
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-30T12:00:00Z").unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn project_rows_show_paths_ages_and_the_last_block_in_the_row_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("code");
+        std::fs::create_dir_all(&code).unwrap();
+        let config = project_config(dir.path(), &[&code], false);
+        let project = dir.path().join("vault/personal/corr");
+        std::fs::write(project.join("history.jsonl"), "{\"date\":\"2026-09-28T10:00:00Z\",\"title\":\"x\"}\n").unwrap();
+        let (rows, ok) = project_rows(&config, dir.path(), noon());
+        assert!(ok);
+        assert_eq!(rows, vec![format!("  {:<38} \u{2713} {} exists. Last history entry 2 days ago. No decisions. No stop-check blocks.", "Project personal/corr", code.display())]);
+        assert_eq!(rows[0].find('\u{2713}'), "  Config                                 \u{2713}".find('\u{2713}'), "marks line up");
+
+        let state = crate::stop_check::state_dir(dir.path());
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join(crate::stop_check::LOG), "{\"at\":\"2026-09-30T09:00:00Z\",\"project\":\"personal/corr\",\"commits\":2,\"session_id\":\"s\",\"since\":\"2026-09-30T08:00:00Z\"}\n").unwrap();
+        let (rows, _) = project_rows(&config, dir.path(), noon());
+        assert!(rows[0].ends_with("Last stop-check block 3 hours ago, 2 commits."), "{}", rows[0]);
+    }
+
+    #[test]
+    fn a_missing_path_or_vault_folder_fails_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("code");
+        let gone = dir.path().join("gone");
+        std::fs::create_dir_all(&code).unwrap();
+        let config = project_config(dir.path(), &[&code, &gone], false);
+        let (rows, ok) = project_rows(&config, dir.path(), noon());
+        assert!(!ok);
+        assert!(rows[0].contains(&format!("\u{2717} {} exists, {} missing.", code.display(), gone.display())), "{}", rows[0]);
+
+        std::fs::remove_dir_all(dir.path().join("vault/personal/corr")).unwrap();
+        let config = project_config(dir.path(), &[&code], false);
+        std::fs::remove_dir_all(dir.path().join("vault/personal/corr")).unwrap();
+        let (rows, ok) = project_rows(&config, dir.path(), noon());
+        assert!(!ok);
+        assert!(rows[0].contains("\u{2717}") && rows[0].contains("No vault folder; run `wardwell seed personal/corr`."), "{}", rows[0]);
+    }
+
+    #[test]
+    fn a_bound_project_row_adds_the_last_pull_and_no_mapping_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("code");
+        std::fs::create_dir_all(&code).unwrap();
+        let config = project_config(dir.path(), &[&code], true);
+        let (rows, _) = project_rows(&config, dir.path(), noon());
+        assert!(rows[0].contains("No decisions. Never pulled. No stop-check blocks."), "{}", rows[0]);
+        let mut config = config;
+        config.projects.clear();
+        assert_eq!(project_rows(&config, dir.path(), noon()), (vec![], true));
     }
 }
