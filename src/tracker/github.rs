@@ -361,21 +361,45 @@ fn time(node: &Value, key: &str) -> Option<DateTime<Utc>> {
 /// Error text when the API answers 404, so doctor can name a missing repository.
 const NOT_FOUND: &str = "GitHub returned HTTP 404";
 
-/// Runs the `gh` that `locate_gh` found. Standard error is discarded and
-/// nothing is echoed; a run past `GH_TIMEOUT` is killed and counts as failed.
+/// Runs the `gh` that `locate_gh` found, in its own process group.
+/// Standard error is discarded and nothing is echoed. A run past its time
+/// limit has its whole group killed, so a child of `gh` that keeps standard
+/// output open cannot hold the pull.
 pub struct SystemGh {
     program: Option<std::path::PathBuf>,
+    timeout: Duration,
+    output_limit: usize,
 }
 
 impl SystemGh {
     /// The runner for the `gh` at `program`; None runs nothing and answers `Missing`.
     pub fn at(program: Option<std::path::PathBuf>) -> Self {
-        Self { program }
+        Self { program, timeout: GH_TIMEOUT, output_limit: RESPONSE_LIMIT }
     }
 
     /// The runner for the `gh` that `find_gh` finds.
     pub fn located() -> Self {
         Self::at(find_gh())
+    }
+
+    /// The same runner with another time limit and output limit.
+    pub fn with_limits(self, timeout: Duration, output_limit: usize) -> Self {
+        Self { timeout, output_limit, ..self }
+    }
+
+    fn spawn(&self, program: &std::path::Path, args: &[String]) -> std::io::Result<std::process::Child> {
+        let mut command = std::process::Command::new(program);
+        command
+            .args(args)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("NO_COLOR", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        command.spawn()
     }
 }
 
@@ -384,48 +408,73 @@ impl GhRunner for SystemGh {
         let Some(program) = &self.program else {
             return GhOutcome::Missing;
         };
-        let spawned = std::process::Command::new(program)
-            .args(args)
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_NO_UPDATE_NOTIFIER", "1")
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        let Ok(mut child) = spawned else {
+        let Ok(mut child) = self.spawn(program, args) else {
             return GhOutcome::Missing;
         };
+        let deadline = Instant::now() + self.timeout;
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            stop(&mut child);
             return GhOutcome::Missing;
         };
-        // Read on a thread so a full pipe never blocks the wait below.
-        let reader = std::thread::spawn(move || {
+        // Read on a thread so a full pipe never blocks; receive with a bound,
+        // since a child of `gh` may hold the pipe open past `gh` itself.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let limit = self.output_limit;
+        std::thread::spawn(move || {
             let mut bytes = Vec::new();
-            stdout.take(RESPONSE_LIMIT as u64 + 1).read_to_end(&mut bytes).map(|_| bytes)
+            let read = stdout.take(limit as u64 + 1).read_to_end(&mut bytes).map(|_| bytes);
+            let _ = sender.send(read);
         });
-        let deadline = Instant::now() + GH_TIMEOUT;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
+        let bytes = match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(bytes)) if bytes.len() > limit => {
+                stop(&mut child);
+                return GhOutcome::Oversize(limit);
+            }
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => Vec::new(),
+            Err(_) => {
+                stop(&mut child);
+                return GhOutcome::TimedOut(self.timeout);
             }
         };
-        match (status, reader.join()) {
-            (None, _) => GhOutcome::TimedOut(GH_TIMEOUT),
-            (Some(_), Ok(Ok(bytes))) if bytes.len() > RESPONSE_LIMIT => GhOutcome::Oversize(RESPONSE_LIMIT),
-            (Some(status), _) if status.code() == Some(GH_SIGNED_OUT) => GhOutcome::SignedOut,
-            (Some(status), _) if !status.success() => GhOutcome::Exited(status.code()),
-            (Some(_), Ok(Ok(bytes))) => GhOutcome::Output(bytes),
-            (Some(_), _) => GhOutcome::Exited(None),
+        let Some(status) = wait_until(&mut child, deadline) else {
+            stop(&mut child);
+            return GhOutcome::TimedOut(self.timeout);
+        };
+        match status.code() {
+            Some(0) => GhOutcome::Output(bytes),
+            Some(GH_SIGNED_OUT) => GhOutcome::SignedOut,
+            code => GhOutcome::Exited(code),
         }
     }
+}
+
+/// The child's exit status once it exits, or None at `deadline`.
+fn wait_until(child: &mut std::process::Child, deadline: Instant) -> Option<std::process::ExitStatus> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => return None,
+        }
+    }
+}
+
+/// Kill the child's whole process group, then reap the child. The group id
+/// is the child's id, since it was spawned as a group leader.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-KILL", "--", &group])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Bounded HTTPS reads from the GitHub REST API with a bearer token. Never
@@ -740,6 +789,20 @@ pub(crate) mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_child_of_gh_holding_stdout_does_not_outlast_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeout = Duration::from_secs(1);
+        for body in ["sleep 30 &\necho '[]'\nexit 0", "echo '['\nsleep 30 &\nsleep 30"] {
+            let stub = stub_gh(dir.path(), body);
+            let runner = SystemGh::at(Some(stub)).with_limits(timeout, RESPONSE_LIMIT);
+            let started = Instant::now();
+            assert_eq!(runner.run(&[]), GhOutcome::TimedOut(timeout), "{body}");
+            assert!(started.elapsed() < timeout + Duration::from_millis(1500), "{body}: {:?}", started.elapsed());
+        }
     }
 
     #[cfg(unix)]

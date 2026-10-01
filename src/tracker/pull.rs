@@ -855,6 +855,23 @@ mod tests {
         assert!(!log::path_for(vault.path(), "work", "claims").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_gh_timeout_records_its_failure_and_releases_the_project_lock() {
+        use crate::tracker::github::{SystemGh, tests::stub_gh};
+        let dir = tempfile::tempdir().unwrap();
+        let stub = stub_gh(dir.path(), "sleep 30 &\nsleep 30");
+        let runner = SystemGh::at(Some(stub)).with_limits(Duration::from_secs(1), 1024);
+        let vault = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        let error = pull_project(vault.path(), &github(), &github_for(&github(), None, Box::new(runner)), false, at(12)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(2500), "{:?}", started.elapsed());
+        assert_eq!((error.message.as_str(), error.code), ("gh did not finish within 1 seconds", FailureCode::Provider));
+        let path = log::path_for(vault.path(), "work", "claims");
+        assert_eq!(log::read_for(&path, "github").unwrap().last_failure.map(|(_, c)| c), Some(FailureCode::Provider));
+        lock::acquire(&path, lock::TEST_FREE_WAIT).unwrap();
+    }
+
     #[test]
     fn a_failing_gh_without_a_token_is_a_provider_failure_with_its_sentence() {
         use crate::tracker::github::GhOutcome;
