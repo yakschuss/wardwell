@@ -420,14 +420,27 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
             ok &= row_ok;
             let mark = if row_ok { '\u{2713}' } else { '\u{2717}' };
             if !folder.is_dir() {
-                return format!("  {label:<38} {mark} {}. No vault folder; run `wardwell seed {key}`.", paths.join(", "));
+                return format!("  {label:<38} {mark} {}. No vault folder; run `wardwell seed {key}`. {}", paths.join(", "), kanban_words(config, key));
             }
             let today = now.with_timezone(&chrono::Local).date_naive();
             let rot = crate::inject::session::project_rot_line(&folder, today);
-            format!("  {label:<38} {mark} {}. {rot}{} {}", paths.join(", "), last_pull(config, config_dir, mapping, now), last_block(config_dir, key, now))
+            format!("  {label:<38} {mark} {}. {rot}{} {} {}", paths.join(", "), last_pull(config, config_dir, mapping, now), last_block(config_dir, key, now), kanban_words(config, key))
         })
         .collect();
     (rows, ok)
+}
+
+/// The kanban state of a mapped project: on, or off with where its work
+/// lives.
+fn kanban_words(config: &crate::config::loader::WardwellConfig, key: &str) -> String {
+    if config.kanban_on(key) {
+        return "kanban: on.".to_string();
+    }
+    let binding = crate::config::loader::project_key_parts(key).and_then(|(domain, project)| config.tracker_for(domain, project));
+    match binding {
+        Some(b) => format!("kanban: off, tracker {} {}.", b.provider, b.scope()),
+        None => "kanban: off, no tracker binding.".to_string(),
+    }
 }
 
 /// One mapped path as doctor reports it, and whether it is usable. A path
@@ -819,14 +832,14 @@ mod tests {
         std::fs::write(project.join("history.jsonl"), "{\"date\":\"2026-09-28T10:00:00Z\",\"title\":\"x\"}\n").unwrap();
         let (rows, ok) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
         assert!(ok);
-        assert_eq!(rows, vec![format!("  {:<38} \u{2713} {} exists. Last history entry 2 days ago. No decisions. No stop-check blocks.", "Project personal/corr", code.display())]);
+        assert_eq!(rows, vec![format!("  {:<38} \u{2713} {} exists. Last history entry 2 days ago. No decisions. No stop-check blocks. kanban: off, no tracker binding.", "Project personal/corr", code.display())]);
         assert_eq!(rows[0].find('\u{2713}'), "  Config                                 \u{2713}".find('\u{2713}'), "marks line up");
 
         let state = crate::stop_check::state_dir(dir.path());
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join(crate::stop_check::LOG), "{\"at\":\"2026-09-30T09:00:00Z\",\"project\":\"personal/corr\",\"commits\":2,\"session_id\":\"s\",\"since\":\"2026-09-30T08:00:00Z\"}\n").unwrap();
         let (rows, _) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
-        assert!(rows[0].ends_with("Last stop-check block 3 hours ago, 2 commits."), "{}", rows[0]);
+        assert!(rows[0].contains("Last stop-check block 3 hours ago, 2 commits."), "{}", rows[0]);
     }
 
     #[test]
@@ -859,6 +872,24 @@ mod tests {
         let mut config = config;
         config.projects.clear();
         assert_eq!(project_rows(&config, dir.path(), noon(), |_: &Path| None), (vec![], true));
+    }
+
+    #[test]
+    fn each_project_row_says_whether_its_kanban_is_on_or_where_the_work_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("code");
+        std::fs::create_dir_all(&code).unwrap();
+        let mut config = project_config(dir.path(), &[&code], true);
+        config.kanban_enabled = true;
+        config.trackers[0].readonly = true;
+        let row = |c: &crate::config::loader::WardwellConfig| project_rows(c, dir.path(), noon(), |_: &Path| None).0.remove(0);
+        assert!(row(&config).ends_with("kanban: off, tracker linear COR."), "readonly binding infers off: {}", row(&config));
+        config.trackers[0].readonly = false;
+        assert!(row(&config).ends_with("kanban: on."), "{}", row(&config));
+        config.projects.values_mut().for_each(|m| m.kanban = Some(false));
+        assert!(row(&config).ends_with("kanban: off, tracker linear COR."), "{}", row(&config));
+        config.trackers.clear();
+        assert!(row(&config).ends_with("kanban: off, no tracker binding."), "{}", row(&config));
     }
 
     #[test]
