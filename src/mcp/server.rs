@@ -589,19 +589,9 @@ impl WardwellServer {
             Some(self.allowed_domains.clone())
         };
 
-        let query = SearchQuery {
-            query: query_str,
-            domains: search_domains,
-            types: Vec::new(),
-            status: None,
-            limit: self.fetch_limit(p.limit.unwrap_or(5)),
-        };
-
-        match self.index.search(&query) {
-            Ok(mut results) => {
-                self.drop_off_native(&mut results.results, |r| r.path.as_str());
-                results.results.truncate(p.limit.unwrap_or(5));
-                results.total = results.results.len();
+        let limit = p.limit.unwrap_or(5);
+        match self.keyword_search(&query_str, search_domains, limit) {
+            Ok(results) => {
                 // Track accessed projects from search results
                 for r in &results.results {
                     if let Some((d, p)) = extract_domain_project(&r.path) {
@@ -635,17 +625,8 @@ impl WardwellServer {
             Some(self.allowed_domains.clone())
         };
 
-        match crate::index::hybrid::hybrid_search(
-            &self.index,
-            embedder,
-            query,
-            self.fetch_limit(limit),
-            domains.as_deref(),
-        ) {
-            Ok(mut results) => {
-                self.drop_off_native(&mut results.chunks, |c| c.path.as_str());
-                results.chunks.truncate(limit);
-                results.total = results.chunks.len();
+        match self.hybrid_filled(embedder, query, domains.as_deref(), limit) {
+            Ok(results) => {
                 // Track accessed projects from chunk results
                 for chunk in &results.chunks {
                     if let Some((d, p)) = extract_domain_project(&chunk.path) {
@@ -663,20 +644,8 @@ impl WardwellServer {
                 } else {
                     Some(self.allowed_domains.clone())
                 };
-                let fallback_query = SearchQuery {
-                    query: query.to_string(),
-                    domains: fallback_domains,
-                    types: Vec::new(),
-                    status: None,
-                    limit: self.fetch_limit(limit),
-                };
-                match self.index.search(&fallback_query) {
-                    Ok(mut results) => {
-                        self.drop_off_native(&mut results.results, |r| r.path.as_str());
-                        results.results.truncate(limit);
-                        results.total = results.results.len();
-                        serde_json::to_string_pretty(&results).unwrap_or_default()
-                    }
+                match self.keyword_search(query, fallback_domains, limit) {
+                    Ok(results) => serde_json::to_string_pretty(&results).unwrap_or_default(),
                     Err(e2) => json_error(&format!("Search failed: {e2}")),
                 }
             }

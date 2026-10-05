@@ -47,20 +47,44 @@ impl WardwellServer {
         }
     }
 
-    /// Drop the entries whose path is native kanban text of an off project.
-    pub(super) fn drop_off_native<T>(&self, entries: &mut Vec<T>, path: impl Fn(&T) -> &str) {
-        entries.retain(|entry| match crate::kanban::native_file_project(path(entry)) {
-            Some((domain, project)) => !self.config.kanban_off_for_project(&format!("{domain}/{project}")),
-            None => true,
-        });
+    /// Keyword search that returns `limit` hits that are not native kanban
+    /// text of an off project, when that many exist: it asks the index for
+    /// more until the limit is filled or the index has no more.
+    pub(super) fn keyword_search(&self, query: &str, domains: Option<Vec<String>>, limit: usize) -> Result<crate::index::fts::SearchResults, crate::index::store::IndexError> {
+        let mut suggestions = Vec::new();
+        let found = self.filled(limit, |n| {
+            let q = crate::index::fts::SearchQuery { query: query.to_string(), domains: domains.clone(), types: Vec::new(), status: None, limit: n };
+            let r = self.index.search(&q)?;
+            suggestions = r.suggestions;
+            Ok(r.results)
+        }, |r| r.path.as_str())?;
+        Ok(crate::index::fts::SearchResults { total: found.len(), results: found, suggestions })
     }
 
-    /// How many index hits to fetch so `limit` remain once native kanban text
-    /// of off projects is dropped.
-    pub(super) fn fetch_limit(&self, limit: usize) -> usize {
-        let bound: Vec<String> = self.config.trackers.iter().map(|b| b.key()).collect();
-        let any_off = self.config.projects.keys().chain(bound.iter()).any(|key| self.config.kanban_off_for_project(key));
-        if any_off { limit.saturating_mul(4) } else { limit }
+    /// `keyword_search` for the hybrid index.
+    pub(super) fn hybrid_filled(&self, embedder: &mut crate::index::embed::Embedder, query: &str, domains: Option<&[String]>, limit: usize) -> Result<crate::index::hybrid::HybridResults, crate::index::store::IndexError> {
+        let found = self.filled(limit, |n| Ok(crate::index::hybrid::hybrid_search(&self.index, embedder, query, n, domains)?.chunks), |c| c.path.as_str())?;
+        Ok(crate::index::hybrid::HybridResults { total: found.len(), chunks: found })
+    }
+
+    fn filled<T>(&self, limit: usize, mut fetch: impl FnMut(usize) -> Result<Vec<T>, crate::index::store::IndexError>, path: impl Fn(&T) -> &str) -> Result<Vec<T>, crate::index::store::IndexError> {
+        if limit == 0 {
+            return fetch(0);
+        }
+        let mut asked = limit;
+        loop {
+            let mut found = fetch(asked)?;
+            let exhausted = found.len() < asked;
+            found.retain(|entry| match crate::kanban::native_file_project(path(entry)) {
+                Some((domain, project)) => !self.config.kanban_off_for_project(&format!("{domain}/{project}")),
+                None => true,
+            });
+            if found.len() >= limit || exhausted {
+                found.truncate(limit);
+                return Ok(found);
+            }
+            asked = asked.saturating_mul(4);
+        }
     }
 }
 
@@ -213,10 +237,18 @@ mod tests {
     }
 
     #[test]
-    fn search_over_fetches_so_an_off_project_does_not_starve_the_limit() {
+    fn search_fills_the_limit_past_many_native_files_of_an_off_project() {
         let f = fixture_with(&standard_mirror(), true, None);
-        assert_eq!(f.server.fetch_limit(5), 20);
-        let on = fixture_with(&standard_mirror(), false, Some(true));
-        assert_eq!(on.server.fetch_limit(5), 5);
+        let vault = &f.server.vault_root;
+        std::fs::create_dir_all(vault.join("work/te")).unwrap();
+        std::fs::create_dir_all(vault.join("work/claims/status")).unwrap();
+        for i in 0..6 {
+            std::fs::write(vault.join(format!("work/claims/status/s{i}.md")), "zebrafish zebrafish zebrafish zebrafish zebrafish\n").unwrap();
+        }
+        std::fs::write(vault.join("work/te/current_state.md"), "# State\n\nzebrafish once\n").unwrap();
+        crate::index::builder::IndexBuilder::build_filtered(&f.server.index, vault, &[], None).unwrap();
+        let params: super::super::SearchParams = serde_json::from_value(json!({"action": "search", "query": "zebrafish", "limit": 1})).unwrap();
+        let found: Value = serde_json::from_str(&f.server.action_search(&params)).unwrap();
+        assert_eq!(paths(&found), vec!["work/te/current_state.md"], "{found}");
     }
 }
