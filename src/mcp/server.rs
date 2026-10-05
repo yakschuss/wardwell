@@ -667,6 +667,10 @@ impl WardwellServer {
             }
         }
 
+        if let Some(refusal) = self.read_refusal(&path) {
+            return json_error(&refusal);
+        }
+
         let full_path = resolve_path(&self.vault_root, &path);
         let vf = match full_path.and_then(|fp| crate::vault::reader::read_file(&fp).ok()) {
             Some(vf) => vf,

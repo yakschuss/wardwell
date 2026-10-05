@@ -47,6 +47,12 @@ impl WardwellServer {
         }
     }
 
+    /// Refusal when `path` is native kanban text of an off project.
+    pub(super) fn read_refusal(&self, path: &str) -> Option<String> {
+        let (domain, project) = crate::kanban::native_file_project(path.trim_start_matches('/'))?;
+        self.config.kanban_off_for_project(&format!("{domain}/{project}")).then(|| crate::tracker::kanban_off_refusal(&self.config, domain, project, false))
+    }
+
     /// Keyword search that returns `limit` hits that are not native kanban
     /// text of an off project, when that many exist: it asks the index for
     /// more until the limit is filled or the index has no more.
@@ -250,5 +256,24 @@ mod tests {
         let params: super::super::SearchParams = serde_json::from_value(json!({"action": "search", "query": "zebrafish", "limit": 1})).unwrap();
         let found: Value = serde_json::from_str(&f.server.action_search(&params)).unwrap();
         assert_eq!(paths(&found), vec!["work/te/current_state.md"], "{found}");
+    }
+
+    #[test]
+    fn reading_a_native_kanban_file_of_an_off_project_is_refused_and_other_files_are_not() {
+        let f = fixture_with(&standard_mirror(), true, None);
+        index_vault(&f);
+        let read = |path: &str| -> Value {
+            let params: super::super::SearchParams = serde_json::from_value(json!({"action": "read", "path": path})).unwrap();
+            serde_json::from_str(&f.server.action_read(&params)).unwrap()
+        };
+        for path in ["work/claims/tickets.md", "/work/claims/tickets.md"] {
+            assert_eq!(error(&read(path)), READ_OFF, "{path}");
+        }
+        assert!(read("work/claims/current_state.md").get("error").is_none());
+        let on = fixture_with(&standard_mirror(), true, Some(true));
+        index_vault(&on);
+        let params: super::super::SearchParams = serde_json::from_value(json!({"action": "read", "path": "work/claims/tickets.md"})).unwrap();
+        let body: Value = serde_json::from_str(&on.server.action_read(&params)).unwrap();
+        assert!(body.get("error").is_none(), "{body}");
     }
 }
