@@ -232,6 +232,47 @@ The command adds the directory under `projects:` in config.yml. Comments and oth
 
 `wardwell project list` shows each project and its directories. Sessions already running do not change. The mapping applies from the next session.
 
+## Kanban per project
+
+`kanban.enabled` is the default for every project. A project can turn its own native board off, so a project that works in a tracker is pointed there and the others keep the board:
+
+```yaml
+kanban:
+  enabled: true
+projects:
+  personal/corr-platform:
+    kanban: off        # its work lives in Linear team COR
+```
+
+A project mapping may carry `kanban`, `paths`, or both. An empty mapping is an error. Set it with a backup and no hand edit:
+
+```bash
+wardwell project kanban personal/corr-platform off
+wardwell project kanban personal/corr-platform on
+```
+
+The command keeps comments and other keys, saves the old file beside it, changes nothing on a second run, and prints the resulting state. `wardwell doctor` shows one `kanban:` state per mapped project: `kanban: on`, `kanban: off, tracker linear COR`, or `kanban: off, no tracker binding`.
+
+Whether a project's board is on, in this order:
+
+1. `projects.<key>.kanban: on | off` wins.
+2. With no setting, a project whose issue tracker bindings are all `readonly: true` is off. Its work lives in the tracker. A binding that mirrors merged changes (`github`) is not an issue tracker and does not count.
+3. Otherwise `kanban.enabled` decides.
+
+`kanban: on` under `kanban.enabled: false` is a load error that names the project, because the store is not open. An explicit `kanban: on` keeps the native board readable beside a readonly binding; the readonly refusal of writes still applies first.
+
+For an off project, every `wardwell_kanban` action that reaches the native board refuses. A read says:
+
+> The kanban is off for personal/corr-platform. Read its work in Linear team COR; wardwell_kanban list still returns the mirror.
+
+A write says:
+
+> The kanban is off for personal/corr-platform. Edit it in Linear team COR. Nothing was written.
+
+With no tracker binding, both say `The kanban is off for <project>. It has no tracker binding.` A readonly binding's refusal still comes first for writes. `get`, `list`, `query` and `search` still return the mirrored tracker issues for the project, with `origin: "tracker"`, and leave out its native items; a call that names the project adds `kanban_off` with the read sentence. Attachments and `export_roadmap` fall under the write refusal. Text search leaves out the project's native kanban files (`tickets.md`, `kanban.jsonl`, `proposals.jsonl`, `questions.jsonl`, `relationships.jsonl`, `verifications.jsonl`, `status/`); its tracker mirror and other files stay searchable. `inject` and the Stop check read no native board, so they are unchanged.
+
+Old native items stay in `kanban.db` and in the project's files, untouched. Turning a board back on shows them again. No command exports the board; `export_roadmap` saves a PDF roadmap and is refused for an off project. Sessions already running keep their old config until they restart.
+
 ## Linear gate
 
 The tracker policy tier. Turn it on per binding with `gate: true`:
@@ -349,6 +390,7 @@ wardwell gate linear          PreToolUse hook: check a Linear write (reads JSON 
 wardwell inject .             Output project context for a directory, used by hooks
 wardwell project link [<d/p>] [--path <dir>] [--dry-run] [--yes]   Link a directory to a vault project
 wardwell project list         Show each linked project and its directories
+wardwell project kanban <d/p> on|off   Turn one project's native kanban on or off in config.yml
 wardwell reindex              Rebuild the vault search index from scratch
 wardwell seed <path>          Create domain or project folders
 wardwell tracker connect <name> --token-stdin   Store a tracker API token
