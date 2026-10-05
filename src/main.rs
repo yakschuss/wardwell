@@ -97,6 +97,20 @@ enum ProjectCommand {
     },
     /// Show each linked project and its directories
     List,
+    /// Turn the native kanban of one project on or off in config.yml, with a backup
+    Kanban {
+        /// <domain>/<project>
+        target: String,
+        /// on or off
+        #[arg(value_enum)]
+        state: KanbanState,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KanbanState {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -244,6 +258,7 @@ fn run_project(command: ProjectCommand) -> Result<(), Box<dyn std::error::Error>
             project::link(&config_dir, &request, wardwell::inject::git::dirs, confirm_link, &mut out)?;
         }
         ProjectCommand::List => project::list(&config_dir, &mut out)?,
+        ProjectCommand::Kanban { target, state } => project::kanban(&config_dir, &target, matches!(state, KanbanState::On), &mut out)?,
     }
     Ok(())
 }

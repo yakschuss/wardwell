@@ -432,7 +432,7 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
 
 /// The kanban state of a mapped project: on, or off with where its work
 /// lives.
-fn kanban_words(config: &crate::config::loader::WardwellConfig, key: &str) -> String {
+pub fn kanban_words(config: &crate::config::loader::WardwellConfig, key: &str) -> String {
     if config.kanban_on(key) {
         return "kanban: on.".to_string();
     }

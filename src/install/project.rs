@@ -1,12 +1,13 @@
-//! `wardwell project link` and `wardwell project list`: record which
-//! directories belong to a vault project in config.yml, preview first, with
-//! a backup, idempotently. A linked worktree records its main checkout.
+//! `wardwell project link`, `wardwell project list` and `wardwell project
+//! kanban`: record which directories belong to a vault project, and whether
+//! its kanban is on, in config.yml, with a backup, idempotently. `link`
+//! previews first. A linked worktree records its main checkout.
 //!
 //! Does NOT create vault folders, resolve sessions (inject/resolve.rs does),
 //! or touch any client settings.
 
 use crate::companion::install::{atomic_write, backup_file, read_optional};
-use crate::config::edit::add_project_path;
+use crate::config::edit::{add_project_path, set_project_kanban};
 use crate::config::loader::{WardwellConfig, parse};
 use crate::inject::git::{GitDirs, canonical};
 use std::io::Write;
@@ -68,6 +69,28 @@ fn link_waiting(config_dir: &Path, request: &LinkRequest, git: impl Fn(&Path) ->
     drop(lock);
     say(out, format!("\n  OK linked.\n    backup: {}", backup.display()))?;
     say(out, format!("\n  New sessions started in {} or its worktrees load {key}.\n  Sessions already running do not change.", dir.display()))
+}
+
+/// Set the kanban switch of `key` in `config_dir/config.yml` and say the
+/// resulting state. Writes a backup first; a setting already in place writes
+/// nothing. Holds the config lock from the read to the rename.
+pub fn kanban(config_dir: &Path, key: &str, on: bool, out: &mut dyn Write) -> Result<(), String> {
+    let path = config_dir.join("config.yml");
+    let _lock = Lock::take(&path, LOCK_WAIT)?;
+    let (before, config) = read_config(&path)?;
+    require_vault_folder(&config, key)?;
+    let say = |out: &mut dyn Write, line: String| writeln!(out, "{line}").map_err(|e| e.to_string());
+    say(out, format!("wardwell project kanban\n\n  Set the kanban of {key} {}.", if on { "on" } else { "off" }))?;
+    if config.projects.get(key).and_then(|m| m.kanban) == Some(on) {
+        say(out, format!("    {:<15} {}", "UNCHANGED", path.display()))?;
+        return say(out, format!("\n  Already set. Nothing changed.\n  {key} {}", crate::install::doctor::kanban_words(&config, key)));
+    }
+    let after = set_project_kanban(&before, key, on)?;
+    let backup = write(&path, &before, &after)?;
+    say(out, format!("    {:<15} {}", "UPDATE + BACKUP", path.display()))?;
+    let state = parse(&after).map_err(|e| e.to_string())?;
+    say(out, format!("\n  OK set.\n    backup: {}\n  {key} {}", backup.display(), crate::install::doctor::kanban_words(&state, key)))?;
+    say(out, "\n  Old kanban items stay in kanban.db untouched. Sessions already running do not change.".to_string())
 }
 
 /// `config.yml.lock` beside config.yml, created exclusively and removed when
@@ -425,5 +448,60 @@ mod tests {
         std::fs::set_permissions(&f.cfg, std::fs::Permissions::from_mode(0o755)).unwrap();
         let out = result.unwrap();
         assert!(out.contains("UPDATE + BACKUP") && out.contains("Dry run complete. Nothing changed."), "{out}");
+    }
+
+    fn kanban_run(f: &Fixture, key: &str, on: bool) -> Result<String, String> {
+        let mut out = Vec::new();
+        kanban(&f.cfg, key, on, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    fn enable_board(f: &Fixture) {
+        let text = format!("{}kanban:\n  enabled: true\n", config_text(f));
+        std::fs::write(f.cfg.join("config.yml"), text).unwrap();
+    }
+
+    #[test]
+    fn kanban_off_writes_the_setting_with_a_backup_prints_the_state_and_a_second_run_changes_nothing() {
+        let f = fixture();
+        enable_board(&f);
+        let original = config_text(&f);
+        let out = kanban_run(&f, "personal/corrtex", false).unwrap();
+        assert!(out.contains("UPDATE + BACKUP") && out.contains("personal/corrtex kanban: off, no tracker binding."), "{out}");
+        assert!(out.contains("Old kanban items stay in kanban.db untouched."), "{out}");
+        let text = config_text(&f);
+        assert!(text.starts_with(&original), "every existing byte kept: {text}");
+        assert_eq!(parse(&text).unwrap().projects["personal/corrtex"].kanban, Some(false));
+        let saved = backups(&f);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), original);
+        let again = kanban_run(&f, "personal/corrtex", false).unwrap();
+        assert!(again.contains("UNCHANGED") && again.contains("Nothing changed.") && again.contains("kanban: off"), "{again}");
+        assert_eq!(config_text(&f), text);
+        assert_eq!(backups(&f).len(), 1);
+        assert!(!f.cfg.join("config.yml.lock").exists());
+    }
+
+    #[test]
+    fn kanban_on_flips_the_setting_and_refuses_a_global_false_without_writing() {
+        let f = fixture();
+        let error = kanban_run(&f, "personal/corrtex", true).unwrap_err();
+        assert!(error.contains("kanban.enabled"), "{error}");
+        assert!(backups(&f).is_empty());
+        enable_board(&f);
+        kanban_run(&f, "personal/corrtex", false).unwrap();
+        let out = kanban_run(&f, "personal/corrtex", true).unwrap();
+        assert!(out.contains("personal/corrtex kanban: on."), "{out}");
+        assert_eq!(parse(&config_text(&f)).unwrap().projects["personal/corrtex"].kanban, Some(true));
+    }
+
+    #[test]
+    fn kanban_refuses_a_project_with_no_vault_folder_and_a_bad_key() {
+        let f = fixture();
+        let error = kanban_run(&f, "personal/nope", false).unwrap_err();
+        assert!(error.contains("has no folder in the vault"), "{error}");
+        assert!(kanban_run(&f, "personal", false).unwrap_err().contains("is not <domain>/<project>"));
+        assert!(backups(&f).is_empty());
+        assert!(!f.cfg.join("config.yml.lock").exists());
     }
 }
