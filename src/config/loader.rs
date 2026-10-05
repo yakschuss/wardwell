@@ -51,6 +51,30 @@ pub struct WardwellConfig {
 }
 
 impl WardwellConfig {
+    /// Whether the native kanban board is on for a project. The project's own
+    /// `kanban` setting wins. Without one, a project whose issue bindings are
+    /// all readonly is off, because its work lives in the tracker. Otherwise
+    /// the global `kanban.enabled` flag decides. Does NOT say whether the
+    /// tracker mirror answers; it always does.
+    pub fn kanban_on(&self, project_key: &str) -> bool {
+        match self.projects.get(project_key).and_then(|m| m.kanban) {
+            Some(setting) => setting,
+            None => self.kanban_enabled && !self.kanban_off_for_project(project_key),
+        }
+    }
+
+    /// Whether the project itself turned its native board off: `kanban: off`,
+    /// or no setting and every issue binding readonly. False when the board
+    /// is only off because `kanban.enabled` is false, so a search of a
+    /// vault without the board still finds its old ticket files.
+    pub fn kanban_off_for_project(&self, project_key: &str) -> bool {
+        if let Some(setting) = self.projects.get(project_key).and_then(|m| m.kanban) {
+            return !setting;
+        }
+        let mut bindings = self.issue_bindings().filter(|b| b.key() == project_key).peekable();
+        bindings.peek().is_some() && bindings.all(|b| b.readonly)
+    }
+
     /// The issue tracker binding of a vault project, if one is configured.
     /// A binding that mirrors merged changes is not an issue tracker, so the
     /// kanban read path, the read-only lock, and session start never see it.
@@ -104,13 +128,18 @@ impl TrackerBinding {
 }
 
 /// Maps working directories to one vault project, so a session started in
-/// any of `paths` reads and writes that project.
+/// any of `paths` reads and writes that project, and carries that project's
+/// own kanban switch. A mapping may hold `paths`, `kanban`, or both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMapping {
     pub domain: String,
     pub project: String,
     /// Absolute directories, tilde expanded, without a trailing slash.
     pub paths: Vec<PathBuf>,
+    /// The project's own kanban switch: `Some(true)` for `kanban: on`,
+    /// `Some(false)` for `kanban: off`, None to follow the precedence in
+    /// `WardwellConfig::kanban_on`.
+    pub kanban: Option<bool>,
 }
 
 /// AI configuration for session summarization.
@@ -192,7 +221,20 @@ impl<'de> Deserialize<'de> for ProjectEntries {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProjectEntry {
-    paths: Vec<String>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    #[serde(default)]
+    kanban: Option<serde_yaml::Value>,
+}
+
+/// `on` or `off`, as the words or as YAML booleans.
+fn kanban_setting(value: &serde_yaml::Value) -> Option<bool> {
+    match value {
+        serde_yaml::Value::Bool(b) => Some(*b),
+        serde_yaml::Value::String(s) if s == "on" => Some(true),
+        serde_yaml::Value::String(s) if s == "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +376,7 @@ pub fn parse(contents: &str) -> Result<WardwellConfig, ConfigError> {
     let trackers = tracker_bindings(raw.trackers)?;
     reject_prefix_collisions(&trackers, &kanban_prefixes)?;
     let projects = project_mappings(raw.projects)?;
+    reject_kanban_on_under_global_off(&projects, kanban_enabled)?;
 
     Ok(WardwellConfig {
         vault_path,
@@ -361,11 +404,18 @@ fn project_mappings(raw: ProjectEntries) -> Result<BTreeMap<String, ProjectMappi
         }
         let (domain, project) = split_project_key(&key).map_err(|_| invalid(&key, "key must be <domain>/<project>".into()))?;
         let entry: RawProjectEntry = serde_yaml::from_value(value)
-            .map_err(|e| invalid(&key, format!("{e}; a project takes only `paths`")))?;
-        if entry.paths.is_empty() {
-            return Err(invalid(&key, "`paths` needs at least one path".into()));
-        }
-        let paths: Vec<PathBuf> = entry.paths.iter().map(|p| project_path(&key, p)).collect::<Result<_, _>>()?;
+            .map_err(|e| invalid(&key, format!("{e}; a project takes only `paths` and `kanban`")))?;
+        let kanban = match &entry.kanban {
+            Some(value) => Some(kanban_setting(value).ok_or_else(|| invalid(&key, "`kanban` must be on or off".into()))?),
+            None => None,
+        };
+        let raw_paths = match entry.paths {
+            Some(paths) if paths.is_empty() => return Err(invalid(&key, "`paths` needs at least one path".into())),
+            Some(paths) => paths,
+            None if kanban.is_some() => Vec::new(),
+            None => return Err(invalid(&key, "the entry needs `paths` or `kanban`".into())),
+        };
+        let paths: Vec<PathBuf> = raw_paths.iter().map(|p| project_path(&key, p)).collect::<Result<_, _>>()?;
         for path in &paths {
             // Existing folders compare by their real path, so a symlink to a
             // folder mapped elsewhere is caught.
@@ -375,9 +425,21 @@ fn project_mappings(raw: ProjectEntries) -> Result<BTreeMap<String, ProjectMappi
                 return Err(invalid(&key, format!("path {} is listed {place}; keep it under one project", path.display())));
             }
         }
-        mappings.insert(key, ProjectMapping { domain, project, paths });
+        mappings.insert(key, ProjectMapping { domain, project, paths, kanban });
     }
     Ok(mappings)
+}
+
+/// `kanban: on` for a project needs the store open, which `kanban.enabled`
+/// controls. Fails closed at load, naming the project.
+fn reject_kanban_on_under_global_off(projects: &BTreeMap<String, ProjectMapping>, enabled: bool) -> Result<(), ConfigError> {
+    match projects.iter().find(|(_, m)| m.kanban == Some(true)).filter(|_| !enabled) {
+        Some((key, _)) => Err(ConfigError::InvalidProjectMapping {
+            key: key.clone(),
+            reason: "`kanban: on` needs `kanban.enabled: true`; the store is not open".into(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// One mapped directory: tilde expanded, absolute, no trailing slash.
@@ -960,5 +1022,72 @@ trackers:
         std::fs::create_dir_all(&other).unwrap();
         let fine = format!("vault_path: /tmp/v\nsession_sources: []\nprojects:\n  work/a:\n    paths: [\"{}\"]\n  work/b:\n    paths: [\"{}\"]\n", real.display(), other.display());
         assert!(parse(&fine).is_ok());
+    }
+
+    fn kanban_cfg(global: &str, project: &str, trackers: &str) -> String {
+        format!("vault_path: /tmp/v\nsession_sources: []\n{global}{trackers}projects:\n  work/a:\n{project}")
+    }
+
+    const LINEAR_RO: &str = "trackers:\n  work/a:\n    provider: linear\n    team: COR\n    credential: c\n    readonly: true\n";
+    const LINEAR_RW: &str = "trackers:\n  work/a:\n    provider: linear\n    team: COR\n    credential: c\n";
+
+    #[test]
+    fn a_project_may_carry_kanban_alone_paths_alone_or_both_but_not_nothing() {
+        let alone = parse(&kanban_cfg("", "    kanban: off\n", "")).unwrap();
+        assert!(alone.projects["work/a"].paths.is_empty());
+        assert_eq!(alone.projects["work/a"].kanban, Some(false));
+        let paths = parse(&kanban_cfg("", "    paths: [/srv/a]\n", "")).unwrap();
+        assert_eq!(paths.projects["work/a"].kanban, None);
+        let both = parse(&kanban_cfg("kanban:\n  enabled: true\n", "    paths: [/srv/a]\n    kanban: on\n", "")).unwrap();
+        assert_eq!(both.projects["work/a"].kanban, Some(true));
+        let empty = parse(&kanban_cfg("", "    {}\n", "")).err().expect("empty").to_string();
+        assert!(empty.contains("work/a") && empty.contains("`paths` or `kanban`"), "{empty}");
+    }
+
+    #[test]
+    fn kanban_takes_on_and_off_only() {
+        let error = parse(&kanban_cfg("", "    kanban: maybe\n", "")).err().expect("bad value").to_string();
+        assert!(error.contains("work/a") && error.contains("on or off"), "{error}");
+        let error = parse(&kanban_cfg("", "    kanban: 3\n", "")).err().expect("bad value").to_string();
+        assert!(error.contains("on or off"), "{error}");
+        assert_eq!(parse(&kanban_cfg("", "    kanban: \"off\"\n", "")).unwrap().projects["work/a"].kanban, Some(false));
+    }
+
+    #[test]
+    fn kanban_on_under_a_global_false_is_a_load_error_naming_the_project() {
+        for global in ["", "kanban:\n  enabled: false\n"] {
+            let error = parse(&kanban_cfg(global, "    kanban: on\n", "")).err().expect("fail closed").to_string();
+            assert!(error.contains("work/a") && error.contains("kanban.enabled"), "{error}");
+        }
+    }
+
+    #[test]
+    fn kanban_on_resolves_by_setting_then_readonly_bindings_then_the_global_flag() {
+        let on = "kanban:\n  enabled: true\n";
+        let paths = "    paths: [/srv/a]\n";
+        // explicit off beats a global true
+        assert!(!parse(&kanban_cfg(on, "    kanban: off\n", "")).unwrap().kanban_on("work/a"));
+        // explicit on beats readonly bindings
+        assert!(parse(&kanban_cfg(on, "    kanban: on\n", LINEAR_RO)).unwrap().kanban_on("work/a"));
+        // no setting, every issue binding readonly: off even under a global true
+        assert!(!parse(&kanban_cfg(on, paths, LINEAR_RO)).unwrap().kanban_on("work/a"));
+        // no setting, a writable binding: the global flag
+        assert!(parse(&kanban_cfg(on, paths, LINEAR_RW)).unwrap().kanban_on("work/a"));
+        assert!(!parse(&kanban_cfg("", paths, LINEAR_RW)).unwrap().kanban_on("work/a"));
+        // no setting, no binding: the global flag
+        assert!(parse(&kanban_cfg(on, paths, "")).unwrap().kanban_on("work/a"));
+        assert!(!parse(&kanban_cfg("", paths, "")).unwrap().kanban_on("work/a"));
+        // an unmapped project follows the global flag
+        assert!(parse(&kanban_cfg(on, paths, "")).unwrap().kanban_on("work/unmapped"));
+    }
+
+    #[test]
+    fn a_github_binding_beside_a_readonly_issue_binding_does_not_keep_the_board_on() {
+        let mixed = "trackers:\n  work/a:\n    - provider: linear\n      team: COR\n      credential: c\n      readonly: true\n    - provider: github\n      repository: o/n\n";
+        let config = parse(&kanban_cfg("kanban:\n  enabled: true\n", "    paths: [/srv/a]\n", mixed)).unwrap();
+        assert!(!config.kanban_on("work/a"), "github mirrors merged changes and is no issue tracker");
+        let writable = "trackers:\n  work/a:\n    - provider: linear\n      team: COR\n      credential: c\n    - provider: github\n      repository: o/n\n";
+        let config = parse(&kanban_cfg("kanban:\n  enabled: true\n", "    paths: [/srv/a]\n", writable)).unwrap();
+        assert!(config.kanban_on("work/a"));
     }
 }

@@ -3,6 +3,23 @@
 The owner runs these steps. An agent prepares the release commit but never
 tags or pushes a tag.
 
+## 0.14.0
+
+The steps are the ones for 0.13.0 below, with `0.14.0` in place of `0.13.0`.
+
+0.14.0 adds a per-project kanban switch: `projects.<domain>/<project>.kanban:
+on | off`, and `wardwell project kanban <domain>/<project> on|off`. A project
+with only readonly issue tracker bindings and no setting is now off, so after
+the upgrade its native board refuses, and its mirror still answers. Check
+each project:
+
+```sh
+wardwell doctor        # one "kanban:" state per mapped project
+```
+
+Old native items stay in kanban.db. To keep a readonly project's native board,
+run `wardwell project kanban <domain>/<project> on`.
+
 ## 0.13.3
 
 The steps are the ones for 0.13.0 below, with `0.13.3` in place of `0.13.0`.
