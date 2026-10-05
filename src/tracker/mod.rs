@@ -70,6 +70,20 @@ pub fn readonly_refusal(binding: &crate::config::loader::TrackerBinding) -> Opti
     })
 }
 
+/// Refusal of the native board of a project whose kanban is off. A write
+/// says nothing was written; a read says the mirror still answers. Names
+/// where the work lives: the issue tracker binding, else that there is none.
+pub fn kanban_off_refusal(config: &crate::config::loader::WardwellConfig, domain: &str, project: &str, write: bool) -> String {
+    let Some(binding) = config.tracker_for(domain, project) else {
+        return format!("The kanban is off for {domain}/{project}. It has no tracker binding.");
+    };
+    let place = format!("{} team {}", provider_label(&binding.provider), binding.team);
+    match write {
+        true => format!("The kanban is off for {domain}/{project}. Edit it in {place}. Nothing was written."),
+        false => format!("The kanban is off for {domain}/{project}. Read its work in {place}; wardwell_kanban list still returns the mirror."),
+    }
+}
+
 /// Refusal for a kanban write addressed to `key`, an issue the mirror of
 /// `binding` holds. Applies whether or not the binding is read-only, since
 /// the issue lives in the tracker, not in the kanban.

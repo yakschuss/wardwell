@@ -30,6 +30,13 @@ pub(super) fn binding(readonly: bool) -> TrackerBinding {
 /// A server with kanban on, `work/claims` bound to a mirror, one native
 /// ticket in that project, and the given mirror events on disk.
 pub(super) fn fixture(events: &[Event], readonly: bool) -> Fixture {
+    fixture_with(events, readonly, Some(true))
+}
+
+/// `fixture` with the kanban setting of `work/claims`: `Some(true)` keeps the
+/// native board readable beside a readonly binding, None leaves it to the
+/// precedence, `Some(false)` turns it off.
+pub(super) fn fixture_with(events: &[Event], readonly: bool, kanban_setting: Option<bool>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let vault = dir.path().join("vault");
     std::fs::create_dir_all(vault.join("work/claims")).unwrap();
@@ -52,7 +59,11 @@ pub(super) fn fixture(events: &[Event], readonly: bool) -> Fixture {
         kanban_prefixes: std::collections::HashMap::new(),
         features: Default::default(),
         trackers,
-        projects: Default::default(),
+        projects: std::iter::once((
+            "work/claims".to_string(),
+            crate::config::loader::ProjectMapping { domain: "work".into(), project: "claims".into(), paths: vec![], kanban: kanban_setting },
+        ))
+        .collect(),
     };
     let server = WardwellServer::new(config, index, Arc::new(Mutex::new(None)), None, Some(kanban));
     Fixture { _dir: dir, server }
@@ -510,7 +521,7 @@ fn files(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf
     found
 }
 
-fn dispatch(server: &WardwellServer, args: Value) -> Value {
+pub(super) fn dispatch(server: &WardwellServer, args: Value) -> Value {
     let params: KanbanParams = serde_json::from_value(args).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let raw = runtime.block_on(server.wardwell_kanban(Parameters(params)));

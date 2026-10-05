@@ -454,6 +454,9 @@ impl WardwellServer {
         {
             return json_error(&refusal);
         }
+        if let Some(refusal) = self.off_refusal(kanban, &p) {
+            return json_error(&refusal);
+        }
         match p.action.as_str() {
             "list" => self.kanban_list(kanban, &p),
             "create" => self.kanban_create(kanban, &p),
@@ -2218,7 +2221,7 @@ impl WardwellServer {
         let domains = if self.allowed_domains.is_empty() { None } else { Some(self.allowed_domains.as_slice()) };
         match kanban.search(query, p.project.as_deref(), domains) {
             Ok(items) => {
-                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let mut items: Vec<serde_json::Value> = self.visible_native(kanban, &items).into_iter().map(crate::tracker::items::native).collect();
                 let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::SEARCH_CAP, false, &|issue| crate::tracker::items::search_keeps(issue, query));
                 items.extend(mirrored);
                 let total = items.len();
@@ -2227,6 +2230,7 @@ impl WardwellServer {
                     response["tracker_truncated"] = serde_json::json!(truncated);
                 }
                 self.add_collision_note(&mut response, p);
+                self.add_off_note(kanban, &mut response, p);
                 serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
@@ -2258,7 +2262,7 @@ impl WardwellServer {
                     tag: p.tag.as_deref(),
                     include_done: p.include_done.unwrap_or(false),
                 };
-                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let mut items: Vec<serde_json::Value> = self.visible_native(kanban, &items).into_iter().map(crate::tracker::items::native).collect();
                 let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, true, &|issue| filter.keeps(issue));
                 items.extend(mirrored);
                 let total = items.len();
@@ -2267,6 +2271,7 @@ impl WardwellServer {
                     response["tracker_truncated"] = serde_json::json!(truncated);
                 }
                 self.add_collision_note(&mut response, p);
+                self.add_off_note(kanban, &mut response, p);
                 serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
@@ -2418,7 +2423,7 @@ impl WardwellServer {
         match kanban.query(question, &self.kanban_queries, p.project.as_deref(), domains) {
             Ok(items) => {
                 let now = chrono::Utc::now();
-                let mut items: Vec<serde_json::Value> = items.iter().map(crate::tracker::items::native).collect();
+                let mut items: Vec<serde_json::Value> = self.visible_native(kanban, &items).into_iter().map(crate::tracker::items::native).collect();
                 let (mirrored, truncated) = self.mirror_items(p, crate::tracker::items::LIST_CAP, true, &|issue| {
                     crate::tracker::items::query_keeps(issue, question, now).unwrap_or(false)
                 });
@@ -2432,6 +2437,7 @@ impl WardwellServer {
                     response["tracker_note"] = serde_json::json!(crate::tracker::items::QUERY_NOT_MIRRORED);
                 }
                 self.add_collision_note(&mut response, p);
+                self.add_off_note(kanban, &mut response, p);
                 serde_json::to_string(&response).unwrap_or_default()
             }
             Err(e) => json_error(&e.to_string()),
@@ -4397,6 +4403,9 @@ fn clipboard_copy(content: &str) -> Result<usize, String> {
 #[cfg(test)]
 #[path = "server_tracker_tests.rs"]
 mod tracker_tests;
+
+#[path = "server_kanban_off.rs"]
+mod kanban_off;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
