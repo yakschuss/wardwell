@@ -168,6 +168,9 @@ fn verify(old: &str, new: &str, before: &std::collections::BTreeMap<String, Proj
 /// edit does not handle, with what to do instead.
 pub fn set_project_kanban(text: &str, key: &str, on: bool) -> Result<String, String> {
     let before = parse(text).map_err(|e| format!("config.yml does not parse: {e}"))?;
+    if on && !before.kanban_enabled {
+        return Err(format!("{key} cannot be set on while kanban.enabled is false; set kanban.enabled: true in config.yml first. Nothing written."));
+    }
     let crlf = text.contains("\r\n") && !text.replace("\r\n", "").contains('\n');
     let lf = if crlf { text.replace("\r\n", "\n") } else { text.to_string() };
     let word = if on { "on" } else { "off" };
@@ -373,5 +376,7 @@ mod tests {
     fn kanban_on_under_a_global_false_is_refused_and_nothing_is_produced() {
         let error = set_project_kanban(BASE, "work/a", true).unwrap_err();
         assert!(error.contains("kanban.enabled") && error.contains("work/a"), "{error}");
+        assert!(error.contains("set kanban.enabled: true in config.yml first."), "{error}");
+        assert!(!error.contains("rewrite"), "{error}");
     }
 }
