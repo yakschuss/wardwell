@@ -16,6 +16,7 @@ pub struct Pending {
     pub arguments: Value,
     pub principal_fingerprint: Option<String>,
     pub state: String,
+    pub failure_code: Option<String>,
 }
 
 pub fn path() -> PathBuf {
@@ -123,7 +124,7 @@ pub fn pending(source_key: &str) -> Result<Vec<Pending>, String> {
 fn pending_at(database_path: &Path, source_key: &str) -> Result<Vec<Pending>, String> {
     let connection = open(database_path)?;
     let mut statement = connection
-        .prepare("SELECT request_id, action, request_json, principal_fingerprint, state FROM operations WHERE source_key = ?1 AND state IN ('pending', 'blocked') ORDER BY staged_at, request_id LIMIT 100")
+        .prepare("SELECT request_id, action, request_json, principal_fingerprint, state, failure_code FROM operations WHERE source_key = ?1 AND state IN ('pending', 'blocked') ORDER BY staged_at, request_id LIMIT 100")
         .map_err(|_| "Could not read the Companion outbox")?;
     let rows = statement
         .query_map([source_key], |row| {
@@ -133,12 +134,13 @@ fn pending_at(database_path: &Path, source_key: &str) -> Result<Vec<Pending>, St
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|_| "Could not read the Companion outbox")?;
     let mut result = Vec::new();
     for row in rows {
-        let (request_id, action, request_json, principal_fingerprint, state) =
+        let (request_id, action, request_json, principal_fingerprint, state, failure_code) =
             row.map_err(|_| "Could not read the Companion outbox")?;
         let arguments = serde_json::from_str(&request_json)
             .map_err(|_| "Companion outbox contains a malformed request")?;
@@ -148,6 +150,7 @@ fn pending_at(database_path: &Path, source_key: &str) -> Result<Vec<Pending>, St
             arguments,
             principal_fingerprint,
             state,
+            failure_code,
         });
     }
     Ok(result)
@@ -502,7 +505,9 @@ mod tests {
     #[test]
     fn unchanged_requires_verified_publication_without_outstanding_work_for_exact_source() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("companions/wardwell-context/outbox.sqlite3");
+        let db = dir
+            .path()
+            .join("companions/wardwell-context/outbox.sqlite3");
         assert!(!unchanged_eligible_at(&db, "a").unwrap());
         let first = stage_at(
             &db,

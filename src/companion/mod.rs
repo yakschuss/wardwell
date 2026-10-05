@@ -12,11 +12,12 @@ use serde_json::{Value, json};
 use std::{fs, io::Read, path::Path};
 
 const PUBLISH_ARGUMENTS_FILE_LIMIT: u64 = 200_000;
+const INDEX_PAGE_LIMIT: u64 = 50;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CompanionParams {
-    /// Wrapper action: status, schema, discover, capture, publish, list, get, responses,
+    /// Wrapper action: status, schema, discover, inspect, capture, publish, list, get, responses,
     /// consume, acknowledge, outbox_status, or flush. Call schema for hosted and local contracts.
     pub action: String,
     /// Stable identity from this conversation's Companion journal, never a project-wide key.
@@ -37,7 +38,7 @@ pub async fn connect(token: &str) -> Result<Value, String> {
         endpoint: "https://api.wardwell.app/mcp".into(),
         token: token.into(),
     };
-    remote_tool(&connection, "work_plan_list", json!({})).await?;
+    remote_tool(&connection, "work_plan_index", json!({"limit":1})).await?;
     connection::save(&connection::default_path()?, token)?;
     Ok(
         json!({"status":"connected", "local_tools":"independent", "publication_authority":"checked by Hank on each publication"}),
@@ -114,7 +115,7 @@ async fn execute_connected(
     let key = params.source_key.as_deref().unwrap_or_default();
     match params.action.as_str() {
         "status" => {
-            remote_tool(connection, "work_plan_list", json!({})).await?;
+            remote_tool(connection, "work_plan_index", json!({"limit":1})).await?;
             Ok(
                 json!({"status":"connected", "local_tools":"independent", "publication_authority":"checked by Hank on each publication"}),
             )
@@ -132,18 +133,28 @@ async fn execute_connected(
                 .and_then(Value::as_array)
                 .ok_or("Hank returned an invalid tool list")?;
             Ok(json!({
-                "tools": tools.iter().filter(|tool| matches!(tool["name"].as_str(), Some("capture_submit" | "work_plan_publish" | "work_plan_list" | "work_plan_get" | "work_plan_responses"))).collect::<Vec<_>>(),
+                "tools": tools.iter().filter(|tool| matches!(tool["name"].as_str(), Some("capture_submit" | "work_plan_publish" | "work_plan_index" | "work_plan_get" | "work_plan_responses"))).collect::<Vec<_>>(),
                 "local_actions": local_action_schema()
             }))
         }
         "list" => {
-            let result = remote_tool(connection, "work_plan_list", args).await?;
+            let result = remote_tool(
+                connection,
+                "work_plan_index",
+                json!({"source_key":key,"limit":1}),
+            )
+            .await?;
             own_plans(result, key)
         }
         "discover" => {
-            let result = remote_tool(connection, "work_plan_list", compact_args(&args)).await?;
-            discover_plans(result, args["workstream"].as_str().unwrap_or_default())
+            discover_index(
+                connection,
+                args["workstream"].as_str().unwrap_or_default(),
+                args.get("cursor").and_then(Value::as_str),
+            )
+            .await
         }
+        "inspect" => remote_tool(connection, "work_plan_get", get_args(&args, true)).await,
         "get" | "responses" => {
             // A plan ID alone is insufficient routing information for a shared installation.
             let plan = remote_tool(
@@ -295,6 +306,7 @@ fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
         "status"
             | "schema"
             | "discover"
+            | "inspect"
             | "capture"
             | "publish"
             | "outbox_status"
@@ -306,7 +318,7 @@ fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
             | "acknowledge"
     ) {
         return Err(
-            "Use status, schema, discover, capture, publish, list, get, responses, consume, acknowledge, outbox_status, or flush".into(),
+            "Use status, schema, discover, inspect, capture, publish, list, get, responses, consume, acknowledge, outbox_status, or flush".into(),
         );
     }
     if !arguments.is_object() {
@@ -340,11 +352,25 @@ fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
             .ok_or("Workstream must be a nonempty string of at most 200 characters")?;
         if !args
             .keys()
-            .all(|key| matches!(key.as_str(), "workstream" | "compact"))
+            .all(|key| matches!(key.as_str(), "workstream" | "compact" | "cursor"))
             || args.get("compact").is_some_and(|value| !value.is_boolean())
+            || args.get("cursor").is_some_and(|value| {
+                !value.as_str().is_some_and(|cursor| {
+                    !cursor.is_empty()
+                        && cursor.len() <= 2_000
+                        && !cursor.chars().any(char::is_control)
+                })
+            })
         {
-            return Err("Discover accepts only workstream and compact".into());
+            return Err("Discover accepts only workstream, compact, and a bounded cursor".into());
         }
+        return Ok(());
+    }
+    if params.action == "inspect" {
+        if params.source_key.is_some() {
+            return Err("Inspect does not accept source_key".into());
+        }
+        validate_plan_read(arguments, "Inspect accepts only id and compact")?;
         return Ok(());
     }
     let key = params
@@ -452,9 +478,20 @@ fn validate(params: &CompanionParams, arguments: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn compact_args(args: &Value) -> Value {
-    args.get("compact")
-        .map_or_else(|| json!({}), |compact| json!({"compact": compact}))
+fn validate_plan_read(arguments: &Value, error: &str) -> Result<(), String> {
+    let args = arguments.as_object().ok_or("A plan id is required")?;
+    let id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or("A plan id is required")?;
+    uuid::Uuid::parse_str(id).map_err(|_| "Plan id must be a UUID")?;
+    if args.keys().all(|name| name == "id" || name == "compact")
+        && args.get("compact").is_none_or(Value::is_boolean)
+    {
+        Ok(())
+    } else {
+        Err(error.into())
+    }
 }
 
 fn local_action_schema() -> Value {
@@ -501,6 +538,35 @@ fn require_plan_key(plan: &Value, source_key: &str) -> Result<(), String> {
     }
 }
 
+async fn discover_index(
+    connection: &Connection,
+    workstream: &str,
+    cursor: Option<&str>,
+) -> Result<Value, String> {
+    let mut arguments = json!({"limit":INDEX_PAGE_LIMIT,"workstream":workstream});
+    if let Some(value) = cursor {
+        arguments["cursor"] = Value::String(value.to_owned());
+    }
+    let page = remote_tool(connection, "work_plan_index", arguments).await?;
+    discovery_page(page)
+}
+
+fn discovery_page(page: Value) -> Result<Value, String> {
+    let plans = page
+        .get("work_plans")
+        .and_then(Value::as_array)
+        .ok_or("Hank returned an invalid work plan index")?;
+    let matches = plans.clone();
+    let next_cursor = page.get("next_cursor").cloned().unwrap_or(Value::Null);
+
+    Ok(json!({
+        "work_plans": matches,
+        "next_cursor": next_cursor,
+        "truncated": !next_cursor.is_null(),
+        "retrieval": "Use inspect with a selected plan id for its read-only effective projection. Inspect is never an edit base. Source-bound responses is the only authoritative source_document read."
+    }))
+}
+
 fn own_plans(result: Value, source_key: &str) -> Result<Value, String> {
     let plans = result
         .get("work_plans")
@@ -511,40 +577,6 @@ fn own_plans(result: Value, source_key: &str) -> Result<Value, String> {
         output["workstreams"] = registry.clone();
     }
     Ok(output)
-}
-
-fn discover_plans(result: Value, workstream: &str) -> Result<Value, String> {
-    let plans = result
-        .get("work_plans")
-        .and_then(Value::as_array)
-        .ok_or("Hank returned an invalid plan list")?;
-    Ok(
-        json!({"work_plans":plans.iter().filter(|plan| workstream_matches(plan, workstream)).collect::<Vec<_>>()}),
-    )
-}
-
-fn workstream_matches(plan: &Value, requested: &str) -> bool {
-    if plan
-        .get("nodes")
-        .and_then(Value::as_array)
-        .is_some_and(|nodes| nodes.iter().any(|node| workstream_matches(node, requested)))
-    {
-        return true;
-    }
-    if plan["workstream_id"].as_str() == Some(requested)
-        || plan["workstream"].as_str() == Some(requested)
-    {
-        return true;
-    }
-    match (
-        plan["workstream"]["project"].as_str(),
-        plan["workstream"]["name"].as_str(),
-    ) {
-        (Some(project), Some(name)) => {
-            requested == format!("{project} / {name}") || (project == name && requested == name)
-        }
-        _ => false,
-    }
 }
 
 enum PublishReconciliation {
@@ -567,7 +599,7 @@ async fn flush_outbox(connection: &Connection, source_key: &str) -> Result<Value
     let mut blocked = 0_u64;
     let mut pending = 0_u64;
     for operation in operations {
-        if operation.state == "blocked" {
+        if !replayable_operation(&operation) {
             blocked += 1;
             continue;
         }
@@ -600,6 +632,12 @@ async fn flush_outbox(connection: &Connection, source_key: &str) -> Result<Value
         "blocked": blocked,
         "status": outbox::status(source_key)?
     }))
+}
+
+fn replayable_operation(operation: &outbox::Pending) -> bool {
+    operation.state == "pending"
+        || (operation.state == "blocked"
+            && operation.failure_code.as_deref() == Some("revision_conflict"))
 }
 
 async fn deliver(
@@ -735,7 +773,11 @@ where
     let expected = arguments["expected_revision"]
         .as_u64()
         .ok_or("Pending publication has no expected revision")?;
-    let listed = call("work_plan_list", json!({"compact":true})).await?;
+    let listed = call(
+        "work_plan_index",
+        json!({"source_key":source_key,"limit":1}),
+    )
+    .await?;
     let matches = listed
         .get("work_plans")
         .and_then(Value::as_array)
@@ -1052,10 +1094,6 @@ mod tests {
         assert!(valid(&params("list", "session-a", json!({"compact":true}))).is_ok());
         assert!(valid(&params("list", "session-a", json!({"compact":"yes"}))).is_err());
         assert_eq!(
-            compact_args(&json!({"workstream":"x","compact":false})),
-            json!({"compact":false})
-        );
-        assert_eq!(
             get_args(&json!({"id":"x","compact":true}), true),
             json!({"id":"x","compact":true})
         );
@@ -1107,6 +1145,15 @@ mod tests {
             })
             .is_ok()
         );
+        assert!(
+            valid(&CompanionParams {
+                action: "discover".into(),
+                source_key: None,
+                arguments: Some(json!({"workstream":"corr/pcc","cursor":"next-page"})),
+                arguments_file: None,
+            })
+            .is_ok()
+        );
         for arguments in [
             json!({}),
             json!({"workstream":""}),
@@ -1135,24 +1182,50 @@ mod tests {
     }
 
     #[test]
-    fn discover_filters_other_sources_by_exact_workstream() {
-        let result = discover_plans(
-            json!({"work_plans":[
-                {"source_key":"a","workstream":"corr/pcc","id":"one"},
-                {"source_key":"b","workstream":"corr/pcc","id":"two"},
-                {"source_key":"c","workstream":"Corr/PCC","id":"three"},
-                {"source_key":"d","id":"four"}
-            ]}),
-            "corr/pcc",
+    fn inspect_is_source_free_read_only_plan_projection() {
+        let id = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            valid(&CompanionParams {
+                action: "inspect".into(),
+                source_key: None,
+                arguments: Some(json!({"id":id,"compact":true})),
+                arguments_file: None,
+            })
+            .is_ok()
         );
-        assert_eq!(
-            result,
-            Ok(json!({"work_plans":[
-                {"source_key":"a","workstream":"corr/pcc","id":"one"},
-                {"source_key":"b","workstream":"corr/pcc","id":"two"}
-            ]}))
-        );
-        assert!(discover_plans(json!({}), "corr/pcc").is_err());
+        assert!(valid(&params("inspect", "session-a", json!({"id":id}))).is_err());
+        for arguments in [
+            json!({}),
+            json!({"id":"bad"}),
+            json!({"id":id,"source_key":"other"}),
+        ] {
+            assert!(
+                valid(&CompanionParams {
+                    action: "inspect".into(),
+                    source_key: None,
+                    arguments: Some(arguments),
+                    arguments_file: None,
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_preserves_the_server_cursor_and_never_hides_same_page_matches() {
+        let page = discovery_page(json!({
+            "work_plans":[
+                {"id":"one","workstream":"Corr / ADT"},
+                {"id":"two","workstream":"Corr / ADT"}
+            ],
+            "next_cursor":"page-two"
+        }))
+        .unwrap();
+
+        assert_eq!(page["work_plans"].as_array().unwrap().len(), 2);
+        assert_eq!(page["next_cursor"], "page-two");
+        assert_eq!(page["truncated"], true);
+        assert!(page["retrieval"].as_str().unwrap().contains("responses"));
     }
 
     #[test]
@@ -1170,34 +1243,29 @@ mod tests {
     }
 
     #[test]
-    fn owner_categories_are_discoverable_without_exposing_other_source_plans() {
-        let plan = json!({"source_key":"a","id":"one","workstream_id":"category-id","workstream":{"project":"Corr","name":"ADT"},"source_workstream":"old-label"});
-        let result = json!({"work_plans":[plan.clone(),{"source_key":"b","id":"private"}],"workstreams":[{"id":"category-id","project":"Corr","name":"ADT"}]});
-        let own = own_plans(result.clone(), "a").unwrap();
-        assert_eq!(own["work_plans"], json!([plan]));
-        assert_eq!(own["workstreams"], result["workstreams"]);
-        assert_eq!(
-            discover_plans(result.clone(), "Corr / ADT").unwrap()["work_plans"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            discover_plans(result.clone(), "category-id").unwrap()["work_plans"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            discover_plans(result, "old-label").unwrap()["work_plans"],
-            json!([])
-        );
-        assert!(workstream_matches(
-            &json!({"workstream_id":"pcc","nodes":[{"workstream_id":"adt","workstream":{"project":"Corr","name":"ADT"}}]}),
-            "adt"
-        ));
+    fn flush_retries_only_revision_conflicts_that_can_be_exactly_reconciled() {
+        let operation = |state: &str, failure_code: Option<&str>| outbox::Pending {
+            request_id: "request".into(),
+            action: "publish".into(),
+            arguments: json!({}),
+            principal_fingerprint: Some("principal".into()),
+            state: state.into(),
+            failure_code: failure_code.map(str::to_owned),
+        };
+
+        assert!(replayable_operation(&operation("pending", None)));
+        assert!(replayable_operation(&operation(
+            "blocked",
+            Some("revision_conflict")
+        )));
+        assert!(!replayable_operation(&operation(
+            "blocked",
+            Some("principal_mismatch")
+        )));
+        assert!(!replayable_operation(&operation(
+            "blocked",
+            Some("unexpected_revision")
+        )));
     }
 
     #[test]
@@ -1264,8 +1332,9 @@ mod tests {
         ));
         assert_eq!(
             calls.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            ["work_plan_list", "work_plan_responses"]
+            ["work_plan_index", "work_plan_responses"]
         );
+        assert_eq!(calls[0].1, json!({"source_key":"source-a","limit":1}));
 
         let mut calls = Vec::new();
         let mut responses = VecDeque::from([

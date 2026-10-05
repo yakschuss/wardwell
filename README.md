@@ -472,28 +472,33 @@ is disconnected.
 Use `status` to check the hosted connection and `schema` to discover the current
 hosted capture/work inputs. Source-owned calls supply the stable `source_key`
 from their conversation journal and an `arguments` object. `discover` is a
-tenant-scoped read and does not require a source key:
+tenant-scoped read and does not require a source key. `inspect` lazily reads a selected discovered plan without accepting a source key:
 
 For large publish payloads, `arguments_file` may replace `arguments`. It must be
 an absolute path to a regular JSON file no larger than 200,000 bytes; the binary
-reads and validates it locally and never sends the path to Hank. `list`, `get`,
-and `discover` also accept an optional boolean `arguments.compact`.
+reads and validates it locally and never sends the path to Hank. `get` accepts an
+optional boolean `arguments.compact`. `discover` accepts the returned bounded
+`arguments.cursor` to continue through metadata pages.
 
 | Action | Hosted operation |
 | --- | --- |
 | `capture` | `capture_submit`; `conversation_key` must match `source_key` |
 | `publish` | `work_plan_publish`; source key must match and revisions use CAS |
-| `discover` | List tenant-visible plans whose `workstream` exactly matches the required nonempty `arguments.workstream` string |
-| `list` | List only this source's plans, for recovery |
+| `discover` | Read one bounded metadata page and return plans whose current owner filing exactly matches `arguments.workstream`; use the returned cursor to continue |
+| `list` | Read bounded metadata only for this authenticated source, for recovery |
+| `inspect` | Read a selected discovered plan projection without a source key; read-only and never a publication edit base |
 | `get` | Read a plan after checking its source key |
 | `responses` | Read the source's durable owner responses and current source document |
 | `consume` | Stage the next response page in a private local journal; returns existing staged responses before fetching again |
 | `acknowledge` | Record that named staged observation IDs were persisted locally; this does not claim execution or completion |
 
 Use `discover` when an agent needs exact targets from another session before it
-adds a cited cross-plan reference to its own next WorkPlan version. Discovery
-does not grant access to another source's `get` or `responses` calls and does not
-transfer execution authority.
+adds a cited cross-plan reference to its own next WorkPlan version. Its results
+are metadata choices without nodes or source documents. Use `inspect` after choosing
+a plan for its effective projection; the source owner uses source-bound `get` and
+`responses`, and only `responses` returns the authoritative source document.
+Inspection never supplies a publication edit base and does not grant access to
+another source's `get` or `responses` calls and does not transfer execution authority.
 
 Conversation keys prevent accidental cross-session routing; they are not
 credentials or isolation against other processes on the same OS account. The
