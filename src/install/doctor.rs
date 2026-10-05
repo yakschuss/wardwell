@@ -408,7 +408,7 @@ fn freshness_words(config: &crate::config::loader::WardwellConfig, config_dir: &
 /// missing vault folder fails the row.
 fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Path, now: chrono::DateTime<chrono::Utc>, git: impl Fn(&Path) -> Option<crate::inject::git::GitDirs>) -> (Vec<String>, bool) {
     let mut ok = true;
-    let rows = config
+    let mut rows: Vec<String> = config
         .projects
         .iter()
         .map(|(key, mapping)| {
@@ -427,7 +427,16 @@ fn project_rows(config: &crate::config::loader::WardwellConfig, config_dir: &Pat
             format!("  {label:<38} {mark} {}. {rot}{} {} {}", paths.join(", "), last_pull(config, config_dir, mapping, now), last_block(config_dir, key, now), kanban_words(config, key))
         })
         .collect();
+    rows.extend(bound_unmapped_kanban_rows(config));
     (rows, ok)
+}
+
+/// A kanban row for each project that has a tracker binding and no entry
+/// under `projects:`, so the change a readonly binding makes shows.
+fn bound_unmapped_kanban_rows(config: &crate::config::loader::WardwellConfig) -> Vec<String> {
+    let mut keys: Vec<String> = config.trackers.iter().map(|b| b.key()).filter(|k| !config.projects.contains_key(k)).collect();
+    keys.dedup();
+    keys.into_iter().map(|key| format!("  {:<38} {}", format!("Kanban {key}"), kanban_words(config, &key))).collect()
 }
 
 /// The kanban state of a mapped project: on, or off with where its work
@@ -437,7 +446,9 @@ pub fn kanban_words(config: &crate::config::loader::WardwellConfig, key: &str) -
         return "kanban: on.".to_string();
     }
     let binding = crate::config::loader::project_key_parts(key).and_then(|(domain, project)| config.tracker_for(domain, project));
+    let set = config.projects.get(key).is_some_and(|m| m.kanban.is_some());
     match binding {
+        Some(b) if b.readonly && !set => format!("kanban: off, inferred from the readonly {} binding.", b.provider),
         Some(b) => format!("kanban: off, tracker {} {}.", b.provider, b.scope()),
         None => "kanban: off, no tracker binding.".to_string(),
     }
@@ -871,6 +882,7 @@ mod tests {
         assert!(rows[0].contains("No decisions. Never pulled. Stale. Reason: No pull was tried. No stop-check blocks."), "{}", rows[0]);
         let mut config = config;
         config.projects.clear();
+        config.trackers.clear();
         assert_eq!(project_rows(&config, dir.path(), noon(), |_: &Path| None), (vec![], true));
     }
 
@@ -883,13 +895,23 @@ mod tests {
         config.kanban_enabled = true;
         config.trackers[0].readonly = true;
         let row = |c: &crate::config::loader::WardwellConfig| project_rows(c, dir.path(), noon(), |_: &Path| None).0.remove(0);
-        assert!(row(&config).ends_with("kanban: off, tracker linear COR."), "readonly binding infers off: {}", row(&config));
+        assert!(row(&config).ends_with("kanban: off, inferred from the readonly linear binding."), "readonly binding infers off: {}", row(&config));
         config.trackers[0].readonly = false;
         assert!(row(&config).ends_with("kanban: on."), "{}", row(&config));
         config.projects.values_mut().for_each(|m| m.kanban = Some(false));
         assert!(row(&config).ends_with("kanban: off, tracker linear COR."), "{}", row(&config));
         config.trackers.clear();
         assert!(row(&config).ends_with("kanban: off, no tracker binding."), "{}", row(&config));
+    }
+
+    #[test]
+    fn a_bound_project_missing_from_projects_still_gets_a_kanban_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = format!("vault_path: {}\nsession_sources: []\nkanban:\n  enabled: true\ntrackers:\n  personal/corr-platform:\n    provider: linear\n    team: COR\n    credential: c\n    readonly: true\n", dir.path().display());
+        let config = loader::parse(&yaml).unwrap();
+        let (rows, ok) = project_rows(&config, dir.path(), noon(), |_: &Path| None);
+        assert!(ok);
+        assert_eq!(rows, vec![format!("  {:<38} kanban: off, inferred from the readonly linear binding.", "Kanban personal/corr-platform")]);
     }
 
     #[test]

@@ -251,7 +251,7 @@ wardwell project kanban personal/corr-platform off
 wardwell project kanban personal/corr-platform on
 ```
 
-The command keeps comments and other keys, saves the old file beside it, changes nothing on a second run, and prints the resulting state. `wardwell doctor` shows one `kanban:` state per mapped project: `kanban: on`, `kanban: off, tracker linear COR`, or `kanban: off, no tracker binding`.
+The command keeps comments and other keys, saves the old file beside it, changes nothing on a second run, and prints the resulting state. `wardwell doctor` shows one `kanban:` state per mapped project and per project with a tracker binding: `kanban: on`, `kanban: off, tracker linear COR`, `kanban: off, inferred from the readonly linear binding`, or `kanban: off, no tracker binding`.
 
 Whether a project's board is on, in this order:
 
@@ -270,6 +270,8 @@ A write says:
 > The kanban is off for personal/corr-platform. Edit it in Linear team COR. Nothing was written.
 
 With no tracker binding, both say `The kanban is off for <project>. It has no tracker binding.` A readonly binding's refusal still comes first for writes. `get`, `list`, `query` and `search` still return the mirrored tracker issues for the project, with `origin: "tracker"`, and leave out its native items; a call that names the project adds `kanban_off` with the read sentence. Attachments and `export_roadmap` fall under the write refusal. Text search leaves out the project's native kanban files (`tickets.md`, `kanban.jsonl`, `proposals.jsonl`, `questions.jsonl`, `relationships.jsonl`, `verifications.jsonl`, `status/`); its tracker mirror and other files stay searchable. `inject` and the Stop check read no native board, so they are unchanged.
+
+**Upgrading to 0.14.0.** A project whose issue tracker bindings are all readonly, with no `kanban` setting, is now off, so its native board refuses until you opt back in with `wardwell project kanban <domain>/<project> on` (this needs `kanban.enabled: true`). Run `wardwell doctor` to see each project's state.
 
 Old native items stay in `kanban.db` and in the project's files, untouched. Turning a board back on shows them again. No command exports the board; `export_roadmap` saves a PDF roadmap and is refused for an off project. Sessions already running keep their old config until they restart.
 
