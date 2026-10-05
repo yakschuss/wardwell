@@ -165,7 +165,11 @@ pub fn mark_blocked(request_id: &str, code: &str) -> Result<(), String> {
 }
 
 fn update_state(request_id: &str, state: &str, code: &str) -> Result<(), String> {
-    let connection = open(&path())?;
+    update_state_at(&path(), request_id, state, code)
+}
+
+fn update_state_at(database_path: &Path, request_id: &str, state: &str, code: &str) -> Result<(), String> {
+    let connection = open(database_path)?;
     connection
         .execute(
             "UPDATE operations SET state = ?1, failure_code = ?2, attempts = attempts + 1 WHERE request_id = ?3 AND state != 'completed'",
@@ -342,7 +346,11 @@ fn unchanged_eligible_at(database_path: &Path, source_key: &str) -> Result<bool,
 }
 
 pub fn status(source_key: &str) -> Result<Value, String> {
-    let connection = open(&path())?;
+    status_at(&path(), source_key)
+}
+
+fn status_at(database_path: &Path, source_key: &str) -> Result<Value, String> {
+    let connection = open(database_path)?;
     let (pending, blocked, completed): (u64, u64, u64) = connection
         .query_row(
             "SELECT COALESCE(SUM(CASE WHEN state = 'pending' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN state = 'blocked' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN state = 'completed' THEN 1 ELSE 0 END), 0) FROM operations WHERE source_key = ?1",
@@ -365,15 +373,30 @@ pub fn status(source_key: &str) -> Result<Value, String> {
         })
         .map_err(|_| "Could not read the Companion outbox status")?;
     let mut operations = Vec::new();
+    let mut failure_counts = std::collections::BTreeMap::new();
     for row in rows {
-        operations.push(row.map_err(|_| "Could not read the Companion outbox status")?);
+        let operation = row.map_err(|_| "Could not read the Companion outbox status")?;
+        let key = (
+            operation["action"].as_str().unwrap_or("unknown").to_owned(),
+            operation["state"].as_str().unwrap_or("unknown").to_owned(),
+            operation["failure_code"].as_str().unwrap_or("none").to_owned(),
+        );
+        *failure_counts.entry(key).or_insert(0_u64) += 1;
+        operations.push(operation);
     }
+    let failure_summary = failure_counts
+        .into_iter()
+        .map(|((action, state, failure_code), count)| {
+            json!({"action":action,"state":state,"failure_code":failure_code,"count":count})
+        })
+        .collect::<Vec<_>>();
     Ok(json!({
         "source_key":source_key,
         "pending":pending,
         "blocked":blocked,
         "completed":completed,
         "operations":operations,
+        "failure_summary":failure_summary,
         "operations_truncated": pending.saturating_add(blocked) > 100
     }))
 }
@@ -735,4 +758,24 @@ mod tests {
                 .unwrap()
         );
     }
+    #[test]
+    fn status_reports_actual_blocked_counts_and_bounded_failure_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("companions/wardwell-context/outbox.sqlite3");
+        let request = json!({"source_key":"source-a","expected_revision":0});
+        let id = stage_at(&database, "source-a", "publish", &request, Some("principal"), true).unwrap();
+        update_state_at(&database, &id, "blocked", "validation_rejected").unwrap();
+
+        let status = status_at(&database, "source-a").unwrap();
+        assert_eq!(status["pending"], 0);
+        assert_eq!(status["blocked"], 1);
+        assert_eq!(status["failure_summary"], json!([{
+            "action":"publish",
+            "state":"blocked",
+            "failure_code":"validation_rejected",
+            "count":1
+        }]));
+        assert!(status.to_string().find("expected_revision").is_none());
+    }
+
 }

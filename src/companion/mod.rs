@@ -596,19 +596,17 @@ async fn flush_outbox(connection: &Connection, source_key: &str) -> Result<Value
     let principal = outbox::principal_fingerprint(&connection.endpoint, &connection.token);
     let operations = outbox::pending(source_key)?;
     let mut receipts = Vec::new();
-    let mut blocked = 0_u64;
-    let mut pending = 0_u64;
+    let mut attempted = 0_u64;
     for operation in operations {
         if !replayable_operation(&operation) {
-            blocked += 1;
             continue;
         }
+        attempted += 1;
         if operation.principal_fingerprint.as_deref() != Some(principal.as_str()) {
             outbox::mark_blocked(&operation.request_id, "principal_mismatch")?;
-            blocked += 1;
             continue;
         }
-        match deliver(
+        if let Ok(result) = deliver(
             connection,
             source_key,
             &operation.request_id,
@@ -616,21 +614,20 @@ async fn flush_outbox(connection: &Connection, source_key: &str) -> Result<Value
             operation.arguments,
         )
         .await
+            && let Some(receipt) = result.get("local_outbox_receipt")
         {
-            Ok(result) => {
-                if let Some(receipt) = result.get("local_outbox_receipt") {
-                    receipts.push(receipt.clone());
-                }
-            }
-            Err(_) => pending += 1,
+            receipts.push(receipt.clone());
         }
     }
+    let status = outbox::status(source_key)?;
     Ok(json!({
         "source_key": source_key,
+        "attempted": attempted,
         "verified_receipts": receipts,
-        "pending": pending,
-        "blocked": blocked,
-        "status": outbox::status(source_key)?
+        "pending": status["pending"],
+        "blocked": status["blocked"],
+        "failure_summary": status["failure_summary"],
+        "status": status
     }))
 }
 
@@ -638,6 +635,51 @@ fn replayable_operation(operation: &outbox::Pending) -> bool {
     operation.state == "pending"
         || (operation.state == "blocked"
             && operation.failure_code.as_deref() == Some("revision_conflict"))
+}
+
+fn record_remote_failure(
+    request_id: &str,
+    error: &str,
+    pending_code: &str,
+) -> Result<bool, String> {
+    record_remote_failure_with(error, pending_code, |state, code| match state {
+        "blocked" => outbox::mark_blocked(request_id, code),
+        "pending" => outbox::mark_pending(request_id, code),
+        _ => unreachable!(),
+    })
+}
+
+fn record_remote_failure_with<F>(
+    error: &str,
+    pending_code: &str,
+    mut transition: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    if let Some(code) = remote_rejection_code(error) {
+        transition("blocked", code)?;
+        Ok(true)
+    } else {
+        transition("pending", pending_code)?;
+        Ok(false)
+    }
+}
+
+fn remote_rejection_code(error: &str) -> Option<&'static str> {
+    if error.contains("stale revision") {
+        Some("revision_conflict")
+    } else if error.starts_with("Hank rejected the Companion request:") {
+        Some("validation_rejected")
+    } else if error == "Hank rejected the Companion request. Check the current schema and source journal; no success is recorded." {
+        Some("remote_rejected")
+    } else if error == "The installation connection lacks a required Companion permission." {
+        Some("scope_denied")
+    } else if error == "This installation does not own that Companion. Keep the journal and reconnect its original installation." {
+        Some("not_creator")
+    } else {
+        None
+    }
 }
 
 async fn deliver(
@@ -648,12 +690,17 @@ async fn deliver(
     arguments: Value,
 ) -> Result<Value, String> {
     if action == "capture" {
-        let mut result = remote_tool(connection, "capture_submit", arguments)
-            .await
-            .map_err(|error| {
-                let _ = outbox::mark_pending(request_id, "transport_or_remote_failure");
-                format!("{error} The exact capture remains pending in the local Companion outbox.")
-            })?;
+        let mut result = match remote_tool(connection, "capture_submit", arguments).await {
+            Ok(result) => result,
+            Err(error) => {
+                let blocked =
+                    record_remote_failure(request_id, &error, "transport_or_remote_failure")?;
+                return Err(format!(
+                    "{error} The exact capture remains {} in the local Companion outbox.",
+                    if blocked { "blocked for correction" } else { "pending" }
+                ));
+            }
+        };
         let capture_id = result
             .get("capture_id")
             .and_then(Value::as_str)
@@ -692,14 +739,14 @@ async fn deliver(
         }
         Ok(PublishDelivery::Published(result)) => result,
         Err(error) => {
-            let blocked = error.contains("stale revision");
-            let _ = if blocked {
-                outbox::mark_blocked(request_id, "revision_conflict")
-            } else {
-                outbox::mark_pending(request_id, "reconciliation_or_transport_failure")
-            };
+            let blocked = record_remote_failure(
+                request_id,
+                &error,
+                "reconciliation_or_transport_failure",
+            )?;
             return Err(format!(
-                "{error} The exact publication remains in the local Companion outbox; no success was recorded."
+                "{error} The exact publication remains {} in the local Companion outbox; no success was recorded.",
+                if blocked { "blocked for correction" } else { "pending" }
             ));
         }
     };
@@ -1240,6 +1287,38 @@ mod tests {
         );
         assert!(require_plan_key(&json!({"source_key":"b"}), "a").is_err());
         assert!(require_plan_key(&json!({}), "a").is_err());
+    }
+
+    #[test]
+    fn remote_failure_state_is_persisted_before_it_is_reported() {
+        let mut transitions = Vec::new();
+        let blocked = record_remote_failure_with(
+            "Hank rejected the Companion request: invalid_work_plan: response_evidence_required",
+            "transient",
+            |state, code| {
+                transitions.push((state.to_owned(), code.to_owned()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(blocked);
+        assert_eq!(transitions, [("blocked".into(), "validation_rejected".into())]);
+
+        transitions.clear();
+        let blocked = record_remote_failure_with("request timed out", "transient", |state, code| {
+            transitions.push((state.to_owned(), code.to_owned()));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!blocked);
+        assert_eq!(transitions, [("pending".into(), "transient".into())]);
+
+        let failure = record_remote_failure_with(
+            "Hank rejected the Companion request: invalid_work_plan: response_evidence_required",
+            "transient",
+            |_state, _code| Err("journal locked".into()),
+        );
+        assert_eq!(failure, Err("journal locked".into()));
     }
 
     #[test]
