@@ -153,7 +153,7 @@ fn verify(old: &str, new: &str, before: &std::collections::BTreeMap<String, Proj
     }
     let mut expected = before.clone();
     let (domain, project) = key.split_once('/').ok_or_else(|| failed("has no <domain>/<project> key"))?;
-    let mapping = expected.entry(key.to_string()).or_insert_with(|| ProjectMapping { domain: domain.into(), project: project.into(), paths: vec![] });
+    let mapping = expected.entry(key.to_string()).or_insert_with(|| ProjectMapping { domain: domain.into(), project: project.into(), paths: vec![], kanban: None });
     mapping.paths.push(PathBuf::from(dir));
     if after.projects != expected {
         return Err(failed("would not add exactly this one path"));
