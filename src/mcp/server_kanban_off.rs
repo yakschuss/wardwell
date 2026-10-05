@@ -46,6 +46,22 @@ impl WardwellServer {
             response["kanban_off"] = serde_json::json!(crate::tracker::kanban_off_refusal(&self.config, &domain, project, false));
         }
     }
+
+    /// Drop the entries whose path is native kanban text of an off project.
+    pub(super) fn drop_off_native<T>(&self, entries: &mut Vec<T>, path: impl Fn(&T) -> &str) {
+        entries.retain(|entry| match crate::kanban::native_file_project(path(entry)) {
+            Some((domain, project)) => !self.config.kanban_off_for_project(&format!("{domain}/{project}")),
+            None => true,
+        });
+    }
+
+    /// How many index hits to fetch so `limit` remain once native kanban text
+    /// of off projects is dropped.
+    pub(super) fn fetch_limit(&self, limit: usize) -> usize {
+        let bound: Vec<String> = self.config.trackers.iter().map(|b| b.key()).collect();
+        let any_off = self.config.projects.keys().chain(bound.iter()).any(|key| self.config.kanban_off_for_project(key));
+        if any_off { limit.saturating_mul(4) } else { limit }
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +178,45 @@ mod tests {
         assert!(!titles.contains(&"Native claims task"), "{titles:?}");
         let create = dispatch(&f.server, json!({"action": "create", "project": "other", "domain": "work", "title": "More"}));
         assert!(create.get("error").is_none(), "{create}");
+    }
+
+    fn search(f: &super::super::tracker_tests::Fixture, query: &str) -> Value {
+        let params: super::super::SearchParams = serde_json::from_value(json!({"action": "search", "query": query, "limit": 5})).unwrap();
+        serde_json::from_str(&f.server.action_search(&params)).unwrap()
+    }
+
+    fn paths(response: &Value) -> Vec<String> {
+        response["results"].as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap().to_string()).collect()
+    }
+
+    fn index_vault(f: &super::super::tracker_tests::Fixture) {
+        let vault = &f.server.vault_root;
+        std::fs::write(vault.join("work/claims/tickets.md"), "# claims Tickets\n\n- 10/01 CL-1 zebrafish created\n").unwrap();
+        std::fs::write(vault.join("work/claims/current_state.md"), "# State\n\nzebrafish notes live here\n").unwrap();
+        crate::index::builder::IndexBuilder::build_filtered(&f.server.index, vault, &[], None).unwrap();
+    }
+
+    #[test]
+    fn search_leaves_out_native_kanban_files_of_an_off_project_and_keeps_its_other_files() {
+        let f = fixture_with(&standard_mirror(), true, None);
+        index_vault(&f);
+        let found = paths(&search(&f, "zebrafish"));
+        assert_eq!(found, vec!["work/claims/current_state.md"], "{found:?}");
+    }
+
+    #[test]
+    fn search_still_returns_native_kanban_files_when_the_board_is_on() {
+        let f = fixture_with(&standard_mirror(), true, Some(true));
+        index_vault(&f);
+        let found = paths(&search(&f, "zebrafish"));
+        assert!(found.contains(&"work/claims/tickets.md".to_string()), "{found:?}");
+    }
+
+    #[test]
+    fn search_over_fetches_so_an_off_project_does_not_starve_the_limit() {
+        let f = fixture_with(&standard_mirror(), true, None);
+        assert_eq!(f.server.fetch_limit(5), 20);
+        let on = fixture_with(&standard_mirror(), false, Some(true));
+        assert_eq!(on.server.fetch_limit(5), 5);
     }
 }
