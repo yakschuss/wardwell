@@ -503,7 +503,7 @@ another source's `get` or `responses` calls and does not transfer execution auth
 Conversation keys prevent accidental cross-session routing; they are not
 credentials or isolation against other processes on the same OS account. The
 hosted installation credential establishes customer/workspace permissions.
-Publication and saved answers do not authorize external execution.
+Publication and saved answers do not authorize external execution. Explicit hosted validation, permission, and ownership rejections leave the exact request blocked for correction; transport failures remain pending for an explicit retry. `flush` reports the outbox's resulting pending and blocked counts plus bounded failure metadata rather than treating every failed attempt as pending.
 
 The binary reads its private connection from
 `~/.wardwell/hank/connection.json` (under `WARDWELL_CONFIG_DIR` when set).
