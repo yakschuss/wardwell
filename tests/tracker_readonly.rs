@@ -125,12 +125,19 @@ fn snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::Path
     files
 }
 
+/// `kanban: on` for the project, so a readonly binding leaves its native board
+/// readable; with no setting the readonly binding turns the board off.
 fn write_config(config: &std::path::Path, vault: &std::path::Path, readonly: bool) {
+    write_config_with(config, vault, readonly, Some("on"));
+}
+
+fn write_config_with(config: &std::path::Path, vault: &std::path::Path, readonly: bool, kanban: Option<&str>) {
+    let project = kanban.map_or(String::new(), |k| format!("projects:\n  work/claims:\n    kanban: {k}\n"));
     let vault = serde_json::to_string(vault).unwrap();
     std::fs::write(
         config.join("config.yml"),
         format!(
-            "vault_path: {vault}\ndomains:\n  work:\n    paths: [{vault}]\nsession_sources: []\nkanban:\n  enabled: true\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: corr-linear\n    readonly: {readonly}\n"
+            "vault_path: {vault}\ndomains:\n  work:\n    paths: [{vault}]\nsession_sources: []\nkanban:\n  enabled: true\ntrackers:\n  work/claims:\n    provider: linear\n    team: COR\n    credential: corr-linear\n    readonly: {readonly}\n{project}"
         ),
     )
     .unwrap();
@@ -246,4 +253,31 @@ fn readonly_lock_resolves_the_domain_the_store_writes_to_not_the_callers() {
     assert!(body.contains("read-only mirror of Linear"), "{body}");
     assert!(body.contains("Edit it in Linear"), "{body}");
     assert_eq!(std::fs::read(&log).unwrap(), before, "kanban.jsonl unchanged");
+}
+
+#[test]
+fn a_readonly_binding_with_no_setting_turns_the_native_board_off() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config");
+    let vault = directory.path().join("vault");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(vault.join("work/claims")).unwrap();
+    write_config(&config, &vault, false);
+    let id = {
+        let mut mcp = Mcp::start(&config);
+        let created = tool_data(mcp.tool(
+            "wardwell_kanban",
+            json!({"action":"create","domain":"work","project":"claims","title":"Seeded before off"}),
+        ));
+        created["item"]["ticket_id"].as_str().unwrap().to_string()
+    };
+
+    write_config_with(&config, &vault, true, None);
+    let mut mcp = Mcp::start(&config);
+    let read = text(&mcp.tool("wardwell_kanban", json!({"action":"get","ticket_id":id})));
+    assert!(read.contains("The kanban is off for work/claims. Read its work in Linear team COR"), "{read}");
+    let listed = text(&mcp.tool("wardwell_kanban", json!({"action":"list","project":"claims"})));
+    assert!(!listed.contains("Seeded before off"), "{listed}");
+    let write = text(&mcp.tool("wardwell_kanban", json!({"action":"note","ticket_id":id,"text":"x"})));
+    assert!(write.contains("read-only mirror of Linear"), "readonly refusal first: {write}");
 }
