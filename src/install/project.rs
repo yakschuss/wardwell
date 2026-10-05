@@ -183,11 +183,22 @@ fn subfolders(dir: &Path) -> Vec<PathBuf> {
 
 fn require_vault_folder(config: &WardwellConfig, key: &str) -> Result<(), String> {
     let (domain, project) = crate::config::loader::project_key_parts(key).ok_or_else(|| format!("{key} is not <domain>/<project>; nothing changed."))?;
-    let folder = config.vault_path.join(domain).join(project);
-    if !folder.is_dir() {
-        return Err(format!("{key} has no folder in the vault at {}. Create it with `wardwell seed {key}`, then link again. Nothing changed.", folder.display()));
+    let missing = || format!("{key} has no folder in the vault at {}. Create it with `wardwell seed {key}`, then link again. Nothing changed.", config.vault_path.join(domain).join(project).display());
+    // The folder's exact name decides the key: a case-insensitive filesystem
+    // would otherwise accept `Work/TE` and write an entry no session matches.
+    let exact_domain = exact_name(&config.vault_path, domain).ok_or_else(missing)?;
+    let exact_project = exact_name(&config.vault_path.join(&exact_domain), project).ok_or_else(missing)?;
+    match (exact_domain == domain, exact_project == project) {
+        (true, true) => Ok(()),
+        _ => Err(format!("{key} is not the exact name of the vault folder. Use {exact_domain}/{exact_project}. Nothing changed.")),
     }
-    Ok(())
+}
+
+/// The folder under `parent` named like `name`, ignoring case, as it is
+/// spelled on disk; the exact spelling wins when both exist.
+fn exact_name(parent: &Path, name: &str) -> Option<String> {
+    let names: Vec<String> = std::fs::read_dir(parent).ok()?.flatten().filter(|e| e.path().is_dir()).filter_map(|e| e.file_name().into_string().ok()).collect();
+    names.iter().find(|n| *n == name).or_else(|| names.iter().find(|n| n.eq_ignore_ascii_case(name))).cloned()
 }
 
 /// The path of `key` that already contains `dir`. Err when another project
@@ -503,5 +514,17 @@ mod tests {
         assert!(kanban_run(&f, "personal", false).unwrap_err().contains("is not <domain>/<project>"));
         assert!(backups(&f).is_empty());
         assert!(!f.cfg.join("config.yml.lock").exists());
+    }
+
+    #[test]
+    fn kanban_refuses_a_key_spelled_in_another_case_and_names_the_exact_folder() {
+        let f = fixture();
+        let original = config_text(&f);
+        for key in ["Personal/corrtex", "personal/CORRTEX", "PERSONAL/CorrTex"] {
+            let error = kanban_run(&f, key, false).unwrap_err();
+            assert!(error.contains("Use personal/corrtex"), "{key}: {error}");
+        }
+        assert_eq!(config_text(&f), original);
+        assert!(backups(&f).is_empty());
     }
 }
